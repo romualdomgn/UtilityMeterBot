@@ -1,0 +1,31 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Databases (SQLite and its side files)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Editors
+.idea/
+.vscode/
+
+# Local helper scripts
+*.bat
+
+# Logs
+*.log
+
+*.bat
