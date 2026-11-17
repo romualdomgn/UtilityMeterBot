@@ -24,6 +24,7 @@ venv/
 
 # Local helper scripts
 *.bat
+*.xml
 
 # Logs
 *.log
