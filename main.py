@@ -1,0 +1,134 @@
+"""Unified entry point: FastAPI Web App + aiogram Bot + APScheduler."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+import uvicorn
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
+
+from bot_handlers import router as bot_router
+from config import (
+    ADMIN_TELEGRAM_ID,
+    LANDLORD_TELEGRAM_IDS,
+    TELEGRAM_BOT_TOKEN,
+    TENANT_IDS,
+    WEBAPP_HOST,
+    WEBAPP_PORT,
+    WEBAPP_URL,
+)
+from database import crud
+from database.session import init_db
+from services.scheduler import setup_scheduler
+from webapp.api import create_web_app
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
+
+
+async def seed_env_users() -> None:
+    if ADMIN_TELEGRAM_ID:
+        await crud.get_or_create_user(
+            telegram_id=ADMIN_TELEGRAM_ID,
+            name="Администратор",
+            role="admin",
+        )
+
+    families_list = await crud.get_all_families()
+    default_family_id = families_list[0].id if families_list else None
+
+    for lid in LANDLORD_TELEGRAM_IDS:
+        if default_family_id is None:
+            fam = await crud.create_family("Основная семья")
+            default_family_id = fam.id
+        await crud.get_or_create_user(
+            telegram_id=lid,
+            role="landlord",
+            family_id=default_family_id,
+        )
+
+    for tid in TENANT_IDS:
+        await crud.get_or_create_user(
+            telegram_id=tid,
+            role="tenant",
+            family_id=default_family_id,
+        )
+
+
+async def setup_bot_ui(bot: Bot) -> None:
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Открыть панель счётчиков"),
+    ])
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Счётчики",
+                web_app=WebAppInfo(url=WEBAPP_URL),
+            )
+        )
+    except Exception as e:
+        logger.warning("Could not set default menu button: %s", e)
+
+
+async def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в файле .env")
+
+    await init_db()
+    await seed_env_users()
+
+    bot = Bot(
+        token=TELEGRAM_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(bot_router)
+
+    await setup_bot_ui(bot)
+    scheduler = setup_scheduler(bot)
+    scheduler.start()
+
+    web_app = create_web_app(bot)
+    uvicorn_cfg = uvicorn.Config(
+        web_app,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+        log_level="info",
+    )
+    server = uvicorn.Server(uvicorn_cfg)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Utility Meter Web App + Bot started on %s:%s (%s)", WEBAPP_HOST, WEBAPP_PORT, WEBAPP_URL)
+
+    polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+    server_task = asyncio.create_task(server.serve())
+
+    try:
+        done, pending = await asyncio.wait(
+            {polling_task, server_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            if exc := task.exception():
+                raise exc
+    finally:
+        server.should_exit = True
+        for task in (polling_task, server_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(polling_task, server_task, return_exceptions=True)
+        scheduler.shutdown(wait=False)
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

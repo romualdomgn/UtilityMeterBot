@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.version_state.json
 
 # Databases (SQLite and its side files)
 *.db
@@ -25,8 +26,10 @@ venv/
 # Local helper scripts
 *.bat
 *.xml
+repomix info.txt
+new AI chat.txt
+install.txt
+Информация.txt
 
 # Logs
 *.log
-
-*.bat

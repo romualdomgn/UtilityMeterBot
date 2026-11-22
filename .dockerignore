@@ -1,0 +1,14 @@
+.env
+.env.*
+data/
+venv/
+.venv/
+backups/
+exports/
+tests/
+.pytest_cache/
+__pycache__/
+*.pyc
+.git/
+*.db
+*.log
