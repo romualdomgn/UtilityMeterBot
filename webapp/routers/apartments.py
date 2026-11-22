@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import datetime
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from database import crud
+from config import local_today
+from database import crud, operations
 from database.models import ALL_METERS, METER_LABELS
 from services.access import get_accessible_apartments, is_admin, user_can_access_apartment
 from services.calculations import calculate_billing, get_prev_value
@@ -21,6 +21,7 @@ from webapp.schemas import (
 )
 
 router = APIRouter()
+MAX_TARIFF_RATE = Decimal("1000000")
 
 
 @router.get("/api/me")
@@ -45,7 +46,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
     if not apt:
         raise HTTPException(404, "Квартира не найдена")
 
-    tariffs_raw = await crud.get_all_tariffs(apt_id)
+    tariffs_raw = await crud.get_all_tariffs(apt_id, as_of_date=local_today())
     tariffs = {
         mt: float(tariffs_raw[mt].rate) if tariffs_raw.get(mt) else None
         for mt in ALL_METERS
@@ -53,7 +54,15 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
     initial = await crud.get_all_initial_readings(apt_id)
     prev_vals = {mt: await get_prev_value(apt_id, mt) for mt in ALL_METERS}
     billing = await calculate_billing(apt_id)
-    tenants = await crud.get_apartment_tenants(apt_id)
+
+    tenants = (
+        [
+            {"telegram_id": t.telegram_id, "name": t.name, "phone": t.phone}
+            for t in await crud.get_apartment_tenants(apt_id)
+        ]
+        if user.role in ("admin", "landlord")
+        else []
+    )
 
     return {
         "apartment": serialize_apartment(apt),
@@ -61,10 +70,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
         "initial_readings": initial,
         "prev_readings": prev_vals,
         "billing": billing.to_dict(),
-        "tenants": [
-            {"telegram_id": t.telegram_id, "name": t.name, "phone": t.phone}
-            for t in tenants
-        ],
+        "tenants": tenants,
     }
 
 
@@ -77,7 +83,10 @@ async def api_create_apartment(body: ApartmentCreateBody, user: WebAppUser = Dep
 
     if is_admin(user.telegram_id):
         family_id = body.family_id
-        if not family_id:
+        if family_id is not None:
+            if not await crud.get_family(family_id):
+                raise HTTPException(404, "Указанная семья не найдена")
+        else:
             fams = await crud.get_all_families()
             family_id = fams[0].id if fams else (await crud.create_family("Основная семья")).id
     else:
@@ -101,31 +110,33 @@ async def api_update_settings(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа")
 
-    updates = {}
-    for field_name in ("water_submission_day", "electricity_submission_day"):
-        val = getattr(body, field_name)
+    for val in (body.water_submission_day, body.electricity_submission_day):
         if val is not None and not (1 <= val <= 31):
             raise HTTPException(400, "День подачи должен быть от 1 до 31")
-        updates[field_name] = val
-    await crud.update_apartment(apt_id, **updates)
 
-    current_tariffs = await crud.get_all_tariffs(apt_id)
-    today = datetime.date.today()
+    parsed_tariffs: dict[str, Decimal] = {}
     for mt, raw_rate in body.tariffs.items():
         if mt not in ALL_METERS or raw_rate in (None, ""):
             continue
         try:
             rate = Decimal(str(raw_rate).strip().replace(",", "."))
-            if rate <= 0:
+            if not rate.is_finite() or rate <= 0 or rate > MAX_TARIFF_RATE:
                 raise ValueError
         except (InvalidOperation, ValueError):
             raise HTTPException(400, f"Некорректный тариф для {mt}")
+        parsed_tariffs[mt] = rate
 
-        existing = current_tariffs.get(mt)
-        if not existing or Decimal(existing.rate) != rate:
-            await crud.set_tariff(apt_id, mt, rate, today, user.telegram_id)
-
-    await crud.add_audit_log(user.telegram_id, "update_settings", f"Кв. id={apt_id}")
+    try:
+        await operations.update_apartment_settings_atomic(
+            apartment_id=apt_id,
+            water_submission_day=body.water_submission_day,
+            electricity_submission_day=body.electricity_submission_day,
+            tariffs=parsed_tariffs,
+            changed_by=user.telegram_id,
+            effective_from=local_today(),
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True}
 
 
@@ -157,13 +168,18 @@ async def api_update_initial_readings(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа")
 
+    readings_map: dict[str, int] = {}
     for mt in ALL_METERS:
         val = getattr(body, mt)
         if val is None:
             continue
         if val < 0:
             raise HTTPException(400, f"Начальное показание {mt} не может быть отрицательным")
-        await crud.set_initial_reading(apt_id, mt, val, user.telegram_id)
+        readings_map[mt] = val
 
-    await crud.add_audit_log(user.telegram_id, "set_initial_readings", f"Кв. id={apt_id}")
+    if readings_map:
+        try:
+            await operations.update_initial_readings_atomic(apt_id, readings_map, user.telegram_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e))
     return {"ok": True}

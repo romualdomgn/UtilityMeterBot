@@ -15,9 +15,7 @@ from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from bot_handlers import router as bot_router
 from config import (
     ADMIN_TELEGRAM_ID,
-    LANDLORD_TELEGRAM_IDS,
     TELEGRAM_BOT_TOKEN,
-    TENANT_IDS,
     WEBAPP_HOST,
     WEBAPP_PORT,
     WEBAPP_URL,
@@ -35,33 +33,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def seed_env_users() -> None:
-    if ADMIN_TELEGRAM_ID:
-        await crud.get_or_create_user(
-            telegram_id=ADMIN_TELEGRAM_ID,
-            name="Администратор",
-            role="admin",
-        )
-
-    families_list = await crud.get_all_families()
-    default_family_id = families_list[0].id if families_list else None
-
-    for lid in LANDLORD_TELEGRAM_IDS:
-        if default_family_id is None:
-            fam = await crud.create_family("Основная семья")
-            default_family_id = fam.id
-        await crud.get_or_create_user(
-            telegram_id=lid,
-            role="landlord",
-            family_id=default_family_id,
-        )
-
-    for tid in TENANT_IDS:
-        await crud.get_or_create_user(
-            telegram_id=tid,
-            role="tenant",
-            family_id=default_family_id,
-        )
+async def seed_admin() -> None:
+    """CRITICAL-02 & MEDIUM-07: sync only ADMIN_TELEGRAM_ID and revoke stale admins."""
+    await crud.sync_admin_user(ADMIN_TELEGRAM_ID)
 
 
 async def setup_bot_ui(bot: Bot) -> None:
@@ -84,7 +58,7 @@ async def main() -> None:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в файле .env")
 
     await init_db()
-    await seed_env_users()
+    await seed_admin()
 
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,

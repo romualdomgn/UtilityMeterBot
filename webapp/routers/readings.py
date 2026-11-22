@@ -1,14 +1,16 @@
-"""Meter readings submission, history, correction, and photo upload endpoints."""
+"""Meter readings submission, history, correction, and streamed photo upload endpoints."""
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
-from config import PHOTOS_DIR
-from database import crud
+from config import MAX_PHOTO_BYTES, PHOTOS_DIR, local_today
+from database import crud, operations
 from database.models import METER_LABELS, METER_UNITS
 from services.access import user_can_access_apartment
 from services.calculations import calculate_billing, get_prev_value
@@ -22,6 +24,7 @@ from webapp.schemas import (
 )
 
 router = APIRouter()
+CHUNK_SIZE = 64 * 1024
 
 
 async def _save_meter_group(
@@ -39,7 +42,10 @@ async def _save_meter_group(
         raise HTTPException(400, "Показания должны быть неотрицательными целыми числами")
 
     prev_meters = {mt: await get_prev_value(apt_id, mt) for mt in meters}
-    decreased = [mt for mt, v in meters.items() if v < prev_meters[mt]]
+    decreased = [
+        mt for mt, v in meters.items()
+        if prev_meters[mt] is not None and v < prev_meters[mt]
+    ]
     billing = await calculate_billing(apt_id, current_readings=meters)
 
     if decreased and not force:
@@ -49,13 +55,19 @@ async def _save_meter_group(
             "billing": billing.to_dict(),
         }
 
-    today = datetime.date.today()
-    for mt, val in meters.items():
-        await crud.add_reading(apt_id, mt, val, user.telegram_id, today)
+    saved = await operations.save_meter_group_readings(
+        apartment_id=apt_id,
+        meters=meters,
+        submitted_by=user.telegram_id,
+        reading_date=local_today(),
+        action=action,
+        audit_details=audit_details,
+    )
 
-    await crud.add_audit_log(user.telegram_id, action, audit_details)
-    await notify_new_readings(request.app.state.bot, apt_id, meters, prev_meters, user.telegram_id)
-    return {"ok": True, "billing": billing.to_dict()}
+    if saved:
+        await notify_new_readings(request.app.state.bot, apt_id, meters, prev_meters, user.telegram_id)
+
+    return {"ok": True, "deduplicated": not saved, "billing": billing.to_dict()}
 
 
 @router.post("/api/apartments/{apt_id}/readings/water")
@@ -98,6 +110,8 @@ async def api_history(
 
     months = await crud.get_reading_months(apt_id)
     if year and month:
+        if not (1 <= month <= 12):
+            raise HTTPException(400, "Некорректный месяц")
         rows = await crud.get_readings_by_month(apt_id, year, month)
         billing = (await calculate_billing(apt_id, year=year, month=month)).to_dict()
     else:
@@ -155,17 +169,25 @@ async def api_upload_photo(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа к квартире")
 
-    content = await file.read()
-    if not content or len(content) > 15 * 1024 * 1024:
-        raise HTTPException(400, "Файл пуст или превышает 15 МБ")
+    buf = bytearray()
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > MAX_PHOTO_BYTES:
+            raise HTTPException(413, "Файл превышает максимально допустимый размер 15 МБ")
+
+    if not buf:
+        raise HTTPException(400, "Файл пуст")
 
     ext = Path(file.filename or "photo.jpg").suffix.lower()
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         ext = ".jpg"
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = PHOTOS_DIR / f"apt{apt_id}_{user.telegram_id}_{ts}{ext}"
-    filepath.write_bytes(content)
+    filepath = PHOTOS_DIR / f"apt{apt_id}_{user.telegram_id}_{ts}_{uuid.uuid4().hex[:8]}{ext}"
+    await asyncio.to_thread(filepath.write_bytes, bytes(buf))
 
     sent = await forward_meter_photo_file(
         bot=request.app.state.bot,
@@ -177,6 +199,6 @@ async def api_upload_photo(
     )
     await crud.add_audit_log(
         user.telegram_id, "upload_photo_webapp",
-        f"Кв. id={apt_id}, получателей: {sent}",
+        f"Кв. id={apt_id}, файл={filepath.name}, получателей={sent}",
     )
     return {"ok": True, "recipients_count": sent}

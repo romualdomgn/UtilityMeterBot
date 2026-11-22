@@ -1,8 +1,10 @@
-"""Excel and PDF report generators for apartment readings and billing."""
+"""Excel and PDF report generators with unique filenames and async disk writes."""
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import uuid
 from pathlib import Path
 
 from fpdf import FPDF
@@ -16,6 +18,12 @@ from services.calculations import calculate_billing, fmt_date
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+EXCEL_HISTORY_LIMIT = 500
+PDF_HISTORY_LIMIT = 40
+
+
+def _fmt_opt(val) -> str:
+    return "—" if val is None else str(val)
 
 
 async def generate_excel_report(apartments: list) -> Path:
@@ -53,12 +61,12 @@ async def generate_excel_report(apartments: list) -> Path:
             if m:
                 ws.append([
                     METER_PLAIN_LABELS[mt],
-                    m.previous,
-                    m.current,
+                    _fmt_opt(m.previous),
+                    _fmt_opt(m.current) if m.submitted else "Не подано",
                     m.consumption,
                     METER_UNITS[mt],
-                    float(m.tariff),
-                    m.cost,
+                    float(m.tariff) if m.tariff is not None else "Не задан",
+                    m.cost if (m.has_base and m.has_tariff and m.submitted) else "—",
                 ])
 
         ws.append(["Итого вода", "", "", billing.water_consumption_total, "м³", "", billing.water_total])
@@ -68,14 +76,20 @@ async def generate_excel_report(apartments: list) -> Path:
         ws[f"G{ws.max_row}"].font = bold_font
         ws.append([])
 
-        ws.append(["История показаний"])
+        total_count = await crud.get_readings_count(apt.id)
+        readings = await crud.get_all_readings(apt.id, limit=EXCEL_HISTORY_LIMIT)
+        hist_title = (
+            f"История показаний (показаны последние {len(readings)} из {total_count})"
+            if total_count > len(readings)
+            else f"История показаний (всего {total_count})"
+        )
+        ws.append([hist_title])
         ws[f"A{ws.max_row}"].font = bold_font
         ws.append(["ID", "Дата", "Счётчик", "Значение", "Ед.", "Кем подано (TG ID)"])
         for cell in ws[ws.max_row]:
             cell.fill = header_fill
             cell.font = header_font
 
-        readings = await crud.get_all_readings(apt.id, limit=500)
         for r in readings:
             ws.append([
                 r.id,
@@ -91,8 +105,8 @@ async def generate_excel_report(apartments: list) -> Path:
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 34)
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = EXPORT_DIR / f"utility_report_{ts}.xlsx"
-    wb.save(filepath)
+    filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.xlsx"
+    await asyncio.to_thread(wb.save, filepath)
     return filepath
 
 
@@ -133,11 +147,11 @@ async def generate_pdf_report(apartments: list) -> Path:
                 continue
             row = [
                 f"{METER_PLAIN_LABELS[mt]} ({METER_UNITS[mt]})",
-                str(m.previous),
-                str(m.current),
+                _fmt_opt(m.previous),
+                _fmt_opt(m.current) if m.submitted else "—",
                 str(m.consumption),
-                f"{float(m.tariff):.2f}",
-                str(m.cost),
+                f"{float(m.tariff):.2f}" if m.tariff is not None else "—",
+                str(m.cost) if (m.has_base and m.has_tariff and m.submitted) else "—",
             ]
             for val, w in zip(row, widths):
                 pdf.cell(w, 7, val, border=1, align="C")
@@ -152,9 +166,15 @@ async def generate_pdf_report(apartments: list) -> Path:
         )
         pdf.ln(4)
 
+        total_count = await crud.get_readings_count(apt.id)
+        readings = await crud.get_all_readings(apt.id, limit=PDF_HISTORY_LIMIT)
+        hist_title = (
+            f"Последние показания (показано {len(readings)} из {total_count})"
+            if total_count > len(readings)
+            else f"История показаний (всего {total_count})"
+        )
         pdf.set_font("DejaVu", "B", 11)
-        pdf.cell(0, 8, "Последние показания", new_x="LMARGIN", new_y="NEXT")
-        readings = await crud.get_all_readings(apt.id, limit=40)
+        pdf.cell(0, 8, hist_title, new_x="LMARGIN", new_y="NEXT")
         if not readings:
             pdf.set_font("DejaVu", "", 9)
             pdf.cell(0, 6, "Показаний пока нет.", new_x="LMARGIN", new_y="NEXT")
@@ -178,6 +198,6 @@ async def generate_pdf_report(apartments: list) -> Path:
                 pdf.ln()
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = EXPORT_DIR / f"utility_report_{ts}.pdf"
-    pdf.output(str(filepath))
+    filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.pdf"
+    await asyncio.to_thread(pdf.output, str(filepath))
     return filepath

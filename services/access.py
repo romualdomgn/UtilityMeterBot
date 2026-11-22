@@ -1,41 +1,26 @@
-"""Access control — role checks, lease expiration enforcement, and family isolation."""
+"""Access control — role checks (SQLite + ADMIN_TELEGRAM_ID), lease checks, family isolation."""
 
 from __future__ import annotations
-
-import datetime
 
 import config
 from database import crud
 
 
 def is_admin(telegram_id: int) -> bool:
-    return telegram_id == config.ADMIN_TELEGRAM_ID
-
-
-def is_landlord(telegram_id: int) -> bool:
-    return telegram_id in config.LANDLORD_TELEGRAM_IDS
-
-
-def is_tenant(telegram_id: int) -> bool:
-    return telegram_id in config.TENANT_IDS
-
-
-def is_admin_or_landlord(telegram_id: int) -> bool:
-    return is_admin(telegram_id) or is_landlord(telegram_id)
+    return bool(config.ADMIN_TELEGRAM_ID) and telegram_id == config.ADMIN_TELEGRAM_ID
 
 
 async def get_user_role(telegram_id: int) -> str:
-    """Return 'admin', 'landlord', 'tenant', or 'unknown'."""
+    """Return 'admin', 'landlord', 'tenant', or 'unknown'.
+
+    CRITICAL-02 & MEDIUM-07: admin comes exclusively from ADMIN_TELEGRAM_ID;
+    landlord/tenant roles come exclusively from SQLite.
+    """
     if is_admin(telegram_id):
         return "admin"
     user = await crud.get_user_by_telegram_id(telegram_id)
-    if user and not user.is_blocked:
-        if user.role in ("admin", "landlord", "tenant"):
-            return user.role
-    if is_landlord(telegram_id):
-        return "landlord"
-    if is_tenant(telegram_id):
-        return "tenant"
+    if user and not user.is_blocked and user.role in ("landlord", "tenant"):
+        return user.role
     return "unknown"
 
 
@@ -45,10 +30,13 @@ async def is_tenant_lease_active(telegram_id: int, apartment_id: int) -> bool:
         return False
     if apt.agreement_date_finish is None:
         return True
-    return apt.agreement_date_finish >= datetime.date.today()
+    return apt.agreement_date_finish >= config.local_today()
 
 
 async def check_user_access(telegram_id: int) -> tuple[bool, str | None]:
+    if is_admin(telegram_id):
+        return True, None
+
     user = await crud.get_user_by_telegram_id(telegram_id)
     if user and user.is_blocked:
         return False, "⛔ Ваш доступ к боту заблокирован."
@@ -134,13 +122,11 @@ async def get_notification_recipients(apartment_id: int) -> list[int]:
 
     apt = await crud.get_apartment(apartment_id)
     if apt:
-        owners = await crud.get_family_owners(apt.family_id)
-        for owner in owners:
+        for owner in await crud.get_family_owners(apt.family_id):
             if owner.telegram_id not in recipients and not owner.is_blocked:
                 recipients.append(owner.telegram_id)
 
-        apt_owners = await crud.get_apartment_owners(apartment_id)
-        for owner in apt_owners:
+        for owner in await crud.get_apartment_owners(apartment_id):
             if owner.telegram_id not in recipients and not owner.is_blocked:
                 recipients.append(owner.telegram_id)
 

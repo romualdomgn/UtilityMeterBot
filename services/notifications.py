@@ -1,8 +1,9 @@
-"""Telegram bot notification helpers called from Web App API and handlers."""
+"""Telegram bot notification helpers with HTML escaping and delivery reporting."""
 
 from __future__ import annotations
 
 import logging
+from html import escape as h
 from pathlib import Path
 
 from aiogram import Bot
@@ -27,39 +28,43 @@ async def notify_new_readings(
     bot: Bot,
     apt_id: int,
     meters: dict[str, int],
-    prev_meters: dict[str, int],
+    prev_meters: dict[str, int | None],
     submitted_by: int,
-) -> None:
+) -> int:
     apt = await crud.get_apartment(apt_id)
     if not apt:
-        return
+        return 0
     recipients = [r for r in await get_notification_recipients(apt_id) if r != submitted_by]
     if not recipients:
-        return
+        return 0
 
-    lines = [f"📊 <b>Новые показания — Кв. №{apt.number}</b>\n"]
+    lines = [f"📊 <b>Новые показания — Кв. №{h(apt.number)}</b>\n"]
     for mt, new_val in meters.items():
-        prev_val = prev_meters.get(mt, 0)
+        prev_val = prev_meters.get(mt)
         lines.append(format_reading_notification(apt.number, mt, prev_val, new_val))
     text = "\n".join(lines)
 
+    sent = 0
     for uid in recipients:
         try:
             await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+            sent += 1
         except Exception as e:
             logger.warning("Failed to notify %s: %s", uid, e)
+    return sent
 
 
-async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str) -> None:
-    agr_no = apt.agreement_no or "б/н"
+async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str) -> bool:
+    """Send welcome invite to tenant; return True if delivered."""
+    agr_no = h(apt.agreement_no or "б/н")
     date_start = fmt_date(apt.agreement_date_start)
     date_finish = fmt_date(apt.agreement_date_finish)
     try:
         await bot.send_message(
             chat_id=tenant_tg_id,
             text=(
-                f"👋 Здравствуйте, <b>{tenant_name}</b>!\n\n"
-                f"Вы добавлены как наниматель квартиры №<b>{apt.number}</b> "
+                f"👋 Здравствуйте, <b>{h(tenant_name)}</b>!\n\n"
+                f"Вы добавлены как наниматель квартиры №<b>{h(apt.number)}</b> "
                 f"(договор №<b>{agr_no}</b> от <b>{date_start}</b> "
                 f"со сроком действия до <b>{date_finish}</b>).\n"
                 f"Откройте Mini App кнопкой ниже для подачи показаний."
@@ -67,19 +72,28 @@ async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str
             reply_markup=webapp_open_kb("📱 Открыть панель счётчиков"),
             parse_mode="HTML",
         )
+        return True
     except Exception as e:
         logger.warning("Failed to send tenant invite to %s: %s", tenant_tg_id, e)
+        return False
 
 
-async def notify_tenant_removed(bot: Bot, tenant_tg_id: int) -> None:
+async def notify_tenant_removed(
+    bot: Bot,
+    tenant_tg_id: int,
+    apt_number: str | None = None,
+    fully_removed: bool = True,
+) -> bool:
+    if fully_removed:
+        text = "Ваш Telegram ID был удалён из бота и доступ к боту прекращён."
+    else:
+        text = f"Вы откреплены от квартиры №<b>{h(apt_number or '')}</b>. Доступ к остальным привязанным квартирам сохранён."
     try:
-        await bot.send_message(
-            chat_id=tenant_tg_id,
-            text="Ваш Telegram ID был удалён из бота и доступ к боту прекращён.",
-            parse_mode="HTML",
-        )
+        await bot.send_message(chat_id=tenant_tg_id, text=text, parse_mode="HTML")
+        return True
     except Exception as e:
         logger.warning("Failed to send removal notice to %s: %s", tenant_tg_id, e)
+        return False
 
 
 async def forward_meter_photo_file(
@@ -94,9 +108,13 @@ async def forward_meter_photo_file(
     if not apt:
         return 0
     recipients = [r for r in await get_notification_recipients(apt_id) if r != sender_tg_id]
-    caption = f"📷 Фото счётчиков — <b>Кв. №{apt.number}</b>\nОт: {sender_name} (ID: {sender_tg_id})"
-    if comment.strip():
-        caption += f"\n💬 {comment.strip()}"
+    safe_comment = h(comment.strip()[:500])
+    caption = (
+        f"📷 Фото счётчиков — <b>Кв. №{h(apt.number)}</b>\n"
+        f"От: {h(sender_name)} (ID: {sender_tg_id})"
+    )
+    if safe_comment:
+        caption += f"\n💬 {safe_comment}"
 
     sent = 0
     for uid in recipients:

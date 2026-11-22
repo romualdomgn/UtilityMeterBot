@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from database import crud
@@ -12,6 +14,7 @@ from services.notifications import send_document_to_user
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import ExportBody, require_role
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -40,7 +43,14 @@ async def api_export(
         filepath = await generate_pdf_report(apartments)
         caption = "📄 Выгрузка показаний (PDF)"
 
-    await send_document_to_user(request.app.state.bot, user.telegram_id, filepath, caption)
+    try:
+        await send_document_to_user(request.app.state.bot, user.telegram_id, filepath, caption)
+    finally:
+        try:
+            filepath.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Failed to remove temp export %s: %s", filepath.name, e)
+
     await crud.add_audit_log(
         user.telegram_id, f"export_{body.format}",
         f"Файл {filepath.name}, квартир: {len(apartments)}",

@@ -1,11 +1,13 @@
-"""Consumption and Decimal billing calculations."""
+"""Calendar-month consumption and historical-tariff billing calculations."""
 
 from __future__ import annotations
 
+import calendar
 import datetime
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 
+from config import local_today
 from database import crud
 from database.models import (
     ALL_METERS,
@@ -33,11 +35,14 @@ def _round_to_rubles(amount: Decimal) -> int:
 @dataclass
 class MeterResult:
     meter_type: str
-    previous: int
-    current: int
+    previous: int | None
+    current: int | None
     consumption: int
-    tariff: Decimal
+    tariff: Decimal | None
     cost: int
+    has_base: bool = True
+    has_tariff: bool = True
+    submitted: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -47,8 +52,11 @@ class MeterResult:
             "previous": self.previous,
             "current": self.current,
             "consumption": self.consumption,
-            "tariff": float(self.tariff),
+            "tariff": float(self.tariff) if self.tariff is not None else None,
             "cost": self.cost,
+            "has_base": self.has_base,
+            "has_tariff": self.has_tariff,
+            "submitted": self.submitted,
         }
 
 
@@ -91,12 +99,13 @@ class BillingResult:
         }
 
 
-async def get_prev_value(apartment_id: int, meter_type: str) -> int:
+async def get_prev_value(apartment_id: int, meter_type: str) -> int | None:
+    """Latest saved reading or explicit initial reading; None if uninitialized."""
     latest = await crud.get_latest_reading(apartment_id, meter_type)
     if latest:
         return latest.value
     initial = await crud.get_initial_reading(apartment_id, meter_type)
-    return initial.value if initial else 0
+    return initial.value if initial else None
 
 
 async def calculate_billing(
@@ -105,52 +114,59 @@ async def calculate_billing(
     year: int | None = None,
     month: int | None = None,
 ) -> BillingResult:
-    today = datetime.date.today()
-    tariffs = await crud.get_all_tariffs(apartment_id)
+    """Calculate consumption and cost for a calendar month or live reading submission.
+
+    HIGH-01: calendar month always spans latest reading before 1st of month -> latest in month.
+    HIGH-02: tariffs resolved as of end of period (or today for live submission).
+    HIGH-05: missing initial reading is kept as None (no fake billing from 0).
+    """
+    today = local_today()
+    target_year = year or today.year
+    target_month = month or today.month
+    first_day = datetime.date(target_year, target_month, 1)
+    last_day = calendar.monthrange(target_year, target_month)[1]
+    end_of_month = datetime.date(target_year, target_month, last_day)
+
+    period_label = f"{MONTH_NAMES_RU.get(target_month, target_month)} {target_year}"
+    tariff_date = today if current_readings is not None else end_of_month
+
+    tariffs = await crud.get_all_tariffs(apartment_id, as_of_date=tariff_date)
     initials = await crud.get_all_initial_readings(apartment_id)
 
-    if year and month:
-        period_label = f"{MONTH_NAMES_RU.get(month, month)} {year}"
-        month_rows = await crud.get_readings_by_month(apartment_id, year, month)
-        latest_in_month: dict[str, int] = {}
-        for r in month_rows:
+    latest_in_month: dict[str, int] = {}
+    if current_readings is None:
+        for r in await crud.get_readings_by_month(apartment_id, target_year, target_month):
             if r.meter_type not in latest_in_month:
                 latest_in_month[r.meter_type] = r.value
-        first_day = datetime.date(year, month, 1)
-    else:
-        period_label = f"{MONTH_NAMES_RU.get(today.month, today.month)} {today.year}"
-        latest_in_month = {}
-        first_day = None
 
     res = BillingResult(apartment_id=apartment_id, period_label=period_label)
 
     for mt in ALL_METERS:
-        rate = Decimal(tariffs[mt].rate) if tariffs.get(mt) else Decimal("0")
-        init_val = initials.get(mt, 0)
+        tariff_obj = tariffs.get(mt)
+        has_tariff = tariff_obj is not None
+        rate = Decimal(tariff_obj.rate) if has_tariff else None
+        init_val = initials.get(mt)
 
         if current_readings is not None:
             if mt not in current_readings:
                 continue
             prev_val = await get_prev_value(apartment_id, mt)
-            curr_val = current_readings[mt]
-        elif year and month and first_day:
+            curr_val: int | None = current_readings[mt]
+            submitted = True
+        else:
             prev_rec = await crud.get_latest_reading_before(apartment_id, mt, first_day)
             prev_val = prev_rec.value if prev_rec else init_val
-            curr_val = latest_in_month.get(mt, prev_val)
-        else:
-            last_two = await crud.get_last_two_readings(apartment_id, mt)
-            if len(last_two) >= 2:
-                curr_val = last_two[0].value
-                prev_val = last_two[1].value
-            elif len(last_two) == 1:
-                curr_val = last_two[0].value
-                prev_val = init_val
-            else:
-                curr_val = init_val
-                prev_val = init_val
+            curr_val = latest_in_month.get(mt)
+            submitted = curr_val is not None
 
-        consumption = max(0, curr_val - prev_val)
-        cost = _round_to_rubles(Decimal(consumption) * rate)
+        has_base = prev_val is not None
+        if submitted and has_base and curr_val is not None and prev_val is not None:
+            consumption = max(0, curr_val - prev_val)
+            cost = _round_to_rubles(Decimal(consumption) * rate) if (has_tariff and rate is not None) else 0
+        else:
+            consumption = 0
+            cost = 0
+
         res.meters[mt] = MeterResult(
             meter_type=mt,
             previous=prev_val,
@@ -158,6 +174,9 @@ async def calculate_billing(
             consumption=consumption,
             tariff=rate,
             cost=cost,
+            has_base=has_base,
+            has_tariff=has_tariff,
+            submitted=submitted,
         )
 
     return res
@@ -166,10 +185,12 @@ async def calculate_billing(
 def format_reading_notification(
     apartment_number: str,
     meter_type: str,
-    prev_val: int,
+    prev_val: int | None,
     new_val: int,
 ) -> str:
     label = METER_LABELS.get(meter_type, meter_type)
     unit = METER_UNITS.get(meter_type, "")
+    if prev_val is None:
+        return f"{label}: <b>{new_val}</b> {unit} (начальное показание не задано)"
     diff = max(0, new_val - prev_val)
     return f"{label}: {prev_val} → <b>{new_val}</b> {unit} (расход: {diff} {unit})"

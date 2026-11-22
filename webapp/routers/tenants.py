@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from config import sync_id_to_env
-from database import crud
+import config
+from database import crud, operations
 from services.access import user_can_access_apartment
 from services.notifications import notify_tenant_added, notify_tenant_removed
 from webapp.auth import WebAppUser, get_current_user
@@ -22,10 +22,15 @@ async def api_update_contract(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа")
 
+    date_start = parse_iso_date(body.agreement_date_start)
+    date_finish = parse_iso_date(body.agreement_date_finish)
+    if date_start and date_finish and date_start > date_finish:
+        raise HTTPException(400, "Дата начала договора не может быть позже даты окончания")
+
     updates = {
         "agreement_no": (body.agreement_no or "").strip() or None,
-        "agreement_date_start": parse_iso_date(body.agreement_date_start),
-        "agreement_date_finish": parse_iso_date(body.agreement_date_finish),
+        "agreement_date_start": date_start,
+        "agreement_date_finish": date_finish,
     }
     if body.has_tenant is not None:
         updates["has_tenant"] = body.has_tenant
@@ -63,13 +68,15 @@ async def api_add_tenant(
         raise HTTPException(403, "Нет доступа")
     if body.telegram_id <= 0:
         raise HTTPException(400, "Telegram ID должен быть положительным числом")
+    if body.telegram_id == config.ADMIN_TELEGRAM_ID:
+        raise HTTPException(400, "Нельзя добавить администратора в качестве нанимателя")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Имя нанимателя не может быть пустым")
 
     existing = await crud.get_user_by_telegram_id(body.telegram_id)
     if existing:
-        role_map = {"admin": "администратор", "landlord": "владелец", "tenant": "арендатор"}
+        role_map = {"admin": "администратор", "landlord": "владелец", "tenant": "арендатор", "revoked": "отозван"}
         raise HTTPException(
             400,
             f"Пользователь ID {body.telegram_id} уже добавлен ({role_map.get(existing.role, existing.role)})",
@@ -94,15 +101,14 @@ async def api_add_tenant(
         role="tenant",
         family_id=apt.family_id,
     )
-    sync_id_to_env("tenant", body.telegram_id, remove=False)
     await crud.link_user_to_apartment(apt_id, new_user.id, role="tenant")
     await crud.update_apartment(apt_id, has_tenant=True)
     await crud.add_audit_log(
         user.telegram_id, "add_tenant",
         f"Наниматель {name} (ID: {body.telegram_id}) добавлен в кв. №{apt.number}",
     )
-    await notify_tenant_added(request.app.state.bot, apt, body.telegram_id, name)
-    return {"ok": True}
+    notified = await notify_tenant_added(request.app.state.bot, apt, body.telegram_id, name)
+    return {"ok": True, "notified": notified}
 
 
 @router.delete("/api/apartments/{apt_id}/tenants/{tenant_tg_id}")
@@ -116,19 +122,21 @@ async def api_remove_tenant(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа")
 
-    tenant = await crud.get_user_by_telegram_id(tenant_tg_id)
-    if tenant:
-        await crud.unlink_user_from_apartment(apt_id, tenant.id)
-        if not await crud.get_apartments_for_user(tenant_tg_id):
-            await crud.delete_user(tenant_tg_id)
-            sync_id_to_env("tenant", tenant_tg_id, remove=True)
-        await notify_tenant_removed(request.app.state.bot, tenant_tg_id)
+    try:
+        apt_number, fully_removed = await operations.remove_tenant_from_apartment_atomic(
+            apartment_id=apt_id,
+            tenant_tg_id=tenant_tg_id,
+            actor_tg_id=user.telegram_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
 
-    if not await crud.get_apartment_tenants(apt_id):
-        await crud.update_apartment(apt_id, has_tenant=False)
-
-    await crud.add_audit_log(
-        user.telegram_id, "remove_tenant",
-        f"Наниматель ID={tenant_tg_id} удалён из кв. id={apt_id}",
+    await notify_tenant_removed(
+        request.app.state.bot,
+        tenant_tg_id,
+        apt_number=apt_number,
+        fully_removed=fully_removed,
     )
-    return {"ok": True}
+    return {"ok": True, "fully_removed": fully_removed}

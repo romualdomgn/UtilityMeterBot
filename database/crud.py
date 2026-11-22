@@ -6,8 +6,9 @@ import datetime
 from decimal import Decimal
 from typing import Iterable
 
-from sqlalchemy import and_, delete, desc, extract, select
+from sqlalchemy import and_, desc, extract, func, select
 
+import config
 from database.models import (
     ALL_METERS,
     Apartment,
@@ -23,7 +24,7 @@ from database.session import async_session_factory
 
 
 class UnitOfWork:
-    """Async context manager yielding an active SQLAlchemy session."""
+    """Async context manager ensuring sessions always close in finally (MEDIUM-08)."""
 
     def __init__(self) -> None:
         self.session = None
@@ -33,11 +34,13 @@ class UnitOfWork:
         return self.session
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        if exc_type:
-            await self.session.rollback()
-        else:
-            await self.session.commit()
-        await self.session.close()
+        try:
+            if exc_type:
+                await self.session.rollback()
+            else:
+                await self.session.commit()
+        finally:
+            await self.session.close()
 
 
 async def get_all_families() -> list[Family]:
@@ -65,13 +68,6 @@ async def rename_family(family_id: int, new_name: str) -> None:
         fam = await s.get(Family, family_id)
         if fam:
             fam.name = new_name
-
-
-async def delete_family(family_id: int) -> None:
-    async with UnitOfWork() as s:
-        fam = await s.get(Family, family_id)
-        if fam:
-            await s.delete(fam)
 
 
 async def get_family_owners(family_id: int) -> list[User]:
@@ -134,20 +130,22 @@ async def get_or_create_user(
         return user, True
 
 
-async def delete_user(telegram_id: int) -> None:
+async def sync_admin_user(admin_tg_id: int) -> None:
+    """CRITICAL-02: revoke old admin roles in DB; set only current ADMIN_TELEGRAM_ID."""
+    if not admin_tg_id:
+        return
     async with UnitOfWork() as s:
-        res = await s.execute(select(User).where(User.telegram_id == telegram_id))
-        user = res.scalar_one_or_none()
-        if user:
-            await s.delete(user)
+        res = await s.execute(select(User).where(User.role == "admin", User.telegram_id != admin_tg_id))
+        for old in res.scalars().all():
+            old.role = "revoked"
 
-
-async def set_user_blocked(telegram_id: int, is_blocked: bool) -> None:
-    async with UnitOfWork() as s:
-        res = await s.execute(select(User).where(User.telegram_id == telegram_id))
-        user = res.scalar_one_or_none()
-        if user:
-            user.is_blocked = is_blocked
+        res_cur = await s.execute(select(User).where(User.telegram_id == admin_tg_id))
+        cur = res_cur.scalar_one_or_none()
+        if cur:
+            cur.role = "admin"
+            cur.is_blocked = False
+        else:
+            s.add(User(telegram_id=admin_tg_id, name="Администратор", role="admin"))
 
 
 async def get_apartment(apartment_id: int) -> Apartment | None:
@@ -166,14 +164,6 @@ async def get_apartments_by_family(family_id: int) -> list[Apartment]:
 async def get_all_apartments() -> list[Apartment]:
     async with UnitOfWork() as s:
         res = await s.execute(select(Apartment).order_by(Apartment.id))
-        return list(res.scalars().all())
-
-
-async def get_apartments_with_tenants(family_id: int) -> list[Apartment]:
-    async with UnitOfWork() as s:
-        res = await s.execute(
-            select(Apartment).where(Apartment.family_id == family_id).order_by(Apartment.id)
-        )
         return list(res.scalars().all())
 
 
@@ -199,13 +189,6 @@ async def update_apartment(apartment_id: int, **kwargs) -> Apartment | None:
         return apt
 
 
-async def delete_apartment(apartment_id: int) -> None:
-    async with UnitOfWork() as s:
-        apt = await s.get(Apartment, apartment_id)
-        if apt:
-            await s.delete(apt)
-
-
 async def link_user_to_apartment(apartment_id: int, user_id: int, role: str = "tenant") -> None:
     async with UnitOfWork() as s:
         res = await s.execute(
@@ -219,16 +202,6 @@ async def link_user_to_apartment(apartment_id: int, user_id: int, role: str = "t
             existing.role = role
         else:
             s.add(ApartmentUser(apartment_id=apartment_id, user_id=user_id, role=role))
-
-
-async def unlink_user_from_apartment(apartment_id: int, user_id: int) -> None:
-    async with UnitOfWork() as s:
-        await s.execute(
-            delete(ApartmentUser).where(
-                ApartmentUser.apartment_id == apartment_id,
-                ApartmentUser.user_id == user_id,
-            )
-        )
 
 
 async def get_apartments_for_user(telegram_id: int) -> list[Apartment]:
@@ -286,19 +259,35 @@ async def set_tariff(
         return tariff
 
 
-async def get_latest_tariff(apartment_id: int, tariff_type: str) -> Tariff | None:
+async def get_latest_tariff(
+    apartment_id: int,
+    tariff_type: str,
+    as_of_date: datetime.date | None = None,
+) -> Tariff | None:
+    """HIGH-02: query historical tariff effective as of target date."""
+    target_date = as_of_date or config.local_today()
     async with UnitOfWork() as s:
         res = await s.execute(
             select(Tariff)
-            .where(Tariff.apartment_id == apartment_id, Tariff.tariff_type == tariff_type)
+            .where(
+                Tariff.apartment_id == apartment_id,
+                Tariff.tariff_type == tariff_type,
+                Tariff.effective_from <= target_date,
+            )
             .order_by(desc(Tariff.effective_from), desc(Tariff.id))
             .limit(1)
         )
         return res.scalar_one_or_none()
 
 
-async def get_all_tariffs(apartment_id: int) -> dict[str, Tariff | None]:
-    return {mt: await get_latest_tariff(apartment_id, mt) for mt in ALL_METERS}
+async def get_all_tariffs(
+    apartment_id: int,
+    as_of_date: datetime.date | None = None,
+) -> dict[str, Tariff | None]:
+    return {
+        mt: await get_latest_tariff(apartment_id, mt, as_of_date=as_of_date)
+        for mt in ALL_METERS
+    }
 
 
 async def get_tariff_history(apartment_id: int, limit: int = 50) -> list[Tariff]:
@@ -312,37 +301,6 @@ async def get_tariff_history(apartment_id: int, limit: int = 50) -> list[Tariff]
         return list(res.scalars().all())
 
 
-async def set_initial_reading(
-    apartment_id: int,
-    meter_type: str,
-    value: int,
-    set_by: int,
-) -> InitialReading:
-    async with UnitOfWork() as s:
-        res = await s.execute(
-            select(InitialReading).where(
-                InitialReading.apartment_id == apartment_id,
-                InitialReading.meter_type == meter_type,
-            )
-        )
-        rec = res.scalar_one_or_none()
-        if rec:
-            rec.value = value
-            rec.set_by = set_by
-            rec.updated_at = datetime.datetime.utcnow()
-        else:
-            rec = InitialReading(
-                apartment_id=apartment_id,
-                meter_type=meter_type,
-                value=value,
-                set_by=set_by,
-            )
-            s.add(rec)
-        await s.flush()
-        await s.refresh(rec)
-        return rec
-
-
 async def get_initial_reading(apartment_id: int, meter_type: str) -> InitialReading | None:
     async with UnitOfWork() as s:
         res = await s.execute(
@@ -354,37 +312,17 @@ async def get_initial_reading(apartment_id: int, meter_type: str) -> InitialRead
         return res.scalar_one_or_none()
 
 
-async def get_all_initial_readings(apartment_id: int) -> dict[str, int]:
+async def get_all_initial_readings(apartment_id: int) -> dict[str, int | None]:
+    """HIGH-05: missing initial reading is None, not 0."""
     async with UnitOfWork() as s:
         res = await s.execute(
             select(InitialReading).where(InitialReading.apartment_id == apartment_id)
         )
         rows = res.scalars().all()
-        result = {mt: 0 for mt in ALL_METERS}
+        result: dict[str, int | None] = {mt: None for mt in ALL_METERS}
         for r in rows:
             result[r.meter_type] = r.value
         return result
-
-
-async def add_reading(
-    apartment_id: int,
-    meter_type: str,
-    value: int,
-    submitted_by: int,
-    reading_date: datetime.date,
-) -> MeterReading:
-    async with UnitOfWork() as s:
-        rec = MeterReading(
-            apartment_id=apartment_id,
-            meter_type=meter_type,
-            value=value,
-            submitted_by=submitted_by,
-            reading_date=reading_date,
-        )
-        s.add(rec)
-        await s.flush()
-        await s.refresh(rec)
-        return rec
 
 
 async def get_latest_reading(apartment_id: int, meter_type: str) -> MeterReading | None:
@@ -399,20 +337,6 @@ async def get_latest_reading(apartment_id: int, meter_type: str) -> MeterReading
             .limit(1)
         )
         return res.scalar_one_or_none()
-
-
-async def get_last_two_readings(apartment_id: int, meter_type: str) -> list[MeterReading]:
-    async with UnitOfWork() as s:
-        res = await s.execute(
-            select(MeterReading)
-            .where(
-                MeterReading.apartment_id == apartment_id,
-                MeterReading.meter_type == meter_type,
-            )
-            .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
-            .limit(2)
-        )
-        return list(res.scalars().all())
 
 
 async def get_reading_by_id(reading_id: int) -> MeterReading | None:
@@ -440,6 +364,14 @@ async def get_all_readings(apartment_id: int, limit: int = 200) -> list[MeterRea
             .limit(limit)
         )
         return list(res.scalars().all())
+
+
+async def get_readings_count(apartment_id: int) -> int:
+    async with UnitOfWork() as s:
+        res = await s.execute(
+            select(func.count(MeterReading.id)).where(MeterReading.apartment_id == apartment_id)
+        )
+        return int(res.scalar() or 0)
 
 
 async def get_reading_months(apartment_id: int) -> list[tuple[int, int]]:
@@ -498,10 +430,10 @@ async def get_latest_reading_before(
 
 
 async def has_readings_this_month(
-    apartment_id: int, meter_types: Iterable[str]
+    apartment_id: int, meter_types: Iterable[str], today: datetime.date | None = None
 ) -> bool:
-    today = datetime.date.today()
-    first_day = today.replace(day=1)
+    cur = today or config.local_today()
+    first_day = cur.replace(day=1)
     types_list = list(meter_types)
     async with UnitOfWork() as s:
         res = await s.execute(

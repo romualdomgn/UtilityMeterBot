@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from config import sync_id_to_env
-from database import crud
+import config
+from database import crud, operations
 from services.access import is_admin, user_can_manage_family
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import FamilyBody, FamilyOwnerBody, require_role
@@ -66,11 +66,10 @@ async def api_rename_family(
 @router.delete("/api/families/{family_id}")
 async def api_delete_family(family_id: int, user: WebAppUser = Depends(get_current_user)):
     require_role(user, ("admin",))
-    for u in await crud.get_users_by_family(family_id):
-        if u.role in ("landlord", "tenant"):
-            sync_id_to_env(u.role, u.telegram_id, remove=True)
-    await crud.delete_family(family_id)
-    await crud.add_audit_log(user.telegram_id, "delete_family", f"Семья id={family_id} удалена")
+    try:
+        await operations.delete_family_atomic(family_id, user.telegram_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True}
 
 
@@ -82,6 +81,8 @@ async def api_add_family_owner(
         raise HTTPException(403, "Нет доступа")
     if body.telegram_id <= 0:
         raise HTTPException(400, "Telegram ID должен быть положительным числом")
+    if body.telegram_id == config.ADMIN_TELEGRAM_ID:
+        raise HTTPException(400, "Администратор уже имеет доступ ко всем семьям")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Имя не может быть пустым")
@@ -97,7 +98,6 @@ async def api_add_family_owner(
         role="landlord",
         family_id=family_id,
     )
-    sync_id_to_env("landlord", body.telegram_id, remove=False)
     await crud.add_audit_log(
         user.telegram_id, "add_family_owner",
         f"Владелец {name} (ID: {body.telegram_id}) добавлен в семью id={family_id}",
@@ -111,10 +111,10 @@ async def api_delete_family_owner(
 ):
     if not await user_can_manage_family(user.telegram_id, family_id):
         raise HTTPException(403, "Нет доступа")
-    await crud.delete_user(owner_tg_id)
-    sync_id_to_env("landlord", owner_tg_id, remove=True)
-    await crud.add_audit_log(
-        user.telegram_id, "delete_family_owner",
-        f"Владелец ID={owner_tg_id} удалён из семьи id={family_id}",
-    )
+    try:
+        await operations.delete_family_owner_atomic(family_id, owner_tg_id, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True}

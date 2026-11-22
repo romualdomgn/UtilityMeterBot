@@ -10,9 +10,11 @@ const state = {
   submitSubtab: "water",
   manageSubtab: "settings",
   historyMonth: "",
+  aptReqSeq: 0,
+  histReqSeq: 0,
 };
 
-const ROLE_RU = { admin: "Администратор", landlord: "Владелец", tenant: "Наниматель" };
+const ROLE_RU = { admin: "Администратор", landlord: "Владелец", tenant: "Наниматель", revoked: "Отозван" };
 const MONTH_RU = ["", "Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"];
 
 function esc(v) {
@@ -32,7 +34,7 @@ function showToast(msg) {
   el.textContent = msg;
   el.classList.remove("hidden");
   clearTimeout(el._timer);
-  el._timer = setTimeout(() => el.classList.add("hidden"), 3000);
+  el._timer = setTimeout(() => el.classList.add("hidden"), 3500);
 }
 
 function openModal(title, bodyHtml, buttons) {
@@ -104,8 +106,12 @@ async function loadBootstrap() {
 }
 
 async function loadApartmentDetail(aptId) {
-  if (!aptId) { state.aptDetail = null; return; }
-  state.aptDetail = await api(`/api/apartments/${aptId}`);
+  if (!aptId) { state.aptDetail = null; return true; }
+  const seq = ++state.aptReqSeq;
+  const detail = await api(`/api/apartments/${aptId}`);
+  if (seq !== state.aptReqSeq || aptId !== state.selectedAptId) return false;
+  state.aptDetail = detail;
+  return true;
 }
 
 function renderAptSelector() {
@@ -118,8 +124,8 @@ function renderAptSelector() {
   sel.onchange = async () => {
     state.selectedAptId = Number(sel.value);
     state.historyMonth = "";
-    await loadApartmentDetail(state.selectedAptId);
-    await renderTab();
+    const ok = await loadApartmentDetail(state.selectedAptId);
+    if (ok) await renderTab();
   };
 }
 
@@ -181,6 +187,30 @@ async function renderTab() {
   }
 }
 
+function renderMeterRow(m) {
+  let subline;
+  let rightCol;
+  if (!m.submitted) {
+    const prevTxt = m.has_base ? `пред.: ${m.previous} ${esc(m.unit)}` : "начальное не задано";
+    subline = `Ещё не подано (${prevTxt})`;
+    rightCol = `<span class="small muted">0 ₽</span>`;
+  } else if (!m.has_base) {
+    subline = `Подано: ${m.current} ${esc(m.unit)} · <b>не задано начальное показание</b>`;
+    rightCol = `<span class="small muted">—</span>`;
+  } else if (!m.has_tariff) {
+    subline = `${m.previous} → ${m.current} ${esc(m.unit)} (расход ${m.consumption}) · <b>не задан тариф</b>`;
+    rightCol = `<span class="small muted">—</span>`;
+  } else {
+    subline = `${m.previous} → ${m.current} ${esc(m.unit)} (расход ${m.consumption}, тариф ${m.tariff} ₽)`;
+    rightCol = `<div class="bold">${m.cost} ₽</div>`;
+  }
+  return `
+    <div class="table-row">
+      <div><div class="bold">${esc(m.label)}</div><div class="small muted">${subline}</div></div>
+      ${rightCol}
+    </div>`;
+}
+
 function renderDashboard(root) {
   if (!state.aptDetail) {
     const canCreate = state.user.role !== "tenant";
@@ -195,14 +225,7 @@ function renderDashboard(root) {
   }
 
   const { apartment: apt, billing, tenants } = state.aptDetail;
-  const rows = Object.values(billing.meters).map(m => `
-    <div class="table-row">
-      <div>
-        <div class="bold">${esc(m.label)}</div>
-        <div class="small muted">${m.previous} → ${m.current} ${esc(m.unit)} (расход ${m.consumption}, тариф ${m.tariff} ₽)</div>
-      </div>
-      <div class="bold">${m.cost} ₽</div>
-    </div>`).join("");
+  const rows = Object.values(billing.meters).map(renderMeterRow).join("");
 
   root.innerHTML = `
     <div class="card">
@@ -219,7 +242,7 @@ function renderDashboard(root) {
       </div>
     </div>
     <div class="card">
-      <h3>📊 Расход — ${esc(billing.period_label)}</h3>
+      <h3>📊 Расход за ${esc(billing.period_label)}</h3>
       ${rows}
     </div>
     <div class="grid-2">
@@ -258,6 +281,12 @@ async function doExport(format, aptId) {
   } catch (err) { showToast("❌ " + err.message); }
 }
 
+function fmtPrevLabel(val, unit, tariff) {
+  const p = val === null || val === undefined ? "не задано" : `<b>${val}</b> ${unit}`;
+  const t = tariff === null || tariff === undefined ? "тариф не задан" : `тариф: ${tariff} ₽`;
+  return `предыдущее: ${p}, ${t}`;
+}
+
 function renderSubmit(root) {
   if (!state.aptDetail) {
     root.innerHTML = `<div class="card center muted">Сначала выберите или создайте квартиру.</div>`;
@@ -274,14 +303,14 @@ function renderSubmit(root) {
         <button class="subtab ${!isWater ? "active" : ""}" id="tab-e">⚡ Электричество</button>
       </div>
       ${isWater ? `
-        <div class="field"><label>💧 ХВС (предыдущее: <b>${prev.cold_water}</b> м³, тариф: ${tariffs.cold_water ?? 0} ₽)</label><input type="number" inputmode="numeric" min="0" step="1" id="in-cold" placeholder="${prev.cold_water}" /></div>
-        <div class="field"><label>🔥 ГВС (предыдущее: <b>${prev.hot_water}</b> м³, тариф: ${tariffs.hot_water ?? 0} ₽)</label><input type="number" inputmode="numeric" min="0" step="1" id="in-hot" placeholder="${prev.hot_water}" /></div>
+        <div class="field"><label>💧 ХВС (${fmtPrevLabel(prev.cold_water, "м³", tariffs.cold_water)})</label><input type="number" inputmode="numeric" min="0" step="1" id="in-cold" placeholder="${prev.cold_water ?? ""}" /></div>
+        <div class="field"><label>🔥 ГВС (${fmtPrevLabel(prev.hot_water, "м³", tariffs.hot_water)})</label><input type="number" inputmode="numeric" min="0" step="1" id="in-hot" placeholder="${prev.hot_water ?? ""}" /></div>
         <div id="calc-preview" class="preview-box muted">Введите целые значения для предрасчёта стоимости.</div>
         <button class="btn" id="btn-submit-water">✅ Сохранить показания воды</button>
       ` : `
-        <div class="field"><label>⚡ Т1 (предыдущее: <b>${prev.t1}</b> кВт·ч, тариф: ${tariffs.t1 ?? 0} ₽)</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t1" placeholder="${prev.t1}" /></div>
-        <div class="field"><label>⚡ Т2 (предыдущее: <b>${prev.t2}</b> кВт·ч, тариф: ${tariffs.t2 ?? 0} ₽)</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t2" placeholder="${prev.t2}" /></div>
-        <div class="field"><label>⚡ Т3 (предыдущее: <b>${prev.t3}</b> кВт·ч, тариф: ${tariffs.t3 ?? 0} ₽)</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t3" placeholder="${prev.t3}" /></div>
+        <div class="field"><label>⚡ Т1 (${fmtPrevLabel(prev.t1, "кВт·ч", tariffs.t1)})</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t1" placeholder="${prev.t1 ?? ""}" /></div>
+        <div class="field"><label>⚡ Т2 (${fmtPrevLabel(prev.t2, "кВт·ч", tariffs.t2)})</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t2" placeholder="${prev.t2 ?? ""}" /></div>
+        <div class="field"><label>⚡ Т3 (${fmtPrevLabel(prev.t3, "кВт·ч", tariffs.t3)})</label><input type="number" inputmode="numeric" min="0" step="1" id="in-t3" placeholder="${prev.t3 ?? ""}" /></div>
         <div id="calc-preview" class="preview-box muted">Введите целые значения для предрасчёта стоимости.</div>
         <button class="btn" id="btn-submit-elec">✅ Сохранить показания электричества</button>
       `}
@@ -299,9 +328,14 @@ function renderSubmit(root) {
       const h = parseInt(document.getElementById("in-hot").value, 10);
       const box = document.getElementById("calc-preview");
       if (isNaN(c) || isNaN(h)) { box.textContent = "Введите оба значения (целые числа)."; return; }
+      if (prev.cold_water === null || prev.hot_water === null) {
+        box.innerHTML = "⚠️ Начальные показания не заданы — значения сохранятся без расчёта расхода.";
+        return;
+      }
       const dc = Math.max(0, c - prev.cold_water), dh = Math.max(0, h - prev.hot_water);
-      const cost = Math.round(dc * (tariffs.cold_water || 0)) + Math.round(dh * (tariffs.hot_water || 0));
-      box.innerHTML = `Расход ХВС: <b>${dc} м³</b> · ГВС: <b>${dh} м³</b><br>Ориентировочно: <b>${cost} ₽</b>`;
+      const hasTariffs = tariffs.cold_water !== null && tariffs.hot_water !== null;
+      const cost = hasTariffs ? `${Math.round(dc * tariffs.cold_water) + Math.round(dh * tariffs.hot_water)} ₽` : "тариф не задан";
+      box.innerHTML = `Расход ХВС: <b>${dc} м³</b> · ГВС: <b>${dh} м³</b><br>Ориентировочно: <b>${cost}</b>`;
     };
     document.getElementById("in-cold").oninput = updatePreview;
     document.getElementById("in-hot").oninput = updatePreview;
@@ -313,9 +347,16 @@ function renderSubmit(root) {
       const v3 = parseInt(document.getElementById("in-t3").value, 10);
       const box = document.getElementById("calc-preview");
       if (isNaN(v1) || isNaN(v2) || isNaN(v3)) { box.textContent = "Введите Т1, Т2 и Т3 (целые числа)."; return; }
+      if (prev.t1 === null || prev.t2 === null || prev.t3 === null) {
+        box.innerHTML = "⚠️ Начальные показания не заданы — значения сохранятся без расчёта расхода.";
+        return;
+      }
       const d1 = Math.max(0, v1 - prev.t1), d2 = Math.max(0, v2 - prev.t2), d3 = Math.max(0, v3 - prev.t3);
-      const cost = Math.round(d1 * (tariffs.t1 || 0)) + Math.round(d2 * (tariffs.t2 || 0)) + Math.round(d3 * (tariffs.t3 || 0));
-      box.innerHTML = `Расход: Т1 <b>${d1}</b> · Т2 <b>${d2}</b> · Т3 <b>${d3}</b> кВт·ч<br>Ориентировочно: <b>${cost} ₽</b>`;
+      const hasTariffs = tariffs.t1 !== null && tariffs.t2 !== null && tariffs.t3 !== null;
+      const cost = hasTariffs
+        ? `${Math.round(d1 * tariffs.t1) + Math.round(d2 * tariffs.t2) + Math.round(d3 * tariffs.t3)} ₽`
+        : "тариф не задан";
+      box.innerHTML = `Расход: Т1 <b>${d1}</b> · Т2 <b>${d2}</b> · Т3 <b>${d3}</b> кВт·ч<br>Ориентировочно: <b>${cost}</b>`;
     };
     ["in-t1", "in-t2", "in-t3"].forEach(id => document.getElementById(id).oninput = updatePreview);
     document.getElementById("btn-submit-elec").onclick = () => submitElec(apt.id, false);
@@ -330,9 +371,12 @@ function parseWholeInt(id) {
 async function submitWater(aptId, force) {
   const cold = parseWholeInt("in-cold"), hot = parseWholeInt("in-hot");
   if (cold === null || hot === null) return showToast("Введите целые неотрицательные числа");
+  const btn = document.getElementById("btn-submit-water");
+  if (btn) btn.disabled = true;
   try {
     const res = await api(`/api/apartments/${aptId}/readings/water`, { method: "POST", body: { cold_water: cold, hot_water: hot, force } });
     if (res.needs_confirm) {
+      if (btn) btn.disabled = false;
       return openModal("⚠️ Значение меньше предыдущего", `<p>${esc(res.warning)}</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
         { label: "Сохранить", cls: "btn-danger", onClick: () => submitWater(aptId, true) },
@@ -342,15 +386,21 @@ async function submitWater(aptId, force) {
     await loadApartmentDetail(aptId);
     state.activeTab = "dashboard";
     await renderTab();
-  } catch (err) { showToast("❌ " + err.message); }
+  } catch (err) {
+    showToast("❌ " + err.message);
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function submitElec(aptId, force) {
   const t1 = parseWholeInt("in-t1"), t2 = parseWholeInt("in-t2"), t3 = parseWholeInt("in-t3");
   if (t1 === null || t2 === null || t3 === null) return showToast("Введите целые неотрицательные числа");
+  const btn = document.getElementById("btn-submit-elec");
+  if (btn) btn.disabled = true;
   try {
     const res = await api(`/api/apartments/${aptId}/readings/electricity`, { method: "POST", body: { t1, t2, t3, force } });
     if (res.needs_confirm) {
+      if (btn) btn.disabled = false;
       return openModal("⚠️ Значение меньше предыдущего", `<p>${esc(res.warning)}</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
         { label: "Сохранить", cls: "btn-danger", onClick: () => submitElec(aptId, true) },
@@ -360,15 +410,21 @@ async function submitElec(aptId, force) {
     await loadApartmentDetail(aptId);
     state.activeTab = "dashboard";
     await renderTab();
-  } catch (err) { showToast("❌ " + err.message); }
+  } catch (err) {
+    showToast("❌ " + err.message);
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function renderHistory(root) {
   if (!state.selectedAptId) { root.innerHTML = `<div class="card center muted">Нет доступных квартир.</div>`; return; }
+  const aptId = state.selectedAptId;
+  const seq = ++state.histReqSeq;
   const q = state.historyMonth ? `?year=${state.historyMonth.split("-")[0]}&month=${state.historyMonth.split("-")[1]}` : "";
-  const data = await api(`/api/apartments/${state.selectedAptId}/history${q}`);
-  const canEdit = state.user.role !== "tenant";
+  const data = await api(`/api/apartments/${aptId}/history${q}`);
+  if (seq !== state.histReqSeq || aptId !== state.selectedAptId || state.activeTab !== "history") return;
 
+  const canEdit = state.user.role !== "tenant";
   const monthOptions = `<option value="">Все последние</option>` +
     data.months.map(m => {
       const key = `${m.year}-${m.month}`;
@@ -430,8 +486,8 @@ function renderPhoto(root) {
   root.innerHTML = `
     <div class="card">
       <h2>📷 Фото счётчиков — Кв. №${esc(apt.number)}</h2>
-      <p class="small muted">Фото будет переслано владельцам квартиры в Telegram.</p>
-      <div class="field mt-8"><label>Выберите или сделайте фото</label><input type="file" id="photo-file" accept="image/*" /></div>
+      <p class="small muted">Фото будет переслано владельцам квартиры в Telegram и сохранено на сервере на 30 дней.</p>
+      <div class="field mt-8"><label>Выберите или сделайте фото (до 15 МБ)</label><input type="file" id="photo-file" accept="image/*" /></div>
       <div class="field"><label>Комментарий (необязательно)</label><input type="text" id="photo-comment" placeholder="Например: счётчики воды за ноябрь" /></div>
       <button class="btn" id="btn-send-photo">📤 Отправить владельцам</button>
     </div>
@@ -446,7 +502,11 @@ function renderPhoto(root) {
     btn.disabled = true;
     try {
       const res = await api(`/api/apartments/${apt.id}/photo`, { method: "POST", body: fd });
-      showToast(`✅ Фото отправлено (получателей: ${res.recipients_count})`);
+      if (res.recipients_count > 0) {
+        showToast(`✅ Фото отправлено (получателей: ${res.recipients_count})`);
+      } else {
+        showToast("⚠️ Фото сохранено, но получателей в Telegram не найдено");
+      }
       fileInput.value = "";
       document.getElementById("photo-comment").value = "";
     } catch (err) { showToast("❌ " + err.message); }
@@ -488,14 +548,15 @@ function renderApartments(root) {
         </div>`;
     } else if (state.manageSubtab === "initial") {
       bodyHtml = `
-        <div class="grid-2">
-          <div class="field"><label>💧 ХВС (м³)</label><input type="number" min="0" id="i-cold" value="${initR.cold_water ?? 0}" /></div>
-          <div class="field"><label>🔥 ГВС (м³)</label><input type="number" min="0" id="i-hot" value="${initR.hot_water ?? 0}" /></div>
+        <p class="small muted">Оставьте поле пустым, если начальное значение ещё не задано (укажите 0, если счётчик новый).</p>
+        <div class="grid-2 mt-8">
+          <div class="field"><label>💧 ХВС (м³)</label><input type="number" min="0" id="i-cold" placeholder="Не задано" value="${initR.cold_water ?? ""}" /></div>
+          <div class="field"><label>🔥 ГВС (м³)</label><input type="number" min="0" id="i-hot" placeholder="Не задано" value="${initR.hot_water ?? ""}" /></div>
         </div>
         <div class="grid-3">
-          <div class="field"><label>⚡ Т1</label><input type="number" min="0" id="i-t1" value="${initR.t1 ?? 0}" /></div>
-          <div class="field"><label>⚡ Т2</label><input type="number" min="0" id="i-t2" value="${initR.t2 ?? 0}" /></div>
-          <div class="field"><label>⚡ Т3</label><input type="number" min="0" id="i-t3" value="${initR.t3 ?? 0}" /></div>
+          <div class="field"><label>⚡ Т1</label><input type="number" min="0" id="i-t1" placeholder="Не задано" value="${initR.t1 ?? ""}" /></div>
+          <div class="field"><label>⚡ Т2</label><input type="number" min="0" id="i-t2" placeholder="Не задано" value="${initR.t2 ?? ""}" /></div>
+          <div class="field"><label>⚡ Т3</label><input type="number" min="0" id="i-t3" placeholder="Не задано" value="${initR.t3 ?? ""}" /></div>
         </div>
         <button class="btn" id="btn-save-initial">💾 Сохранить начальные показания</button>`;
     } else {
@@ -541,8 +602,8 @@ function renderApartments(root) {
     btn.onclick = async () => {
       state.selectedAptId = Number(btn.dataset.apt);
       renderAptSelector();
-      await loadApartmentDetail(state.selectedAptId);
-      renderApartments(root);
+      const ok = await loadApartmentDetail(state.selectedAptId);
+      if (ok) renderApartments(root);
     };
   });
   root.querySelectorAll("[data-m]").forEach(btn => {
@@ -603,15 +664,19 @@ function renderApartments(root) {
   });
 
   document.getElementById("btn-save-initial")?.addEventListener("click", async () => {
+    const optInt = (id) => {
+      const v = document.getElementById(id).value.trim();
+      return v === "" ? null : Number(v);
+    };
     try {
       await api(`/api/apartments/${apt.id}/initial-readings`, {
         method: "PUT",
         body: {
-          cold_water: Number(document.getElementById("i-cold").value || 0),
-          hot_water: Number(document.getElementById("i-hot").value || 0),
-          t1: Number(document.getElementById("i-t1").value || 0),
-          t2: Number(document.getElementById("i-t2").value || 0),
-          t3: Number(document.getElementById("i-t3").value || 0),
+          cold_water: optInt("i-cold"),
+          hot_water: optInt("i-hot"),
+          t1: optInt("i-t1"),
+          t2: optInt("i-t2"),
+          t3: optInt("i-t3"),
         },
       });
       showToast("✅ Начальные показания сохранены");
@@ -656,6 +721,7 @@ function renderApartments(root) {
       <div class="field"><label>Telegram ID (через @userinfobot)</label><input type="number" id="nt-id" /></div>
       <div class="field"><label>Имя</label><input type="text" id="nt-name" /></div>
       <div class="field"><label>Телефон (необязательно)</label><input type="text" id="nt-phone" /></div>
+      <p class="small muted">Бот сможет отправить приглашение только если наниматель ранее уже нажимал /start.</p>
     `, [
       { label: "Отмена", cls: "btn-secondary" },
       {
@@ -673,7 +739,7 @@ function renderApartments(root) {
   root.querySelectorAll(".del-tenant-btn").forEach(btn => {
     btn.onclick = () => {
       const tid = Number(btn.dataset.tid);
-      openModal("Удалить нанимателя?", `<p>Отозвать доступ у ID ${tid}?</p>`, [
+      openModal("Удалить нанимателя?", `<p>Отозвать доступ у ID ${tid} к кв. №${esc(apt.number)}?</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
@@ -695,10 +761,14 @@ async function submitAddTenant(aptId, payload) {
     if (res.needs_confirm) {
       return openModal("⚠️ Договор не заполнен", `<p>${esc(res.warning)}</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
-        { label: "Отправить приглашение", onClick: () => submitAddTenant(aptId, { ...payload, force_no_contract: true }) },
+        { label: "Добавить", onClick: () => submitAddTenant(aptId, { ...payload, force_no_contract: true }) },
       ]);
     }
-    showToast("✅ Наниматель добавлен");
+    showToast(
+      res.notified
+        ? "✅ Наниматель добавлен, приглашение отправлено"
+        : "✅ Наниматель добавлен (попросите его нажать /start в боте)"
+    );
     await loadApartmentDetail(aptId);
     renderTab();
   } catch (err) { showToast("❌ " + err.message); }
@@ -715,7 +785,7 @@ async function renderFamilies(root) {
           ${f.owners.length ? f.owners.map(o => `
             <div class="table-row">
               <div><div class="bold">${esc(o.name || "—")}</div><div class="small muted">ID: ${o.telegram_id}${o.phone ? " · " + esc(o.phone) : ""}</div></div>
-              <button class="btn btn-danger btn-sm del-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}">✕</button>
+              <button class="btn btn-danger btn-sm del-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || o.telegram_id)}">✕</button>
             </div>`).join("") : `<p class="small muted">Владельцев нет.</p>`}
         </div>
         <div class="row-gap mt-12">
@@ -791,14 +861,16 @@ async function renderFamilies(root) {
 
   root.querySelectorAll(".del-owner-btn").forEach(btn => {
     btn.onclick = () => {
-      openModal("Удалить владельца?", `<p>Удалить ID ${btn.dataset.oid}?</p>`, [
+      openModal("Удалить владельца?", `<p>Удалить владельца <b>${esc(btn.dataset.oname)}</b> (ID ${btn.dataset.oid})?</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
           onClick: async () => {
-            await api(`/api/families/${btn.dataset.fid}/owners/${btn.dataset.oid}`, { method: "DELETE" });
-            showToast("✅ Владелец удалён");
-            await renderFamilies(root);
+            try {
+              await api(`/api/families/${btn.dataset.fid}/owners/${btn.dataset.oid}`, { method: "DELETE" });
+              showToast("✅ Владелец удалён");
+              await renderFamilies(root);
+            } catch (err) { showToast("❌ " + err.message); }
           },
         },
       ]);
@@ -807,7 +879,7 @@ async function renderFamilies(root) {
 
   root.querySelectorAll(".del-fam-btn").forEach(btn => {
     btn.onclick = () => {
-      openModal("🗑 Удалить семью?", `<p>Удалить «${esc(btn.dataset.name)}» вместе со всеми квартирами и показаниями?</p>`, [
+      openModal("🗑 Удалить семью?", `<p>Удалить «${esc(btn.dataset.name)}» вместе со всеми квартирами, показаниями и привязанными пользователями?</p>`, [
         { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
