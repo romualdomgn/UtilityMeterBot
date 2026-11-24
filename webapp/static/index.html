@@ -11,22 +11,28 @@
   <div id="app">
     <header class="topbar">
       <div class="topbar-row">
-        <div>
+        <div class="topbar-title-wrap">
           <h1 id="app-title">Счётчики</h1>
-          <div id="user-badge" class="muted small">Загрузка...</div>
+          <button id="edit-profile-btn" class="user-badge-btn" type="button" title="Изменить имя" disabled>
+            <span id="user-badge" class="muted small">Загрузка...</span>
+            <span id="edit-profile-ico" class="edit-ico hidden">✏️</span>
+          </button>
         </div>
         <select id="apt-selector" class="apt-select hidden"></select>
       </div>
     </header>
 
     <main id="content" class="content">
-      <div class="card center muted">Подключение к серверу...</div>
+      <div class="card center muted loading-card">
+        <span class="spinner"></span>
+        <span>Подключение к серверу...</span>
+      </div>
     </main>
 
     <nav id="bottom-nav" class="bottom-nav hidden"></nav>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <div id="modal-overlay" class="modal-overlay hidden">
     <div class="modal-card">
       <h3 id="modal-title"></h3>

@@ -9,7 +9,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from config import BACKUP_DIR, DATABASE_URL, PHOTO_RETENTION_DAYS, PHOTOS_DIR
+from config import BACKUP_DIR, BOT_TZ, DATABASE_URL, PHOTO_RETENTION_DAYS, PHOTOS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +26,14 @@ def _resolve_db_path() -> Path:
 
 def _create_backup_sync(keep_last: int = 14) -> Path:
     db_path = _resolve_db_path()
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     backup_path = BACKUP_DIR / f"utility_meter_backup_{timestamp}.db"
 
     src = sqlite3.connect(str(db_path))
     dst = sqlite3.connect(str(backup_path))
     try:
         with dst:
-            src.backup(dst)
+            src.backup(dst, pages=100, sleep=0.01)
     finally:
         dst.close()
         src.close()

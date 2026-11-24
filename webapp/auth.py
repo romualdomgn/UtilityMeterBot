@@ -11,9 +11,8 @@ from urllib.parse import parse_qsl
 
 from fastapi import Header, HTTPException
 
-from config import INIT_DATA_MAX_AGE_SECONDS, TELEGRAM_BOT_TOKEN
-from database import crud
-from services.access import check_user_access, get_user_family_id, get_user_role
+import config
+from services.access import resolve_user_access
 
 
 @dataclass
@@ -34,7 +33,7 @@ def validate_init_data(init_data: str) -> dict:
         raise HTTPException(status_code=401, detail="Missing hash in initData")
 
     check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
-    secret = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    secret = hmac.new(b"WebAppData", config.TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
     expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected, received_hash):
@@ -45,7 +44,7 @@ def validate_init_data(init_data: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid auth_date")
 
-    if time.time() - auth_date > INIT_DATA_MAX_AGE_SECONDS:
+    if time.time() - auth_date > config.INIT_DATA_MAX_AGE_SECONDS:
         raise HTTPException(status_code=401, detail="initData expired")
 
     return fields
@@ -63,13 +62,11 @@ async def get_current_user(x_init_data: str = Header(default="")) -> WebAppUser:
     except (ValueError, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Malformed user payload")
 
-    allowed, reason = await check_user_access(tid)
+    allowed, reason, role, db_user = await resolve_user_access(tid)
     if not allowed:
         raise HTTPException(status_code=403, detail=reason or "Access denied")
 
-    role = await get_user_role(tid)
-    family_id = await get_user_family_id(tid)
-    db_user = await crud.get_user_by_telegram_id(tid)
+    family_id = db_user.family_id if db_user else None
     tg_name = " ".join(
         p for p in (tg_user.get("first_name"), tg_user.get("last_name")) if p
     ).strip()

@@ -27,14 +27,14 @@ async def api_export(
     require_role(user, ("admin", "landlord"))
     if body.apartment_id:
         if not await user_can_access_apartment(user.telegram_id, body.apartment_id):
-            raise HTTPException(403, "Нет доступа к квартире")
+            raise HTTPException(403, "Нет доступа к объекту недвижимости")
         apt = await crud.get_apartment(body.apartment_id)
         apartments = [apt] if apt else []
     else:
         apartments = await get_accessible_apartments(user.telegram_id)
 
     if not apartments:
-        raise HTTPException(400, "Нет квартир для выгрузки")
+        raise HTTPException(400, "Нет объектов недвижимости для выгрузки")
 
     if body.format == "excel":
         filepath = await generate_excel_report(apartments)
@@ -53,7 +53,7 @@ async def api_export(
 
     await crud.add_audit_log(
         user.telegram_id, f"export_{body.format}",
-        f"Файл {filepath.name}, квартир: {len(apartments)}",
+        f"Файл {filepath.name}, объектов: {len(apartments)}",
     )
     return {"ok": True, "filename": filepath.name}
 

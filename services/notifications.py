@@ -11,6 +11,7 @@ from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarku
 
 from config import WEBAPP_URL
 from database import crud
+from database.models import format_property_short, format_property_title
 from services.access import get_notification_recipients
 from services.calculations import fmt_date, format_reading_notification
 
@@ -38,7 +39,8 @@ async def notify_new_readings(
     if not recipients:
         return 0
 
-    lines = [f"📊 <b>Новые показания — Кв. №{h(apt.number)}</b>\n"]
+    prop_label = format_property_short(apt)
+    lines = [f"📊 <b>Новые показания — {h(prop_label)}</b>\n"]
     for mt, new_val in meters.items():
         prev_val = prev_meters.get(mt)
         lines.append(format_reading_notification(apt.number, mt, prev_val, new_val))
@@ -59,12 +61,13 @@ async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str
     agr_no = h(apt.agreement_no or "б/н")
     date_start = fmt_date(apt.agreement_date_start)
     date_finish = fmt_date(apt.agreement_date_finish)
+    prop_title = h(format_property_title(apt))
     try:
         await bot.send_message(
             chat_id=tenant_tg_id,
             text=(
                 f"👋 Здравствуйте, <b>{h(tenant_name)}</b>!\n\n"
-                f"Вы добавлены как наниматель квартиры №<b>{h(apt.number)}</b> "
+                f"Вы добавлены как наниматель объекта <b>{prop_title}</b> "
                 f"(договор №<b>{agr_no}</b> от <b>{date_start}</b> "
                 f"со сроком действия до <b>{date_finish}</b>).\n"
                 f"Откройте Mini App кнопкой ниже для подачи показаний."
@@ -87,7 +90,7 @@ async def notify_tenant_removed(
     if fully_removed:
         text = "Ваш Telegram ID был удалён из бота и доступ к боту прекращён."
     else:
-        text = f"Вы откреплены от квартиры №<b>{h(apt_number or '')}</b>. Доступ к остальным привязанным квартирам сохранён."
+        text = f"Вы откреплены от объекта <b>{h(apt_number or '')}</b>. Доступ к остальным привязанным объектам сохранён."
     try:
         await bot.send_message(chat_id=tenant_tg_id, text=text, parse_mode="HTML")
         return True
@@ -110,7 +113,7 @@ async def forward_meter_photo_file(
     recipients = [r for r in await get_notification_recipients(apt_id) if r != sender_tg_id]
     safe_comment = h(comment.strip()[:500])
     caption = (
-        f"📷 Фото счётчиков — <b>Кв. №{h(apt.number)}</b>\n"
+        f"📷 Фото счётчиков — <b>{h(format_property_short(apt))}</b>\n"
         f"От: {h(sender_name)} (ID: {sender_tg_id})"
     )
     if safe_comment:

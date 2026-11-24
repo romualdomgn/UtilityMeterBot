@@ -11,9 +11,10 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import MenuButtonWebApp, Message, WebAppInfo
 
-from config import PHOTOS_DIR, WEBAPP_URL
+from config import BOT_TZ, PHOTOS_DIR, WEBAPP_URL
 from database import crud
-from services.access import check_user_access, get_accessible_apartments, get_user_role
+from database.models import format_property_short
+from services.access import get_accessible_apartments, resolve_user_access
 from services.notifications import forward_meter_photo_file, webapp_open_kb
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,11 @@ ROLE_TITLES = {
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     tid = message.from_user.id
-    allowed, reason = await check_user_access(tid)
+    allowed, reason, role, _ = await resolve_user_access(tid)
     if not allowed:
         await message.answer(reason or "⛔ Доступ запрещён.", parse_mode="HTML")
         return
 
-    role = await get_user_role(tid)
     try:
         await message.bot.set_chat_menu_button(
             chat_id=message.chat.id,
@@ -60,31 +60,31 @@ async def cmd_start(message: Message) -> None:
 @router.message(F.photo)
 async def on_direct_photo(message: Message) -> None:
     tid = message.from_user.id
-    allowed, reason = await check_user_access(tid)
+    allowed, reason, _, user = await resolve_user_access(tid)
     if not allowed:
         await message.answer(reason or "⛔ Доступ запрещён.", parse_mode="HTML")
         return
 
     apts = await get_accessible_apartments(tid)
     if not apts:
-        await message.answer("У вас нет привязанных квартир.", parse_mode="HTML")
+        await message.answer("У вас нет привязанных объектов недвижимости.", parse_mode="HTML")
         return
 
     if len(apts) > 1:
         await message.answer(
-            "У вас доступно несколько квартир. Откройте Mini App, чтобы выбрать нужную квартиру перед отправкой фото:",
-            reply_markup=webapp_open_kb("📷 Выбрать квартиру и отправить фото", tab="photo"),
+            "У вас доступно несколько объектов недвижимости. Откройте Mini App, чтобы выбрать нужный объект перед отправкой фото:",
+            reply_markup=webapp_open_kb("📷 Выбрать объект и отправить фото", tab="photo"),
             parse_mode="HTML",
         )
         return
 
     apt = apts[0]
+    prop_label = format_property_short(apt)
     photo = message.photo[-1]
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     filepath = PHOTOS_DIR / f"apt{apt.id}_{tid}_{ts}_{uuid.uuid4().hex[:8]}.jpg"
     await message.bot.download(photo, destination=filepath)
 
-    user = await crud.get_user_by_telegram_id(tid)
     sender_name = (user.name if user and user.name else message.from_user.full_name) or str(tid)
     sent = await forward_meter_photo_file(
         bot=message.bot,
@@ -94,11 +94,11 @@ async def on_direct_photo(message: Message) -> None:
         sender_name=sender_name,
         comment=message.caption or "",
     )
-    await crud.add_audit_log(tid, "upload_photo_chat", f"Кв. №{apt.number}, получателей: {sent}")
+    await crud.add_audit_log(tid, "upload_photo_chat", f"{prop_label}, получателей: {sent}")
     if sent > 0:
-        await message.answer(f"✅ Фото счётчика для кв. №{h(apt.number)} отправлено владельцам ({sent}).", parse_mode="HTML")
+        await message.answer(f"✅ Фото счётчика ({h(prop_label)}) отправлено владельцам ({sent}).", parse_mode="HTML")
     else:
         await message.answer(
-            f"⚠️ Фото сохранено для кв. №{h(apt.number)}, но получателей уведомлений не найдено.",
+            f"⚠️ Фото сохранено ({h(prop_label)}), но получателей уведомлений не найдено.",
             parse_mode="HTML",
         )

@@ -12,8 +12,15 @@ from sqlalchemy import select
 
 from config import BOT_TZ, local_today
 from database import crud
-from database.models import Apartment, ELECTRICITY_METERS, WATER_METERS
-from services.access import get_notification_recipients, is_tenant_lease_active
+from database.models import (
+    Apartment,
+    ELECTRICITY_METERS,
+    GAS_METERS,
+    WATER_METERS,
+    format_property_short,
+    get_apartment_enabled_meters,
+)
+from services.access import get_notification_recipients, is_lease_active_for_apartment
 from services.backup import cleanup_old_photos, create_backup
 from services.calculations import fmt_date
 from services.notifications import webapp_open_kb
@@ -28,14 +35,47 @@ def effective_submission_day(configured_day: int, year: int, month: int) -> int:
 
 async def _get_apartment_reminder_recipients(apt: Apartment) -> list[int]:
     recipients = await get_notification_recipients(apt.id)
-    for tenant in await crud.get_apartment_tenants(apt.id):
-        if tenant.is_blocked:
-            continue
-        if not await is_tenant_lease_active(tenant.telegram_id, apt.id):
-            continue
-        if tenant.telegram_id not in recipients:
-            recipients.append(tenant.telegram_id)
+    if is_lease_active_for_apartment(apt):
+        for tenant in await crud.get_apartment_tenants(apt.id):
+            if tenant.is_blocked:
+                continue
+            if tenant.telegram_id not in recipients:
+                recipients.append(tenant.telegram_id)
     return recipients
+
+
+async def _maybe_send_group_reminder(
+    bot: Bot,
+    apt: Apartment,
+    cur: datetime.date,
+    configured_day: int | None,
+    active_group_meters: list[str],
+    on_day_text: str,
+    overdue_text: str,
+    button_label: str,
+    tab: str,
+) -> None:
+    if not configured_day or not active_group_meters:
+        return
+    if await crud.has_readings_this_month(apt.id, active_group_meters, today=cur):
+        return
+
+    eff_day = effective_submission_day(configured_day, cur.year, cur.month)
+    text = None
+    if cur.day == eff_day:
+        text = on_day_text
+    elif cur.day > eff_day and (cur.day - eff_day) % 3 == 0:
+        text = overdue_text
+
+    if not text:
+        return
+
+    kb = webapp_open_kb(button_label, tab=tab)
+    for uid in await _get_apartment_reminder_recipients(apt):
+        try:
+            await bot.send_message(chat_id=uid, text=text, reply_markup=kb)
+        except Exception as e:
+            logger.warning("%s reminder failed for %s: %s", tab, uid, e)
 
 
 async def check_meter_reminders(bot: Bot, today: datetime.date | None = None) -> None:
@@ -45,37 +85,44 @@ async def check_meter_reminders(bot: Bot, today: datetime.date | None = None) ->
         apartments = result.scalars().all()
 
     for apt in apartments:
-        if apt.water_submission_day:
-            if not await crud.has_readings_this_month(apt.id, WATER_METERS, today=cur):
-                eff_day = effective_submission_day(apt.water_submission_day, cur.year, cur.month)
-                text = None
-                if cur.day == eff_day:
-                    text = f"💧 Пора подавать показания водомеров (Кв. №{apt.number})."
-                elif cur.day > eff_day and (cur.day - eff_day) % 3 == 0:
-                    text = f"⚠️ Внимание! Показания водомеров не были поданы в срок (Кв. №{apt.number})."
-                if text:
-                    kb = webapp_open_kb("💧 Внести показания воды", tab="water")
-                    for uid in await _get_apartment_reminder_recipients(apt):
-                        try:
-                            await bot.send_message(chat_id=uid, text=text, reply_markup=kb)
-                        except Exception as e:
-                            logger.warning("Water reminder failed for %s: %s", uid, e)
+        enabled = set(get_apartment_enabled_meters(apt))
+        prop_label = format_property_short(apt)
 
-        if apt.electricity_submission_day:
-            if not await crud.has_readings_this_month(apt.id, ELECTRICITY_METERS, today=cur):
-                eff_day = effective_submission_day(apt.electricity_submission_day, cur.year, cur.month)
-                text = None
-                if cur.day == eff_day:
-                    text = f"⚡ Пора подавать показания электрического счётчика (Кв. №{apt.number})."
-                elif cur.day > eff_day and (cur.day - eff_day) % 3 == 0:
-                    text = f"⚠️ Внимание! Показания электрического счётчика не были поданы в срок (Кв. №{apt.number})."
-                if text:
-                    kb = webapp_open_kb("⚡ Внести показания электричества", tab="electricity")
-                    for uid in await _get_apartment_reminder_recipients(apt):
-                        try:
-                            await bot.send_message(chat_id=uid, text=text, reply_markup=kb)
-                        except Exception as e:
-                            logger.warning("Electricity reminder failed for %s: %s", uid, e)
+        await _maybe_send_group_reminder(
+            bot=bot,
+            apt=apt,
+            cur=cur,
+            configured_day=apt.water_submission_day,
+            active_group_meters=[m for m in WATER_METERS if m in enabled],
+            on_day_text=f"💧 Пора подавать показания водомеров ({prop_label}).",
+            overdue_text=f"⚠️ Внимание! Показания водомеров не были поданы в срок ({prop_label}).",
+            button_label="💧 Внести показания воды",
+            tab="water",
+        )
+
+        await _maybe_send_group_reminder(
+            bot=bot,
+            apt=apt,
+            cur=cur,
+            configured_day=apt.electricity_submission_day,
+            active_group_meters=[m for m in ELECTRICITY_METERS if m in enabled],
+            on_day_text=f"⚡ Пора подавать показания электрического счётчика ({prop_label}).",
+            overdue_text=f"⚠️ Внимание! Показания электрического счётчика не были поданы в срок ({prop_label}).",
+            button_label="⚡ Внести показания электричества",
+            tab="electricity",
+        )
+
+        await _maybe_send_group_reminder(
+            bot=bot,
+            apt=apt,
+            cur=cur,
+            configured_day=apt.gas_submission_day,
+            active_group_meters=[m for m in GAS_METERS if m in enabled],
+            on_day_text=f"🔥 Пора подавать показания газового счётчика ({prop_label}).",
+            overdue_text=f"⚠️ Внимание! Показания газового счётчика не были поданы в срок ({prop_label}).",
+            button_label="🔥 Внести показания газа",
+            tab="gas",
+        )
 
 
 async def check_lease_expirations(bot: Bot, today: datetime.date | None = None) -> None:
@@ -91,16 +138,17 @@ async def check_lease_expirations(bot: Bot, today: datetime.date | None = None) 
     for apt in apartments:
         agr_no = apt.agreement_no or "б/н"
         date_start = fmt_date(apt.agreement_date_start)
+        prop_label = format_property_short(apt)
         msg_text = None
 
         if apt.agreement_date_finish == in_seven_days:
             msg_text = (
-                f"⏳ Срок найма квартиры №{apt.number} по договору №{agr_no} от {date_start} "
+                f"⏳ Срок найма объекта {prop_label} по договору №{agr_no} от {date_start} "
                 f"завершится через неделю. Не забудьте продлить договор либо удалить нанимателя."
             )
         elif apt.agreement_date_finish == cur:
             msg_text = (
-                f"⚠️ Срок найма квартиры №{apt.number} по договору №{agr_no} от {date_start} "
+                f"⚠️ Срок найма объекта {prop_label} по договору №{agr_no} от {date_start} "
                 f"завершился. Не забудьте продлить договор либо удалить нанимателя."
             )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal
+from typing import Iterable
 
 from sqlalchemy import delete, desc, select
 
@@ -18,6 +19,9 @@ from database.models import (
     MeterReading,
     Tariff,
     User,
+    format_property_short,
+    serialize_enabled_meters,
+    utcnow_naive,
 )
 
 
@@ -31,7 +35,7 @@ async def save_meter_group_readings(
     dedup_window_seconds: int = 10,
 ) -> bool:
     """HIGH-03 & HIGH-06: save meter readings group and audit log atomically with deduplication."""
-    now = datetime.datetime.utcnow()
+    now = utcnow_naive()
     window_start = now - datetime.timedelta(seconds=dedup_window_seconds)
 
     async with UnitOfWork() as s:
@@ -75,17 +79,46 @@ async def update_apartment_settings_atomic(
     tariffs: dict[str, Decimal],
     changed_by: int,
     effective_from: datetime.date,
-) -> None:
-    """MEDIUM-10: validate and save days and tariffs in one transaction."""
+    gas_submission_day: int | None = None,
+    number: str | None = None,
+    property_type: str | None = None,
+    enabled_meters: Iterable[str] | None = None,
+) -> int:
+    """MEDIUM-10: validate and save property settings, days, and changed tariffs in one transaction.
+
+    Returns the number of tariff rows actually inserted (unchanged rates are skipped).
+    """
     async with UnitOfWork() as s:
         apt = await s.get(Apartment, apartment_id)
         if not apt:
-            raise LookupError("Квартира не найдена")
+            raise LookupError("Объект недвижимости не найден")
+
+        if number is not None:
+            apt.number = number
+        if property_type is not None:
+            apt.property_type = property_type
+        if enabled_meters is not None:
+            apt.enabled_meters = serialize_enabled_meters(enabled_meters)
 
         apt.water_submission_day = water_submission_day
         apt.electricity_submission_day = electricity_submission_day
+        apt.gas_submission_day = gas_submission_day
 
+        inserted_tariffs = 0
         for mt, rate in tariffs.items():
+            res_latest = await s.execute(
+                select(Tariff)
+                .where(
+                    Tariff.apartment_id == apartment_id,
+                    Tariff.tariff_type == mt,
+                )
+                .order_by(desc(Tariff.effective_from), desc(Tariff.id))
+                .limit(1)
+            )
+            latest = res_latest.scalar_one_or_none()
+            if latest is not None and Decimal(latest.rate) == rate:
+                continue
+
             s.add(Tariff(
                 apartment_id=apartment_id,
                 tariff_type=mt,
@@ -93,12 +126,14 @@ async def update_apartment_settings_atomic(
                 effective_from=effective_from,
                 changed_by=changed_by,
             ))
+            inserted_tariffs += 1
 
         s.add(AuditLog(
             user_telegram_id=changed_by,
             action="update_settings",
-            details=f"Кв. id={apartment_id}, тарифов обновлено: {len(tariffs)}",
+            details=f"{format_property_short(apt)} (id={apartment_id}), тарифов обновлено: {inserted_tariffs}",
         ))
+        return inserted_tariffs
 
 
 async def update_initial_readings_atomic(
@@ -107,11 +142,11 @@ async def update_initial_readings_atomic(
     set_by: int,
 ) -> None:
     """HIGH-05 & MEDIUM-10: atomically update initial readings."""
-    now = datetime.datetime.utcnow()
+    now = utcnow_naive()
     async with UnitOfWork() as s:
         apt = await s.get(Apartment, apartment_id)
         if not apt:
-            raise LookupError("Квартира не найдена")
+            raise LookupError("Объект недвижимости не найден")
 
         for mt, val in readings.items():
             res = await s.execute(
@@ -136,7 +171,7 @@ async def update_initial_readings_atomic(
         s.add(AuditLog(
             user_telegram_id=set_by,
             action="set_initial_readings",
-            details=f"Кв. id={apartment_id}, счётчиков: {len(readings)}",
+            details=f"{format_property_short(apt)} (id={apartment_id}), счётчиков: {len(readings)}",
         ))
 
 
@@ -175,6 +210,7 @@ async def delete_family_atomic(family_id: int, actor_tg_id: int) -> None:
 
         for u in fam_users:
             if u.telegram_id == config.ADMIN_TELEGRAM_ID:
+                u.family_id = None
                 continue
             await s.execute(delete(ApartmentUser).where(ApartmentUser.user_id == u.id))
             await s.delete(u)
@@ -194,7 +230,7 @@ async def remove_tenant_from_apartment_atomic(
 ) -> tuple[str, bool]:
     """CRITICAL-03 & MEDIUM-04: verify tenant link to apt_id, unlink atomically.
 
-    Returns (apartment_number, fully_removed).
+    Returns (property_label, fully_removed).
     """
     if tenant_tg_id == config.ADMIN_TELEGRAM_ID:
         raise PermissionError("Нельзя удалить администратора")
@@ -202,12 +238,12 @@ async def remove_tenant_from_apartment_atomic(
     async with UnitOfWork() as s:
         apt = await s.get(Apartment, apartment_id)
         if not apt:
-            raise LookupError("Квартира не найдена")
+            raise LookupError("Объект недвижимости не найден")
 
         res_u = await s.execute(select(User).where(User.telegram_id == tenant_tg_id))
         target = res_u.scalar_one_or_none()
         if not target or target.role != "tenant":
-            raise LookupError("Наниматель не найден в этой квартире")
+            raise LookupError("Наниматель не найден в этом объекте")
 
         res_link = await s.execute(
             select(ApartmentUser).where(
@@ -218,7 +254,7 @@ async def remove_tenant_from_apartment_atomic(
         )
         link = res_link.scalar_one_or_none()
         if not link:
-            raise LookupError("Наниматель не привязан к этой квартире")
+            raise LookupError("Наниматель не привязан к этому объекту")
 
         await s.delete(link)
         await s.flush()
@@ -238,9 +274,10 @@ async def remove_tenant_from_apartment_atomic(
         if res_rem.scalar_one_or_none() is None:
             apt.has_tenant = False
 
+        prop_label = format_property_short(apt)
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
             action="remove_tenant",
-            details=f"Наниматель ID={tenant_tg_id} удалён из кв. №{apt.number} (full={fully_removed})",
+            details=f"Наниматель ID={tenant_tg_id} удалён из {prop_label} (full={fully_removed})",
         ))
-        return apt.number, fully_removed
+        return prop_label, fully_removed

@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 async def seed_admin() -> None:
     """CRITICAL-02 & MEDIUM-07: sync only ADMIN_TELEGRAM_ID and revoke stale admins."""
+    if not ADMIN_TELEGRAM_ID:
+        logger.warning(
+            "ADMIN_TELEGRAM_ID не задан (равен 0) — административные функции будут недоступны."
+        )
+        return
     await crud.sync_admin_user(ADMIN_TELEGRAM_ID)
 
 

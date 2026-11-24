@@ -9,15 +9,22 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
-from config import MAX_PHOTO_BYTES, PHOTOS_DIR, local_today
+from config import BOT_TZ, MAX_PHOTO_BYTES, PHOTOS_DIR, local_today
 from database import crud, operations
-from database.models import METER_LABELS, METER_UNITS
+from database.models import (
+    METER_LABELS,
+    METER_PLAIN_LABELS,
+    METER_UNITS,
+    format_property_short,
+    get_apartment_enabled_meters,
+)
 from services.access import user_can_access_apartment
 from services.calculations import calculate_billing, get_prev_value
 from services.notifications import forward_meter_photo_file, notify_new_readings
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import (
     ElectricityReadingBody,
+    GasReadingBody,
     ReadingCorrectionBody,
     WaterReadingBody,
     require_role,
@@ -33,13 +40,24 @@ async def _save_meter_group(
     meters: dict[str, int],
     force: bool,
     action: str,
-    audit_details: str,
     user: WebAppUser,
 ) -> dict:
     if not await user_can_access_apartment(user.telegram_id, apt_id):
-        raise HTTPException(403, "Нет доступа к квартире")
+        raise HTTPException(403, "Нет доступа к объекту недвижимости")
+    if not meters:
+        raise HTTPException(400, "Укажите хотя бы одно показание счётчика")
     if any(v < 0 for v in meters.values()):
         raise HTTPException(400, "Показания должны быть неотрицательными целыми числами")
+
+    apt = await crud.get_apartment(apt_id)
+    if not apt:
+        raise HTTPException(404, "Объект недвижимости не найден")
+
+    enabled = set(get_apartment_enabled_meters(apt))
+    for mt in meters:
+        if mt not in enabled:
+            label = METER_PLAIN_LABELS.get(mt, mt)
+            raise HTTPException(400, f"Счётчик «{label}» не подключён для этого объекта")
 
     prev_meters = {mt: await get_prev_value(apt_id, mt) for mt in meters}
     decreased = [
@@ -54,6 +72,9 @@ async def _save_meter_group(
             "warning": "Введённое значение меньше предыдущего (возможна замена или переполнение счётчика). Подтвердите сохранение.",
             "billing": billing.to_dict(),
         }
+
+    parts = ", ".join(f"{METER_PLAIN_LABELS.get(mt, mt)}={val}" for mt, val in meters.items())
+    audit_details = f"{format_property_short(apt)} (id={apt_id}): {parts}"
 
     saved = await operations.save_meter_group_readings(
         apartment_id=apt_id,
@@ -77,11 +98,14 @@ async def api_submit_water(
     request: Request,
     user: WebAppUser = Depends(get_current_user),
 ):
-    meters = {"cold_water": body.cold_water, "hot_water": body.hot_water}
-    return await _save_meter_group(
-        request, apt_id, meters, body.force, "submit_water",
-        f"Кв. id={apt_id}: ХВС={body.cold_water}, ГВС={body.hot_water}", user,
-    )
+    meters = {
+        k: v
+        for k, v in (("cold_water", body.cold_water), ("hot_water", body.hot_water))
+        if v is not None
+    }
+    if not meters:
+        raise HTTPException(400, "Укажите показание хотя бы одного счётчика воды")
+    return await _save_meter_group(request, apt_id, meters, body.force, "submit_water", user)
 
 
 @router.post("/api/apartments/{apt_id}/readings/electricity")
@@ -91,11 +115,25 @@ async def api_submit_electricity(
     request: Request,
     user: WebAppUser = Depends(get_current_user),
 ):
-    meters = {"t1": body.t1, "t2": body.t2, "t3": body.t3}
-    return await _save_meter_group(
-        request, apt_id, meters, body.force, "submit_electricity",
-        f"Кв. id={apt_id}: T1={body.t1}, T2={body.t2}, T3={body.t3}", user,
-    )
+    meters = {
+        k: v
+        for k, v in (("t1", body.t1), ("t2", body.t2), ("t3", body.t3))
+        if v is not None
+    }
+    if not meters:
+        raise HTTPException(400, "Укажите показание хотя бы одного тарифа электричества")
+    return await _save_meter_group(request, apt_id, meters, body.force, "submit_electricity", user)
+
+
+@router.post("/api/apartments/{apt_id}/readings/gas")
+async def api_submit_gas(
+    apt_id: int,
+    body: GasReadingBody,
+    request: Request,
+    user: WebAppUser = Depends(get_current_user),
+):
+    meters = {"gas": body.gas}
+    return await _save_meter_group(request, apt_id, meters, body.force, "submit_gas", user)
 
 
 @router.get("/api/apartments/{apt_id}/history")
@@ -167,7 +205,7 @@ async def api_upload_photo(
     user: WebAppUser = Depends(get_current_user),
 ):
     if not await user_can_access_apartment(user.telegram_id, apt_id):
-        raise HTTPException(403, "Нет доступа к квартире")
+        raise HTTPException(403, "Нет доступа к объекту недвижимости")
 
     buf = bytearray()
     while True:
@@ -185,7 +223,7 @@ async def api_upload_photo(
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         ext = ".jpg"
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     filepath = PHOTOS_DIR / f"apt{apt_id}_{user.telegram_id}_{ts}_{uuid.uuid4().hex[:8]}{ext}"
     await asyncio.to_thread(filepath.write_bytes, bytes(buf))
 
@@ -199,6 +237,6 @@ async def api_upload_photo(
     )
     await crud.add_audit_log(
         user.telegram_id, "upload_photo_webapp",
-        f"Кв. id={apt_id}, файл={filepath.name}, получателей={sent}",
+        f"Объект id={apt_id}, файл={filepath.name}, получателей={sent}",
     )
     return {"ok": True, "recipients_count": sent}

@@ -1,9 +1,10 @@
-"""SQLAlchemy ORM models and meter constants."""
+"""SQLAlchemy ORM models, property types, and meter constants."""
 
 from __future__ import annotations
 
 import datetime
 from decimal import Decimal
+from typing import Iterable
 
 from sqlalchemy import (
     BigInteger,
@@ -19,16 +20,43 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+
+def utcnow_naive() -> datetime.datetime:
+    """UTC timestamp without tzinfo (Python 3.12+ replacement for utcnow())."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 WATER_METERS = ("cold_water", "hot_water")
 ELECTRICITY_METERS = ("t1", "t2", "t3")
-ALL_METERS = WATER_METERS + ELECTRICITY_METERS
+GAS_METERS = ("gas",)
+LEGACY_METERS = WATER_METERS + ELECTRICITY_METERS
+ALL_METERS = WATER_METERS + ELECTRICITY_METERS + GAS_METERS
+
+PROPERTY_TYPES = {
+    "apartment": "Квартира",
+    "house": "Дом",
+    "dacha": "Дача",
+}
+
+PROPERTY_SHORT_LABELS = {
+    "apartment": "Кв.",
+    "house": "Дом",
+    "dacha": "Дача",
+}
+
+PROPERTY_ICONS = {
+    "apartment": "🏢",
+    "house": "🏡",
+    "dacha": "🌿",
+}
 
 METER_LABELS = {
     "cold_water": "💧 ХВС",
-    "hot_water": "🔥 ГВС",
+    "hot_water": "♨️ ГВС",
     "t1": "⚡ Т1",
     "t2": "⚡ Т2",
     "t3": "⚡ Т3",
+    "gas": "🔥 Газ",
 }
 
 METER_PLAIN_LABELS = {
@@ -37,6 +65,7 @@ METER_PLAIN_LABELS = {
     "t1": "Т1",
     "t2": "Т2",
     "t3": "Т3",
+    "gas": "Газ",
 }
 
 METER_UNITS = {
@@ -45,7 +74,45 @@ METER_UNITS = {
     "t1": "кВт·ч",
     "t2": "кВт·ч",
     "t3": "кВт·ч",
+    "gas": "м³",
 }
+
+
+def serialize_enabled_meters(meters: Iterable[str]) -> str:
+    """Validate and serialize enabled meter keys in canonical order."""
+    chosen = set(meters)
+    ordered = [m for m in ALL_METERS if m in chosen]
+    return ",".join(ordered)
+
+
+def get_apartment_enabled_meters(apt) -> list[str]:
+    """Return active meter keys for a property; NULL defaults to legacy 5 meters."""
+    raw = getattr(apt, "enabled_meters", None)
+    if raw is None:
+        return list(LEGACY_METERS)
+    chosen = {part.strip() for part in raw.split(",") if part.strip()}
+    ordered = [m for m in ALL_METERS if m in chosen]
+    return ordered or list(LEGACY_METERS)
+
+
+def format_property_short(apt) -> str:
+    """Compact human-readable property label, e.g. 'Кв. №371', 'Дом 12', 'Дача уч. 5'."""
+    ptype = getattr(apt, "property_type", None) or "apartment"
+    number = str(getattr(apt, "number", "") or "").strip()
+    if ptype == "apartment":
+        return f"Кв. №{number}"
+    prefix = PROPERTY_SHORT_LABELS.get(ptype, "Кв.")
+    return f"{prefix} {number}".strip()
+
+
+def format_property_title(apt) -> str:
+    """Full human-readable property title, e.g. 'Квартира №371', 'Дом 12', 'Дача уч. 5'."""
+    ptype = getattr(apt, "property_type", None) or "apartment"
+    number = str(getattr(apt, "number", "") or "").strip()
+    if ptype == "apartment":
+        return f"Квартира №{number}"
+    label = PROPERTY_TYPES.get(ptype, "Квартира")
+    return f"{label} {number}".strip()
 
 
 class Base(DeclarativeBase):
@@ -58,7 +125,7 @@ class Family(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )
 
     apartments: Mapped[list["Apartment"]] = relationship(
@@ -80,7 +147,7 @@ class User(Base):
     )
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )
 
     family: Mapped[Family | None] = relationship(back_populates="users")
@@ -94,6 +161,8 @@ class Apartment(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     number: Mapped[str] = mapped_column(String(50), nullable=False)
+    property_type: Mapped[str] = mapped_column(String(20), nullable=False, default="apartment")
+    enabled_meters: Mapped[str | None] = mapped_column(Text, nullable=True)
     family_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("families.id", ondelete="CASCADE"), nullable=False
     )
@@ -103,8 +172,9 @@ class Apartment(Base):
     agreement_date_finish: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     water_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     electricity_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gas_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )
 
     family: Mapped[Family] = relationship(back_populates="apartments")
@@ -153,7 +223,7 @@ class Tariff(Base):
     effective_from: Mapped[datetime.date] = mapped_column(Date, nullable=False)
     changed_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )
 
     apartment: Mapped[Apartment] = relationship(back_populates="tariffs")
@@ -173,7 +243,7 @@ class InitialReading(Base):
     value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     set_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, onupdate=utcnow_naive, nullable=False
     )
 
     apartment: Mapped[Apartment] = relationship(back_populates="initial_readings")
@@ -191,7 +261,7 @@ class MeterReading(Base):
     submitted_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reading_date: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )
 
     apartment: Mapped[Apartment] = relationship(back_populates="readings")
@@ -205,5 +275,5 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, default=datetime.datetime.utcnow, nullable=False
+        DateTime, default=utcnow_naive, nullable=False
     )

@@ -8,17 +8,36 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from database.models import (
+    PROPERTY_ICONS,
+    PROPERTY_TYPES,
+    format_property_short,
+    format_property_title,
+    get_apartment_enabled_meters,
+)
 from webapp.auth import WebAppUser
+
+PropertyTypeLiteral = Literal["apartment", "house", "dacha"]
+
+
+class ProfileUpdateBody(BaseModel):
+    name: str
 
 
 class ApartmentCreateBody(BaseModel):
     number: str
+    property_type: PropertyTypeLiteral = "apartment"
+    enabled_meters: list[str] | None = None
     family_id: int | None = None
 
 
 class ApartmentSettingsBody(BaseModel):
+    number: str | None = None
+    property_type: PropertyTypeLiteral | None = None
+    enabled_meters: list[str] | None = None
     water_submission_day: int | None = None
     electricity_submission_day: int | None = None
+    gas_submission_day: int | None = None
     tariffs: dict[str, str | float | int | None] = {}
 
 
@@ -28,18 +47,24 @@ class InitialReadingsBody(BaseModel):
     t1: int | None = None
     t2: int | None = None
     t3: int | None = None
+    gas: int | None = None
 
 
 class WaterReadingBody(BaseModel):
-    cold_water: int
-    hot_water: int
+    cold_water: int | None = None
+    hot_water: int | None = None
     force: bool = False
 
 
 class ElectricityReadingBody(BaseModel):
-    t1: int
-    t2: int
-    t3: int
+    t1: int | None = None
+    t2: int | None = None
+    t3: int | None = None
+    force: bool = False
+
+
+class GasReadingBody(BaseModel):
+    gas: int
     force: bool = False
 
 
@@ -71,6 +96,11 @@ class FamilyOwnerBody(BaseModel):
     phone: str | None = None
 
 
+class FamilyOwnerUpdateBody(BaseModel):
+    name: str
+    phone: str | None = None
+
+
 class ExportBody(BaseModel):
     format: Literal["excel", "pdf"]
     apartment_id: int | None = None
@@ -89,9 +119,16 @@ def parse_iso_date(raw: str | None) -> datetime.date | None:
 
 
 def serialize_apartment(apt) -> dict:
+    ptype = getattr(apt, "property_type", None) or "apartment"
     return {
         "id": apt.id,
         "number": apt.number,
+        "property_type": ptype,
+        "property_type_label": PROPERTY_TYPES.get(ptype, "Квартира"),
+        "property_icon": PROPERTY_ICONS.get(ptype, "🏢"),
+        "display_name": format_property_short(apt),
+        "full_title": format_property_title(apt),
+        "enabled_meters": get_apartment_enabled_meters(apt),
         "family_id": apt.family_id,
         "has_tenant": apt.has_tenant,
         "agreement_no": apt.agreement_no,
@@ -99,6 +136,7 @@ def serialize_apartment(apt) -> dict:
         "agreement_date_finish": apt.agreement_date_finish.isoformat() if apt.agreement_date_finish else None,
         "water_submission_day": apt.water_submission_day,
         "electricity_submission_day": apt.electricity_submission_day,
+        "gas_submission_day": getattr(apt, "gas_submission_day", None),
     }
 
 

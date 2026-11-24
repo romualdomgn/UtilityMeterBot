@@ -12,9 +12,11 @@ from database import crud
 from database.models import (
     ALL_METERS,
     ELECTRICITY_METERS,
+    GAS_METERS,
     METER_LABELS,
     METER_UNITS,
     WATER_METERS,
+    get_apartment_enabled_meters,
 )
 
 MONTH_NAMES_RU = {
@@ -83,8 +85,16 @@ class BillingResult:
         return sum(self.meters[m].cost for m in ELECTRICITY_METERS if m in self.meters)
 
     @property
+    def gas_consumption_total(self) -> int:
+        return sum(self.meters[m].consumption for m in GAS_METERS if m in self.meters)
+
+    @property
+    def gas_total(self) -> int:
+        return sum(self.meters[m].cost for m in GAS_METERS if m in self.meters)
+
+    @property
     def grand_total(self) -> int:
-        return self.water_total + self.electricity_total
+        return self.water_total + self.electricity_total + self.gas_total
 
     def to_dict(self) -> dict:
         return {
@@ -95,6 +105,8 @@ class BillingResult:
             "water_total": self.water_total,
             "electricity_consumption_total": self.electricity_consumption_total,
             "electricity_total": self.electricity_total,
+            "gas_consumption_total": self.gas_consumption_total,
+            "gas_total": self.gas_total,
             "grand_total": self.grand_total,
         }
 
@@ -130,6 +142,9 @@ async def calculate_billing(
     period_label = f"{MONTH_NAMES_RU.get(target_month, target_month)} {target_year}"
     tariff_date = today if current_readings is not None else end_of_month
 
+    apt = await crud.get_apartment(apartment_id)
+    enabled_set = set(get_apartment_enabled_meters(apt))
+
     tariffs = await crud.get_all_tariffs(apartment_id, as_of_date=tariff_date)
     initials = await crud.get_all_initial_readings(apartment_id)
 
@@ -142,14 +157,19 @@ async def calculate_billing(
     res = BillingResult(apartment_id=apartment_id, period_label=period_label)
 
     for mt in ALL_METERS:
+        if current_readings is not None:
+            if mt not in current_readings:
+                continue
+        else:
+            if mt not in enabled_set and mt not in latest_in_month:
+                continue
+
         tariff_obj = tariffs.get(mt)
         has_tariff = tariff_obj is not None
         rate = Decimal(tariff_obj.rate) if has_tariff else None
         init_val = initials.get(mt)
 
         if current_readings is not None:
-            if mt not in current_readings:
-                continue
             prev_val = await get_prev_value(apartment_id, mt)
             curr_val: int | None = current_readings[mt]
             submitted = True

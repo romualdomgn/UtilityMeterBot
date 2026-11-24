@@ -19,8 +19,22 @@ from database.models import (
     MeterReading,
     Tariff,
     User,
+    serialize_enabled_meters,
 )
 from database.session import async_session_factory
+
+ALLOWED_APARTMENT_FIELDS = frozenset({
+    "number",
+    "property_type",
+    "enabled_meters",
+    "has_tenant",
+    "agreement_no",
+    "agreement_date_start",
+    "agreement_date_finish",
+    "water_submission_day",
+    "electricity_submission_day",
+    "gas_submission_day",
+})
 
 
 class UnitOfWork:
@@ -130,6 +144,52 @@ async def get_or_create_user(
         return user, True
 
 
+async def update_user_name(telegram_id: int, name: str) -> User | None:
+    """Allow an authenticated user (admin/landlord/tenant) to update their own display name."""
+    async with UnitOfWork() as s:
+        res = await s.execute(select(User).where(User.telegram_id == telegram_id))
+        user = res.scalar_one_or_none()
+        if not user:
+            if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
+                user = User(telegram_id=telegram_id, name=name, role="admin")
+                s.add(user)
+                await s.flush()
+                await s.refresh(user)
+                return user
+            return None
+        user.name = name
+        await s.flush()
+        await s.refresh(user)
+        return user
+
+
+async def update_family_owner(
+    family_id: int,
+    owner_tg_id: int,
+    name: str,
+    phone: str | None = None,
+    update_phone: bool = False,
+) -> User | None:
+    """Update a landlord member's name (and optionally phone) within a family."""
+    async with UnitOfWork() as s:
+        res = await s.execute(
+            select(User).where(
+                User.telegram_id == owner_tg_id,
+                User.family_id == family_id,
+                User.role == "landlord",
+            )
+        )
+        target = res.scalar_one_or_none()
+        if not target:
+            return None
+        target.name = name
+        if update_phone:
+            target.phone = phone
+        await s.flush()
+        await s.refresh(target)
+        return target
+
+
 async def sync_admin_user(admin_tg_id: int) -> None:
     """CRITICAL-02: revoke old admin roles in DB; set only current ADMIN_TELEGRAM_ID."""
     if not admin_tg_id:
@@ -167,9 +227,20 @@ async def get_all_apartments() -> list[Apartment]:
         return list(res.scalars().all())
 
 
-async def create_apartment(number: str, family_id: int) -> Apartment:
+async def create_apartment(
+    number: str,
+    family_id: int,
+    property_type: str = "apartment",
+    enabled_meters: Iterable[str] | None = None,
+) -> Apartment:
+    meters_str = serialize_enabled_meters(enabled_meters) if enabled_meters is not None else None
     async with UnitOfWork() as s:
-        apt = Apartment(number=number, family_id=family_id)
+        apt = Apartment(
+            number=number,
+            family_id=family_id,
+            property_type=property_type,
+            enabled_meters=meters_str or None,
+        )
         s.add(apt)
         await s.flush()
         await s.refresh(apt)
@@ -182,11 +253,22 @@ async def update_apartment(apartment_id: int, **kwargs) -> Apartment | None:
         if not apt:
             return None
         for k, v in kwargs.items():
-            if hasattr(apt, k):
+            if k in ALLOWED_APARTMENT_FIELDS:
                 setattr(apt, k, v)
         await s.flush()
         await s.refresh(apt)
         return apt
+
+
+async def is_user_linked_to_apartment(apartment_id: int, user_id: int) -> bool:
+    async with UnitOfWork() as s:
+        res = await s.execute(
+            select(ApartmentUser.id).where(
+                ApartmentUser.apartment_id == apartment_id,
+                ApartmentUser.user_id == user_id,
+            ).limit(1)
+        )
+        return res.scalar_one_or_none() is not None
 
 
 async def link_user_to_apartment(apartment_id: int, user_id: int, role: str = "tenant") -> None:
@@ -284,10 +366,22 @@ async def get_all_tariffs(
     apartment_id: int,
     as_of_date: datetime.date | None = None,
 ) -> dict[str, Tariff | None]:
-    return {
-        mt: await get_latest_tariff(apartment_id, mt, as_of_date=as_of_date)
-        for mt in ALL_METERS
-    }
+    """Fetch latest effective tariff per meter in a single session and query."""
+    target_date = as_of_date or config.local_today()
+    result: dict[str, Tariff | None] = {mt: None for mt in ALL_METERS}
+    async with UnitOfWork() as s:
+        res = await s.execute(
+            select(Tariff)
+            .where(
+                Tariff.apartment_id == apartment_id,
+                Tariff.effective_from <= target_date,
+            )
+            .order_by(desc(Tariff.effective_from), desc(Tariff.id))
+        )
+        for row in res.scalars().all():
+            if row.tariff_type in result and result[row.tariff_type] is None:
+                result[row.tariff_type] = row
+    return result
 
 
 async def get_tariff_history(apartment_id: int, limit: int = 50) -> list[Tariff]:
@@ -321,7 +415,8 @@ async def get_all_initial_readings(apartment_id: int) -> dict[str, int | None]:
         rows = res.scalars().all()
         result: dict[str, int | None] = {mt: None for mt in ALL_METERS}
         for r in rows:
-            result[r.meter_type] = r.value
+            if r.meter_type in result:
+                result[r.meter_type] = r.value
         return result
 
 
@@ -435,6 +530,8 @@ async def has_readings_this_month(
     cur = today or config.local_today()
     first_day = cur.replace(day=1)
     types_list = list(meter_types)
+    if not types_list:
+        return True
     async with UnitOfWork() as s:
         res = await s.execute(
             select(MeterReading.meter_type)

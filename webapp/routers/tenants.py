@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 import config
 from database import crud, operations
+from database.models import format_property_short
 from services.access import user_can_access_apartment
 from services.notifications import notify_tenant_added, notify_tenant_removed
 from webapp.auth import WebAppUser, get_current_user
@@ -36,7 +37,7 @@ async def api_update_contract(
         updates["has_tenant"] = body.has_tenant
 
     await crud.update_apartment(apt_id, **updates)
-    await crud.add_audit_log(user.telegram_id, "update_contract", f"Кв. id={apt_id}")
+    await crud.add_audit_log(user.telegram_id, "update_contract", f"Объект id={apt_id}")
     return {"ok": True}
 
 
@@ -52,7 +53,7 @@ async def api_delete_contract(apt_id: int, user: WebAppUser = Depends(get_curren
         agreement_date_start=None,
         agreement_date_finish=None,
     )
-    await crud.add_audit_log(user.telegram_id, "delete_contract", f"Договор кв. id={apt_id} удалён")
+    await crud.add_audit_log(user.telegram_id, "delete_contract", f"Договор объекта id={apt_id} удалён")
     return {"ok": True}
 
 
@@ -74,40 +75,50 @@ async def api_add_tenant(
     if not name:
         raise HTTPException(400, "Имя нанимателя не может быть пустым")
 
-    existing = await crud.get_user_by_telegram_id(body.telegram_id)
-    if existing:
-        role_map = {"admin": "администратор", "landlord": "владелец", "tenant": "арендатор", "revoked": "отозван"}
-        raise HTTPException(
-            400,
-            f"Пользователь ID {body.telegram_id} уже добавлен ({role_map.get(existing.role, existing.role)})",
-        )
-
     apt = await crud.get_apartment(apt_id)
     if not apt:
-        raise HTTPException(404, "Квартира не найдена")
+        raise HTTPException(404, "Объект недвижимости не найден")
 
+    existing = await crud.get_user_by_telegram_id(body.telegram_id)
+    if existing:
+        if existing.role != "tenant":
+            role_map = {"admin": "администратор", "landlord": "владелец", "revoked": "отозван"}
+            raise HTTPException(
+                400,
+                f"Пользователь ID {body.telegram_id} уже добавлен ({role_map.get(existing.role, existing.role)})",
+            )
+        if existing.is_blocked:
+            raise HTTPException(400, f"Пользователь ID {body.telegram_id} заблокирован")
+        if existing.family_id is not None and existing.family_id != apt.family_id:
+            raise HTTPException(400, "Этот наниматель уже привязан к другой семье")
+        if await crud.is_user_linked_to_apartment(apt_id, existing.id):
+            raise HTTPException(400, "Этот наниматель уже привязан к данному объекту")
+
+    prop_label = format_property_short(apt)
     has_contract = all([apt.agreement_no, apt.agreement_date_start, apt.agreement_date_finish])
     if not has_contract and not body.force_no_contract:
         return {
             "needs_confirm": True,
-            "warning": f"Данные договора для кв. №{apt.number} не заполнены. Всё равно добавить нанимателя и отправить приглашение?",
+            "warning": f"Данные договора для объекта {prop_label} не заполнены. Всё равно добавить нанимателя и отправить приглашение?",
         }
 
     phone = (body.phone or "").strip() or None
-    new_user, _ = await crud.get_or_create_user(
+    target_user, _ = await crud.get_or_create_user(
         telegram_id=body.telegram_id,
         name=name,
         phone=phone,
         role="tenant",
         family_id=apt.family_id,
     )
-    await crud.link_user_to_apartment(apt_id, new_user.id, role="tenant")
+    await crud.link_user_to_apartment(apt_id, target_user.id, role="tenant")
     await crud.update_apartment(apt_id, has_tenant=True)
     await crud.add_audit_log(
         user.telegram_id, "add_tenant",
-        f"Наниматель {name} (ID: {body.telegram_id}) добавлен в кв. №{apt.number}",
+        f"Наниматель {target_user.name or name} (ID: {body.telegram_id}) добавлен в {prop_label}",
     )
-    notified = await notify_tenant_added(request.app.state.bot, apt, body.telegram_id, name)
+    notified = await notify_tenant_added(
+        request.app.state.bot, apt, body.telegram_id, target_user.name or name
+    )
     return {"ok": True, "notified": notified}
 
 
@@ -123,7 +134,7 @@ async def api_remove_tenant(
         raise HTTPException(403, "Нет доступа")
 
     try:
-        apt_number, fully_removed = await operations.remove_tenant_from_apartment_atomic(
+        prop_label, fully_removed = await operations.remove_tenant_from_apartment_atomic(
             apartment_id=apt_id,
             tenant_tg_id=tenant_tg_id,
             actor_tg_id=user.telegram_id,
@@ -136,7 +147,7 @@ async def api_remove_tenant(
     await notify_tenant_removed(
         request.app.state.bot,
         tenant_tg_id,
-        apt_number=apt_number,
+        apt_number=prop_label,
         fully_removed=fully_removed,
     )
     return {"ok": True, "fully_removed": fully_removed}

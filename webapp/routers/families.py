@@ -8,7 +8,7 @@ import config
 from database import crud, operations
 from services.access import is_admin, user_can_manage_family
 from webapp.auth import WebAppUser, get_current_user
-from webapp.schemas import FamilyBody, FamilyOwnerBody, require_role
+from webapp.schemas import FamilyBody, FamilyOwnerBody, FamilyOwnerUpdateBody, require_role
 
 router = APIRouter()
 
@@ -103,6 +103,42 @@ async def api_add_family_owner(
         f"Владелец {name} (ID: {body.telegram_id}) добавлен в семью id={family_id}",
     )
     return {"ok": True}
+
+
+@router.put("/api/families/{family_id}/owners/{owner_tg_id}")
+async def api_update_family_owner(
+    family_id: int,
+    owner_tg_id: int,
+    body: FamilyOwnerUpdateBody,
+    user: WebAppUser = Depends(get_current_user),
+):
+    if not await user_can_manage_family(user.telegram_id, family_id):
+        raise HTTPException(403, "Нет доступа")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Имя не может быть пустым")
+    if len(name) > 120:
+        raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
+
+    update_phone = "phone" in body.model_fields_set
+    phone_val = (body.phone or "").strip() or None if update_phone else None
+
+    updated = await crud.update_family_owner(
+        family_id=family_id,
+        owner_tg_id=owner_tg_id,
+        name=name,
+        phone=phone_val,
+        update_phone=update_phone,
+    )
+    if not updated:
+        raise HTTPException(404, "Член семьи не найден")
+
+    await crud.add_audit_log(
+        user.telegram_id,
+        "update_family_owner",
+        f"Владелец ID={owner_tg_id} (семья id={family_id}) обновлён: имя='{name}'",
+    )
+    return {"ok": True, "name": updated.name, "phone": updated.phone}
 
 
 @router.delete("/api/families/{family_id}/owners/{owner_tg_id}")

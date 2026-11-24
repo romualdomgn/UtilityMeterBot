@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
 import uuid
 from pathlib import Path
 
@@ -11,9 +12,18 @@ from fpdf import FPDF
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
-from config import EXPORT_DIR
+from config import BOT_TZ, EXPORT_DIR
 from database import crud
-from database.models import ALL_METERS, METER_PLAIN_LABELS, METER_UNITS
+from database.models import (
+    ALL_METERS,
+    ELECTRICITY_METERS,
+    GAS_METERS,
+    METER_PLAIN_LABELS,
+    METER_UNITS,
+    WATER_METERS,
+    format_property_short,
+    format_property_title,
+)
 from services.calculations import calculate_billing, fmt_date
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -26,21 +36,38 @@ def _fmt_opt(val) -> str:
     return "—" if val is None else str(val)
 
 
+def _safe_sheet_title(raw: str, used: set[str]) -> str:
+    cleaned = re.sub(r"[\\/*?:\[\]]", "_", raw).strip() or "Объект"
+    base = cleaned[:31]
+    if base not in used:
+        used.add(base)
+        return base
+    idx = 2
+    while True:
+        suffix = f" ({idx})"
+        candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        idx += 1
+
+
 async def generate_excel_report(apartments: list) -> Path:
     wb = Workbook()
     first = True
+    used_titles: set[str] = set()
     header_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     bold_font = Font(bold=True)
 
     for apt in apartments:
-        title = f"Кв_{apt.number}"[:31]
+        title = _safe_sheet_title(format_property_short(apt), used_titles)
         ws = wb.active if first else wb.create_sheet(title=title)
         ws.title = title
         first = False
 
         ws.append([
-            f"Квартира №{apt.number}",
+            format_property_title(apt),
             f"Договор: {apt.agreement_no or '—'}",
             f"Срок: {fmt_date(apt.agreement_date_start)} — {fmt_date(apt.agreement_date_finish)}",
         ])
@@ -69,8 +96,12 @@ async def generate_excel_report(apartments: list) -> Path:
                     m.cost if (m.has_base and m.has_tariff and m.submitted) else "—",
                 ])
 
-        ws.append(["Итого вода", "", "", billing.water_consumption_total, "м³", "", billing.water_total])
-        ws.append(["Итого электричество", "", "", billing.electricity_consumption_total, "кВт·ч", "", billing.electricity_total])
+        if any(m in billing.meters for m in WATER_METERS):
+            ws.append(["Итого вода", "", "", billing.water_consumption_total, "м³", "", billing.water_total])
+        if any(m in billing.meters for m in ELECTRICITY_METERS):
+            ws.append(["Итого электричество", "", "", billing.electricity_consumption_total, "кВт·ч", "", billing.electricity_total])
+        if any(m in billing.meters for m in GAS_METERS):
+            ws.append(["Итого газ", "", "", billing.gas_consumption_total, "м³", "", billing.gas_total])
         ws.append(["ВСЕГО К ОПЛАТЕ", "", "", "", "", "", billing.grand_total])
         ws[f"A{ws.max_row}"].font = bold_font
         ws[f"G{ws.max_row}"].font = bold_font
@@ -104,7 +135,7 @@ async def generate_excel_report(apartments: list) -> Path:
             max_len = max(len(str(c.value or "")) for c in col)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 34)
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.xlsx"
     await asyncio.to_thread(wb.save, filepath)
     return filepath
@@ -119,7 +150,7 @@ async def generate_pdf_report(apartments: list) -> Path:
     for apt in apartments:
         pdf.add_page()
         pdf.set_font("DejaVu", "B", 14)
-        pdf.cell(0, 10, f"Отчёт по квартире №{apt.number}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 10, f"Отчёт — {format_property_title(apt)}", new_x="LMARGIN", new_y="NEXT")
 
         pdf.set_font("DejaVu", "", 10)
         pdf.cell(
@@ -136,8 +167,8 @@ async def generate_pdf_report(apartments: list) -> Path:
         headers = ["Счётчик", "Пред.", "Тек.", "Расход", "Тариф", "Сумма (₽)"]
         widths = [32, 26, 26, 28, 36, 36]
         pdf.set_font("DejaVu", "B", 9)
-        for h, w in zip(headers, widths):
-            pdf.cell(w, 7, h, border=1, align="C")
+        for h_txt, w in zip(headers, widths):
+            pdf.cell(w, 7, h_txt, border=1, align="C")
         pdf.ln()
 
         pdf.set_font("DejaVu", "", 9)
@@ -157,13 +188,18 @@ async def generate_pdf_report(apartments: list) -> Path:
                 pdf.cell(w, 7, val, border=1, align="C")
             pdf.ln()
 
+        totals_parts = []
+        if any(m in billing.meters for m in WATER_METERS):
+            totals_parts.append(f"Вода: {billing.water_total} ₽")
+        if any(m in billing.meters for m in ELECTRICITY_METERS):
+            totals_parts.append(f"Электричество: {billing.electricity_total} ₽")
+        if any(m in billing.meters for m in GAS_METERS):
+            totals_parts.append(f"Газ: {billing.gas_total} ₽")
+        totals_parts.append(f"ИТОГО: {billing.grand_total} ₽")
+
         pdf.set_font("DejaVu", "B", 10)
         pdf.ln(2)
-        pdf.cell(
-            0, 7,
-            f"Вода: {billing.water_total} ₽  |  Электричество: {billing.electricity_total} ₽  |  ИТОГО: {billing.grand_total} ₽",
-            new_x="LMARGIN", new_y="NEXT",
-        )
+        pdf.cell(0, 7, "  |  ".join(totals_parts), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(4)
 
         total_count = await crud.get_readings_count(apt.id)
@@ -182,8 +218,8 @@ async def generate_pdf_report(apartments: list) -> Path:
             r_headers = ["Дата", "Счётчик", "Значение", "TG ID"]
             r_widths = [36, 44, 44, 60]
             pdf.set_font("DejaVu", "B", 9)
-            for h, w in zip(r_headers, r_widths):
-                pdf.cell(w, 7, h, border=1, align="C")
+            for h_txt, w in zip(r_headers, r_widths):
+                pdf.cell(w, 7, h_txt, border=1, align="C")
             pdf.ln()
             pdf.set_font("DejaVu", "", 9)
             for r in readings:
@@ -197,7 +233,7 @@ async def generate_pdf_report(apartments: list) -> Path:
                     pdf.cell(w, 6, val, border=1, align="C")
                 pdf.ln()
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.pdf"
     await asyncio.to_thread(pdf.output, str(filepath))
     return filepath
