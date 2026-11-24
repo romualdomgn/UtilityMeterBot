@@ -12,6 +12,7 @@ const state = {
   historyMonth: "",
   aptReqSeq: 0,
   histReqSeq: 0,
+  reorderMode: false,
 };
 
 const ROLE_RU = { admin: "Администратор", landlord: "Владелец", tenant: "Наниматель", revoked: "Отозван" };
@@ -397,6 +398,10 @@ function renderNav() {
     btn.onclick = async () => {
       if (state.activeTab === btn.dataset.tab) return;
       haptic("light");
+      if (state.reorderMode) {
+        state.reorderMode = false;
+        try { tg?.enableVerticalSwipes?.(); } catch (_) {}
+      }
       state.activeTab = btn.dataset.tab;
       renderNav();
       await renderTab();
@@ -871,6 +876,332 @@ function openCreatePropertyModal() {
   });
 }
 
+async function saveApartmentOrder(newIds, root) {
+  const prevApartments = state.apartments.slice();
+  const byId = new Map(state.apartments.map(a => [a.id, a]));
+  const reordered = newIds.map(id => byId.get(id)).filter(Boolean);
+  if (reordered.length !== state.apartments.length) {
+    for (const a of state.apartments) {
+      if (!newIds.includes(a.id)) reordered.push(a);
+    }
+  }
+  state.apartments = reordered;
+  renderAptSelector();
+
+  try {
+    await api("/api/apartments/reorder", {
+      method: "PUT",
+      body: { apartment_ids: reordered.map(a => a.id) },
+    });
+    showToast("✅ Порядок объектов сохранён");
+  } catch (err) {
+    state.apartments = prevApartments;
+    renderAptSelector();
+    renderApartments(root);
+    showToast("❌ " + err.message, "error");
+  }
+}
+
+async function moveSelectedApartment(delta, root) {
+  const ids = state.apartments.map(a => a.id);
+  const idx = ids.indexOf(state.selectedAptId);
+  if (idx === -1) return;
+  const targetIdx = idx + delta;
+  if (targetIdx < 0 || targetIdx >= ids.length) return;
+  const [moved] = ids.splice(idx, 1);
+  ids.splice(targetIdx, 0, moved);
+  haptic("light");
+  await saveApartmentOrder(ids, root);
+  renderApartments(root);
+}
+
+function initPropertyDragAndDrop(container, root) {
+  const getOrder = () => Array.from(container.querySelectorAll(".apt-chip")).map(el => Number(el.dataset.apt));
+
+  container.addEventListener("contextmenu", (e) => {
+    if (e.target.closest(".apt-chip")) e.preventDefault();
+  });
+
+  container.addEventListener("dragstart", (e) => {
+    e.preventDefault();
+  });
+
+  let activeDrag = null;
+  let lastTouchEndAt = 0;
+
+  const startDrag = (chip, cx, cy) => {
+    if (!activeDrag || activeDrag.dragging) return;
+    activeDrag.dragging = true;
+    activeDrag.initialOrder = getOrder();
+    activeDrag.lastSwapAt = 0;
+
+    const rect = chip.getBoundingClientRect();
+    activeDrag.offsetX = cx - rect.left;
+    activeDrag.offsetY = cy - rect.top;
+
+    const ghost = chip.cloneNode(true);
+    ghost.classList.add("apt-chip-ghost");
+    ghost.style.pointerEvents = "none";
+    ghost.style.left = `${rect.left}px`;
+    ghost.style.top = `${rect.top}px`;
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    document.body.appendChild(ghost);
+    activeDrag.ghost = ghost;
+
+    chip.classList.add("apt-chip-placeholder");
+    document.body.classList.add("is-dragging-apt");
+    try { tg?.disableVerticalSwipes?.(); } catch (_) {}
+    haptic("medium");
+  };
+
+  const reorderAtPoint = (chip, cx, cy) => {
+    const now = Date.now();
+    if (activeDrag && now - activeDrag.lastSwapAt < 55) return;
+
+    const chips = Array.from(container.querySelectorAll(".apt-chip"));
+    if (chips.length < 2) return;
+
+    const dragIdx = chips.indexOf(chip);
+    if (dragIdx === -1) return;
+    const dragRect = chip.getBoundingClientRect();
+
+    let target = null;
+    let targetRect = null;
+    for (const candidate of chips) {
+      if (candidate === chip) continue;
+      const r = candidate.getBoundingClientRect();
+      if (cx >= r.left - 5 && cx <= r.right + 5 && cy >= r.top - 5 && cy <= r.bottom + 5) {
+        target = candidate;
+        targetRect = r;
+        break;
+      }
+    }
+
+    if (target && targetRect) {
+      const targetIdx = chips.indexOf(target);
+      const targetCenterX = targetRect.left + targetRect.width / 2;
+      const sameRow = Math.abs(targetRect.top - dragRect.top) <= targetRect.height * 0.55;
+
+      let moved = false;
+      if (sameRow) {
+        if (dragIdx < targetIdx && cx > targetRect.left + targetRect.width * 0.42) {
+          container.insertBefore(chip, target.nextSibling);
+          moved = true;
+        } else if (dragIdx > targetIdx && cx < targetRect.left + targetRect.width * 0.58) {
+          container.insertBefore(chip, target);
+          moved = true;
+        }
+      } else {
+        if (cx < targetCenterX) {
+          if (chip.nextSibling !== target) {
+            container.insertBefore(chip, target);
+            moved = true;
+          }
+        } else {
+          if (target.nextSibling !== chip) {
+            container.insertBefore(chip, target.nextSibling);
+            moved = true;
+          }
+        }
+      }
+      if (moved) {
+        if (activeDrag) activeDrag.lastSwapAt = now;
+        haptic("light");
+      }
+      return;
+    }
+
+    const firstChip = chips[0];
+    const lastChip = chips[chips.length - 1];
+    if (firstChip && firstChip !== chip) {
+      const fr = firstChip.getBoundingClientRect();
+      if (cy <= fr.bottom && cx < fr.left) {
+        container.insertBefore(chip, firstChip);
+        if (activeDrag) activeDrag.lastSwapAt = now;
+        haptic("light");
+        return;
+      }
+    }
+    if (lastChip && lastChip !== chip) {
+      const lr = lastChip.getBoundingClientRect();
+      if ((cy >= lr.top && cx > lr.right) || cy > lr.bottom + 4) {
+        container.appendChild(chip);
+        if (activeDrag) activeDrag.lastSwapAt = now;
+        haptic("light");
+      }
+    }
+  };
+
+  const finishDrag = (commit) => {
+    if (!activeDrag) return;
+    const d = activeDrag;
+    activeDrag = null;
+
+    if (d.holdTimer) clearTimeout(d.holdTimer);
+    if (d.cleanup) d.cleanup();
+
+    if (!d.dragging) return;
+
+    d.ghost?.remove();
+    d.chip.classList.remove("apt-chip-placeholder");
+    document.body.classList.remove("is-dragging-apt");
+    if (!state.reorderMode) {
+      try { tg?.enableVerticalSwipes?.(); } catch (_) {}
+    }
+
+    container.dataset.justDragged = "1";
+    setTimeout(() => { delete container.dataset.justDragged; }, 140);
+
+    if (commit) {
+      const newOrder = getOrder();
+      if (newOrder.join(",") !== d.initialOrder.join(",")) {
+        saveApartmentOrder(newOrder, root);
+      }
+    }
+  };
+
+  const findTouch = (list, id) => {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].identifier === id) return list[i];
+    }
+    return null;
+  };
+
+  // ── Mouse drag (Desktop / Telegram Desktop) ─────────────────────────
+  container.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (Date.now() - lastTouchEndAt < 500) return;
+    const chip = e.target.closest(".apt-chip");
+    if (!chip || !container.contains(chip)) return;
+
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    const onMouseMove = (ev) => {
+      if (!activeDrag || activeDrag.mode !== "mouse") return;
+      const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
+      if (!activeDrag.dragging && dist >= (state.reorderMode ? 3 : 5)) {
+        startDrag(chip, ev.clientX, ev.clientY);
+      }
+      if (activeDrag.dragging && activeDrag.ghost) {
+        ev.preventDefault();
+        activeDrag.ghost.style.left = `${ev.clientX - activeDrag.offsetX}px`;
+        activeDrag.ghost.style.top = `${ev.clientY - activeDrag.offsetY}px`;
+        reorderAtPoint(chip, ev.clientX, ev.clientY);
+      }
+    };
+
+    const onMouseUp = () => finishDrag(true);
+
+    activeDrag = {
+      mode: "mouse",
+      chip,
+      dragging: false,
+      ghost: null,
+      holdTimer: null,
+      initialOrder: [],
+      offsetX: 0,
+      offsetY: 0,
+      lastSwapAt: 0,
+      cleanup: () => {
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+        window.removeEventListener("blur", onMouseUp);
+      },
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", onMouseUp);
+  });
+
+  // ── Touch drag (iPhone / iOS WKWebView & Android) ───────────────────
+  // Listeners are registered directly on container upfront with passive: false
+  // so iOS WKWebView allows preventDefault() before scroll is committed.
+  container.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    const chip = e.target.closest(".apt-chip");
+    if (!chip || !container.contains(chip)) return;
+
+    const touch = e.touches[0];
+    const touchId = touch.identifier;
+    const startX = touch.clientX;
+    const startY = touch.clientY;
+
+    activeDrag = {
+      mode: "touch",
+      touchId,
+      startX,
+      startY,
+      lastX: startX,
+      lastY: startY,
+      chip,
+      dragging: false,
+      ghost: null,
+      holdTimer: null,
+      initialOrder: [],
+      offsetX: 0,
+      offsetY: 0,
+      lastSwapAt: 0,
+      cleanup: null,
+    };
+
+    if (!state.reorderMode) {
+      activeDrag.holdTimer = setTimeout(() => {
+        if (activeDrag && activeDrag.mode === "touch" && !activeDrag.dragging) {
+          activeDrag.holdTimer = null;
+          startDrag(chip, activeDrag.lastX, activeDrag.lastY);
+        }
+      }, 220);
+    }
+  }, { passive: true });
+
+  container.addEventListener("touchmove", (e) => {
+    if (!activeDrag || activeDrag.mode !== "touch") return;
+    const t = findTouch(e.touches, activeDrag.touchId);
+    if (!t) return;
+    activeDrag.lastX = t.clientX;
+    activeDrag.lastY = t.clientY;
+    const dist = Math.hypot(t.clientX - activeDrag.startX, t.clientY - activeDrag.startY);
+
+    if (!activeDrag.dragging) {
+      if (state.reorderMode) {
+        e.preventDefault();
+        if (dist >= 4) {
+          startDrag(activeDrag.chip, t.clientX, t.clientY);
+        }
+      } else if (dist > 10) {
+        if (activeDrag.holdTimer) {
+          clearTimeout(activeDrag.holdTimer);
+          activeDrag.holdTimer = null;
+        }
+      }
+    }
+
+    if (activeDrag.dragging && activeDrag.ghost) {
+      e.preventDefault();
+      activeDrag.ghost.style.left = `${t.clientX - activeDrag.offsetX}px`;
+      activeDrag.ghost.style.top = `${t.clientY - activeDrag.offsetY}px`;
+      reorderAtPoint(activeDrag.chip, t.clientX, t.clientY);
+    }
+  }, { passive: false });
+
+  container.addEventListener("touchend", (e) => {
+    if (!activeDrag || activeDrag.mode !== "touch") return;
+    if (!findTouch(e.changedTouches, activeDrag.touchId)) return;
+    lastTouchEndAt = Date.now();
+    finishDrag(true);
+  });
+
+  container.addEventListener("touchcancel", () => {
+    if (!activeDrag || activeDrag.mode !== "touch") return;
+    lastTouchEndAt = Date.now();
+    finishDrag(false);
+  });
+}
+
 function renderApartments(root) {
   const apt = state.aptDetail?.apartment;
   const tariffs = state.aptDetail?.tariffs || {};
@@ -878,9 +1209,12 @@ function renderApartments(root) {
   const tenants = state.aptDetail?.tenants || [];
   const enabled = apt ? getEnabledMeters(apt) : [];
 
+  const canReorder = state.apartments.length > 1;
+  if (!canReorder) state.reorderMode = false;
+
   const aptListChips = state.apartments.map(a => `
-    <button class="btn btn-sm ${a.id === state.selectedAptId ? "" : "btn-secondary"}" data-apt="${a.id}">
-      ${esc(propIcon(a))} ${esc(propShort(a))}${a.has_tenant ? " 👤" : ""}
+    <button type="button" class="btn btn-sm apt-chip ${a.id === state.selectedAptId ? "" : "btn-secondary"}" data-apt="${a.id}">
+      ${state.reorderMode ? '<span class="drag-grip">⠿</span>' : ""}${esc(propIcon(a))} ${esc(propShort(a))}${a.has_tenant ? " 👤" : ""}
     </button>`).join("");
 
   let bodyHtml = "";
@@ -970,8 +1304,20 @@ function renderApartments(root) {
 
   root.innerHTML = `
     <div class="card">
-      <div class="row-between"><h2>🏘 Недвижимость</h2><button class="btn btn-sm" id="btn-new-apt">➕ Добавить</button></div>
-      <div class="row-gap mt-8">${aptListChips || '<span class="muted small">Пока нет объектов недвижимости</span>'}</div>
+      <div class="row-between">
+        <h2>🏘 Недвижимость</h2>
+        <div class="row-nowrap">
+          ${canReorder ? `<button type="button" class="btn btn-sm ${state.reorderMode ? "" : "btn-secondary"}" id="btn-toggle-reorder" title="Изменить порядок объектов">${state.reorderMode ? "✓ Готово" : "⇅"}</button>` : ""}
+          <button type="button" class="btn btn-sm" id="btn-new-apt">➕ Добавить</button>
+        </div>
+      </div>
+      <div id="apt-chips-list" class="apt-chips-list mt-8 ${state.reorderMode ? "reorder-mode" : ""}">${aptListChips || '<span class="muted small">Пока нет объектов недвижимости</span>'}</div>
+      ${canReorder && state.reorderMode ? `
+        <div class="reorder-controls">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-move-left" style="flex:1" ${state.apartments.findIndex(a => a.id === state.selectedAptId) <= 0 ? "disabled" : ""}>◀ Влево</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-move-right" style="flex:1" ${state.apartments.findIndex(a => a.id === state.selectedAptId) >= state.apartments.length - 1 ? "disabled" : ""}>Вправо ▶</button>
+        </div>` : ""}
+      ${canReorder ? `<div class="reorder-hint">${state.reorderMode ? "Перетаскивайте объекты или двигайте выбранный кнопками ◀ ▶" : "Перетащите объект (на телефоне — удерживайте) или нажмите ⇅"}</div>` : ""}
     </div>
     ${apt ? `
       <div class="card">
@@ -979,7 +1325,7 @@ function renderApartments(root) {
         <div class="subtabs">
           <button class="subtab ${state.manageSubtab === "settings" ? "active" : ""}" data-m="settings">⚙️ Настройки</button>
           <button class="subtab ${state.manageSubtab === "initial" ? "active" : ""}" data-m="initial">📏 Начальные</button>
-          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract">📋 Договор</button>
+          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract">📋 Аренда</button>
         </div>
         ${bodyHtml}
       </div>` : ""}
@@ -990,11 +1336,35 @@ function renderApartments(root) {
     bindExportButtons(apt);
   }
 
+  document.getElementById("btn-toggle-reorder")?.addEventListener("click", () => {
+    haptic("light");
+    state.reorderMode = !state.reorderMode;
+    try {
+      if (state.reorderMode) tg?.disableVerticalSwipes?.();
+      else tg?.enableVerticalSwipes?.();
+    } catch (_) {}
+    renderApartments(root);
+  });
+
+  const chipsContainer = document.getElementById("apt-chips-list");
+  if (canReorder && chipsContainer) {
+    initPropertyDragAndDrop(chipsContainer, root);
+  }
+
+  document.getElementById("btn-move-left")?.addEventListener("click", () => moveSelectedApartment(-1, root));
+  document.getElementById("btn-move-right")?.addEventListener("click", () => moveSelectedApartment(1, root));
+
   root.querySelectorAll("[data-apt]").forEach(btn => {
     btn.onclick = async () => {
+      if (chipsContainer?.dataset.justDragged === "1") return;
       haptic("light");
       state.selectedAptId = Number(btn.dataset.apt);
       renderAptSelector();
+      if (state.reorderMode) {
+        const ok = await loadApartmentDetail(state.selectedAptId);
+        if (ok) renderApartments(root);
+        return;
+      }
       showLoading(root, "Загружаю объект...");
       const ok = await loadApartmentDetail(state.selectedAptId);
       if (ok) renderApartments(root);

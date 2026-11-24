@@ -31,6 +31,10 @@ class ApartmentCreateBody(BaseModel):
     family_id: int | None = None
 
 
+class ApartmentReorderBody(BaseModel):
+    apartment_ids: list[int]
+
+
 class ApartmentSettingsBody(BaseModel):
     number: str | None = None
     property_type: PropertyTypeLiteral | None = None
@@ -137,6 +141,7 @@ def serialize_apartment(apt) -> dict:
         "water_submission_day": apt.water_submission_day,
         "electricity_submission_day": apt.electricity_submission_day,
         "gas_submission_day": getattr(apt, "gas_submission_day", None),
+        "sort_order": getattr(apt, "sort_order", 0),
     }
 
 

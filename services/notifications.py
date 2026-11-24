@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from html import escape as h
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
-from config import WEBAPP_URL
+from config import BASE_DIR, WEBAPP_URL
 from database import crud
 from database.models import format_property_short, format_property_title
 from services.access import get_notification_recipients
@@ -18,8 +19,29 @@ from services.calculations import fmt_date, format_reading_notification
 logger = logging.getLogger(__name__)
 
 
+def get_webapp_version() -> str:
+    """Compute a short content hash of static Mini App assets for URL cache-busting."""
+    static_dir = BASE_DIR / "webapp" / "static"
+    hasher = hashlib.sha256()
+    for name in ("index.html", "style.css", "app.js"):
+        p = static_dir / name
+        try:
+            hasher.update(p.read_bytes())
+        except OSError:
+            pass
+    return hasher.hexdigest()[:10]
+
+
+def build_webapp_url(tab: str | None = None) -> str:
+    """Build Mini App URL with asset version query param to bypass Telegram WebView cache."""
+    ver = get_webapp_version()
+    if tab:
+        return f"{WEBAPP_URL}/?v={ver}&tab={tab}"
+    return f"{WEBAPP_URL}/?v={ver}"
+
+
 def webapp_open_kb(label: str = "📱 Открыть панель счётчиков", tab: str | None = None) -> InlineKeyboardMarkup:
-    url = f"{WEBAPP_URL}/?tab={tab}" if tab else WEBAPP_URL
+    url = build_webapp_url(tab=tab)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=label, web_app=WebAppInfo(url=url))],
     ])

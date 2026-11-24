@@ -173,6 +173,7 @@ class Apartment(Base):
     water_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     electricity_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gas_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
     )

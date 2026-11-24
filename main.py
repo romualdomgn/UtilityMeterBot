@@ -22,6 +22,7 @@ from config import (
 )
 from database import crud
 from database.session import init_db
+from services.notifications import build_webapp_url
 from services.scheduler import setup_scheduler
 from webapp.api import create_web_app
 
@@ -47,15 +48,32 @@ async def setup_bot_ui(bot: Bot) -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть панель счётчиков"),
     ])
+    menu_url = build_webapp_url()
+    menu_btn = MenuButtonWebApp(
+        text="Счётчики",
+        web_app=WebAppInfo(url=menu_url),
+    )
     try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(
-                text="Счётчики",
-                web_app=WebAppInfo(url=WEBAPP_URL),
-            )
-        )
+        await bot.set_chat_menu_button(menu_button=menu_btn)
     except Exception as e:
         logger.warning("Could not set default menu button: %s", e)
+
+    # Also refresh per-chat menu buttons so existing users immediately get the new ?v= URL
+    chat_ids: set[int] = set()
+    if ADMIN_TELEGRAM_ID:
+        chat_ids.add(ADMIN_TELEGRAM_ID)
+    try:
+        for u in await crud.get_all_users():
+            if not u.is_blocked and u.role in ("admin", "landlord", "tenant"):
+                chat_ids.add(u.telegram_id)
+    except Exception as e:
+        logger.debug("Could not fetch users for menu button sync: %s", e)
+
+    for cid in chat_ids:
+        try:
+            await bot.set_chat_menu_button(chat_id=cid, menu_button=menu_btn)
+        except Exception as e:
+            logger.debug("Could not refresh menu button for chat %s: %s", cid, e)
 
 
 async def main() -> None:

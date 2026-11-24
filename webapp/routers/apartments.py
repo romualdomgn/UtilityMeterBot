@@ -20,6 +20,7 @@ from services.notifications import notify_tenant_removed
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import (
     ApartmentCreateBody,
+    ApartmentReorderBody,
     ApartmentSettingsBody,
     InitialReadingsBody,
     ProfileUpdateBody,
@@ -75,6 +76,26 @@ async def api_update_own_profile(
         f"Пользователь ID={user.telegram_id} изменил имя на '{name}'",
     )
     return {"ok": True, "name": updated.name}
+
+
+@router.put("/api/apartments/reorder")
+async def api_reorder_apartments(
+    body: ApartmentReorderBody,
+    user: WebAppUser = Depends(get_current_user),
+):
+    require_role(user, ("admin", "landlord"))
+    requested_ids = list(dict.fromkeys(body.apartment_ids))
+    if not requested_ids:
+        raise HTTPException(400, "Список объектов не может быть пустым")
+
+    accessible = await get_accessible_apartments(user.telegram_id)
+    accessible_ids = {a.id for a in accessible}
+    if any(aid not in accessible_ids for aid in requested_ids):
+        raise HTTPException(403, "Нет доступа к одному из объектов недвижимости")
+
+    full_order = requested_ids + [a.id for a in accessible if a.id not in set(requested_ids)]
+    updated_ids = await operations.reorder_apartments_atomic(full_order, user.telegram_id)
+    return {"ok": True, "apartment_ids": updated_ids}
 
 
 @router.get("/api/apartments/{apt_id}")

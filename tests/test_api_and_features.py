@@ -28,6 +28,7 @@ from webapp.routers import readings as read_router
 from webapp.routers import tenants as ten_router
 from webapp.schemas import (
     ApartmentCreateBody,
+    ApartmentReorderBody,
     ApartmentSettingsBody,
     ElectricityReadingBody,
     FamilyOwnerUpdateBody,
@@ -122,7 +123,7 @@ async def test_sqlite_migration_adds_new_columns_to_legacy_table(tmp_path):
         rows = (await conn.execute(text("PRAGMA table_info(apartments)"))).fetchall()
         cols = {r[1] for r in rows}
     await engine.dispose()
-    assert {"property_type", "enabled_meters", "gas_submission_day"}.issubset(cols)
+    assert {"property_type", "enabled_meters", "gas_submission_day", "sort_order"}.issubset(cols)
 
 
 @pytest.mark.asyncio
@@ -341,3 +342,82 @@ async def test_delete_apartment_cascade_tenant_cleanup_and_permissions(temp_db):
     with pytest.raises(HTTPException) as exc_404:
         await apt_router.api_delete_apartment(apt_a1.id, req, user=admin)
     assert exc_404.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reorder_apartments_persistence_and_permissions(temp_db):
+    fam_a = await crud.create_family("Family A")
+    fam_b = await crud.create_family("Family B")
+    a1 = await crud.create_apartment("75", fam_a.id)
+    a2 = await crud.create_apartment("188", fam_a.id, property_type="house")
+    a3 = await crud.create_apartment("17", fam_a.id)
+    b1 = await crud.create_apartment("99", fam_b.id)
+
+    await crud.get_or_create_user(201, name="Owner A", role="landlord", family_id=fam_a.id)
+    await crud.get_or_create_user(301, name="Tenant A", role="tenant", family_id=fam_a.id)
+    landlord_a = WebAppUser(telegram_id=201, role="landlord", family_id=fam_a.id, name="Owner A")
+    tenant_a = WebAppUser(telegram_id=301, role="tenant", family_id=fam_a.id, name="Tenant A")
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # Default order follows creation sort_order
+    initial = await crud.get_apartments_by_family(fam_a.id)
+    assert [a.id for a in initial] == [a1.id, a2.id, a3.id]
+
+    # Tenant cannot reorder (403)
+    with pytest.raises(HTTPException) as exc_t:
+        await apt_router.api_reorder_apartments(
+            ApartmentReorderBody(apartment_ids=[a3.id, a1.id, a2.id]), user=tenant_a
+        )
+    assert exc_t.value.status_code == 403
+
+    # Landlord A cannot include Family B's property (403)
+    with pytest.raises(HTTPException) as exc_cross:
+        await apt_router.api_reorder_apartments(
+            ApartmentReorderBody(apartment_ids=[a1.id, b1.id]), user=landlord_a
+        )
+    assert exc_cross.value.status_code == 403
+
+    # Landlord A reorders their properties: [17, 75, 188]
+    res = await apt_router.api_reorder_apartments(
+        ApartmentReorderBody(apartment_ids=[a3.id, a1.id, a2.id]), user=landlord_a
+    )
+    assert res["ok"] is True
+    assert res["apartment_ids"] == [a3.id, a1.id, a2.id]
+
+    reordered = await crud.get_apartments_by_family(fam_a.id)
+    assert [a.id for a in reordered] == [a3.id, a1.id, a2.id]
+
+    # New property added afterwards appends to the end
+    a4 = await crud.create_apartment("371", fam_a.id)
+    after_add = await crud.get_apartments_by_family(fam_a.id)
+    assert [a.id for a in after_add] == [a3.id, a1.id, a2.id, a4.id]
+
+    # Admin can reorder across all properties
+    res_adm = await apt_router.api_reorder_apartments(
+        ApartmentReorderBody(apartment_ids=[a4.id, b1.id, a1.id, a2.id, a3.id]), user=admin
+    )
+    assert res_adm["apartment_ids"] == [a4.id, b1.id, a1.id, a2.id, a3.id]
+    all_apts = await crud.get_all_apartments()
+    assert [a.id for a in all_apts] == [a4.id, b1.id, a1.id, a2.id, a3.id]
+
+
+def test_index_html_injects_asset_version_hashes():
+    from webapp.api import render_index_html
+
+    html = render_index_html()
+    assert '/style.css?v=' in html
+    assert '/app.js?v=' in html
+
+
+def test_webapp_url_versioning_and_arenda_label():
+    from pathlib import Path
+    from services.notifications import build_webapp_url
+
+    url_root = build_webapp_url()
+    assert "?v=" in url_root
+    url_tab = build_webapp_url("water")
+    assert "?v=" in url_tab and "&tab=water" in url_tab
+
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "📋 Аренда" in app_js
+    assert "📋 Договор" not in app_js

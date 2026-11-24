@@ -11,11 +11,11 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import MenuButtonWebApp, Message, WebAppInfo
 
-from config import BOT_TZ, PHOTOS_DIR, WEBAPP_URL
+from config import BOT_TZ, PHOTOS_DIR
 from database import crud
 from database.models import format_property_short
 from services.access import get_accessible_apartments, resolve_user_access
-from services.notifications import forward_meter_photo_file, webapp_open_kb
+from services.notifications import build_webapp_url, forward_meter_photo_file, webapp_open_kb
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -40,7 +40,7 @@ async def cmd_start(message: Message) -> None:
             chat_id=message.chat.id,
             menu_button=MenuButtonWebApp(
                 text="Счётчики",
-                web_app=WebAppInfo(url=WEBAPP_URL),
+                web_app=WebAppInfo(url=build_webapp_url()),
             ),
         )
     except Exception as e:

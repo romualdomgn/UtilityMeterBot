@@ -33,6 +33,7 @@ APARTMENT_MIGRATIONS = (
     ("property_type", "ALTER TABLE apartments ADD COLUMN property_type VARCHAR(20) NOT NULL DEFAULT 'apartment'"),
     ("enabled_meters", "ALTER TABLE apartments ADD COLUMN enabled_meters TEXT"),
     ("gas_submission_day", "ALTER TABLE apartments ADD COLUMN gas_submission_day INTEGER"),
+    ("sort_order", "ALTER TABLE apartments ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -44,6 +45,8 @@ def _run_sqlite_migrations(sync_conn) -> None:
         if col_name not in existing_cols:
             logger.info("Applying SQLite migration: adding column apartments.%s", col_name)
             sync_conn.execute(text(ddl))
+            if col_name == "sort_order":
+                sync_conn.execute(text("UPDATE apartments SET sort_order = id"))
 
 
 async def init_db() -> None:

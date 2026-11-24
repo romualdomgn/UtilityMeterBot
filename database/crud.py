@@ -34,6 +34,7 @@ ALLOWED_APARTMENT_FIELDS = frozenset({
     "water_submission_day",
     "electricity_submission_day",
     "gas_submission_day",
+    "sort_order",
 })
 
 
@@ -216,14 +217,16 @@ async def get_apartment(apartment_id: int) -> Apartment | None:
 async def get_apartments_by_family(family_id: int) -> list[Apartment]:
     async with UnitOfWork() as s:
         res = await s.execute(
-            select(Apartment).where(Apartment.family_id == family_id).order_by(Apartment.id)
+            select(Apartment)
+            .where(Apartment.family_id == family_id)
+            .order_by(Apartment.sort_order, Apartment.id)
         )
         return list(res.scalars().all())
 
 
 async def get_all_apartments() -> list[Apartment]:
     async with UnitOfWork() as s:
-        res = await s.execute(select(Apartment).order_by(Apartment.id))
+        res = await s.execute(select(Apartment).order_by(Apartment.sort_order, Apartment.id))
         return list(res.scalars().all())
 
 
@@ -235,11 +238,14 @@ async def create_apartment(
 ) -> Apartment:
     meters_str = serialize_enabled_meters(enabled_meters) if enabled_meters is not None else None
     async with UnitOfWork() as s:
+        max_order_res = await s.execute(select(func.coalesce(func.max(Apartment.sort_order), 0)))
+        next_order = int(max_order_res.scalar() or 0) + 1
         apt = Apartment(
             number=number,
             family_id=family_id,
             property_type=property_type,
             enabled_meters=meters_str or None,
+            sort_order=next_order,
         )
         s.add(apt)
         await s.flush()
@@ -293,7 +299,7 @@ async def get_apartments_for_user(telegram_id: int) -> list[Apartment]:
             .join(ApartmentUser, ApartmentUser.apartment_id == Apartment.id)
             .join(User, User.id == ApartmentUser.user_id)
             .where(User.telegram_id == telegram_id)
-            .order_by(Apartment.id)
+            .order_by(Apartment.sort_order, Apartment.id)
         )
         return list(res.scalars().all())
 

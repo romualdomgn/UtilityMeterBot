@@ -332,3 +332,31 @@ async def delete_apartment_atomic(
             ),
         ))
         return prop_label, affected_tenants
+
+
+async def reorder_apartments_atomic(
+    apartment_ids: list[int],
+    actor_tg_id: int,
+) -> list[int]:
+    """Persist custom display order for properties in a single transaction."""
+    unique_ids: list[int] = list(dict.fromkeys(apartment_ids))
+    if not unique_ids:
+        return []
+
+    async with UnitOfWork() as s:
+        res = await s.execute(select(Apartment).where(Apartment.id.in_(unique_ids)))
+        apt_map = {a.id: a for a in res.scalars().all()}
+
+        updated_ids: list[int] = []
+        for idx, apt_id in enumerate(unique_ids, start=1):
+            apt = apt_map.get(apt_id)
+            if apt is not None:
+                apt.sort_order = idx
+                updated_ids.append(apt_id)
+
+        s.add(AuditLog(
+            user_telegram_id=actor_tg_id,
+            action="reorder_apartments",
+            details=f"Порядок объектов обновлён ({len(updated_ids)} шт.)",
+        ))
+        return updated_ids
