@@ -275,3 +275,69 @@ async def test_update_apartment_whitelist_and_delete_family_admin_unlink(temp_db
     admin_row = await crud.get_user_by_telegram_id(100)
     assert admin_row is not None
     assert admin_row.family_id is None
+
+
+@pytest.mark.asyncio
+async def test_delete_apartment_cascade_tenant_cleanup_and_permissions(temp_db):
+    fam_a = await crud.create_family("Family A")
+    fam_b = await crud.create_family("Family B")
+    apt_a1 = await crud.create_apartment("101", fam_a.id, property_type="apartment")
+    apt_a2 = await crud.create_apartment("102", fam_a.id, property_type="house", enabled_meters=["cold_water", "t1", "gas"])
+    apt_b1 = await crud.create_apartment("201", fam_b.id, property_type="dacha")
+
+    await crud.get_or_create_user(201, name="Owner A", role="landlord", family_id=fam_a.id)
+    landlord_a = WebAppUser(telegram_id=201, role="landlord", family_id=fam_a.id, name="Owner A")
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    bot = DummyBot()
+    req = make_request(bot)
+
+    # Add readings, tariffs, initial readings to apt_a1
+    await operations.update_initial_readings_atomic(apt_a1.id, {"cold_water": 10}, 100)
+    await operations.update_apartment_settings_atomic(
+        apt_a1.id, 20, 20, {"cold_water": __import__("decimal").Decimal("50")}, 100, datetime.date(2026, 11, 1)
+    )
+    await operations.save_meter_group_readings(
+        apt_a1.id, {"cold_water": 20}, 100, datetime.date(2026, 11, 20), "submit_water", "test"
+    )
+
+    # Tenant 1 linked ONLY to apt_a1; Tenant 2 linked to BOTH apt_a1 and apt_a2
+    u_t1, _ = await crud.get_or_create_user(301, name="Only A1", role="tenant", family_id=fam_a.id)
+    u_t2, _ = await crud.get_or_create_user(302, name="Both A1 A2", role="tenant", family_id=fam_a.id)
+    await crud.link_user_to_apartment(apt_a1.id, u_t1.id, role="tenant")
+    await crud.link_user_to_apartment(apt_a1.id, u_t2.id, role="tenant")
+    await crud.link_user_to_apartment(apt_a2.id, u_t2.id, role="tenant")
+
+    tenant_user = WebAppUser(telegram_id=301, role="tenant", family_id=fam_a.id, name="Only A1")
+
+    # Tenant cannot delete a property (403)
+    with pytest.raises(HTTPException) as exc_tenant:
+        await apt_router.api_delete_apartment(apt_a1.id, req, user=tenant_user)
+    assert exc_tenant.value.status_code == 403
+
+    # Landlord A cannot delete Family B's property (403)
+    with pytest.raises(HTTPException) as exc_cross:
+        await apt_router.api_delete_apartment(apt_b1.id, req, user=landlord_a)
+    assert exc_cross.value.status_code == 403
+
+    # Detail includes readings_count for landlord
+    detail = await apt_router.api_apartment_detail(apt_a1.id, user=landlord_a)
+    assert detail["readings_count"] == 1
+
+    # Landlord A deletes apt_a1
+    res = await apt_router.api_delete_apartment(apt_a1.id, req, user=landlord_a)
+    assert res["ok"] is True
+    assert res["affected_tenants"] == 2
+    assert await crud.get_apartment(apt_a1.id) is None
+    assert await crud.get_readings_count(apt_a1.id) == 0
+    assert await crud.get_tariff_history(apt_a1.id) == []
+
+    # Tenant 1 (only apt_a1) must be fully removed; Tenant 2 (also apt_a2) must remain
+    assert await crud.get_user_by_telegram_id(301) is None
+    assert await crud.get_user_by_telegram_id(302) is not None
+    assert len(bot.sent) == 2
+
+    # Deleting already deleted property returns 404 for admin
+    with pytest.raises(HTTPException) as exc_404:
+        await apt_router.api_delete_apartment(apt_a1.id, req, user=admin)
+    assert exc_404.value.status_code == 404

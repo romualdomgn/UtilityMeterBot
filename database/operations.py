@@ -281,3 +281,54 @@ async def remove_tenant_from_apartment_atomic(
             details=f"Наниматель ID={tenant_tg_id} удалён из {prop_label} (full={fully_removed})",
         ))
         return prop_label, fully_removed
+
+
+async def delete_apartment_atomic(
+    apartment_id: int,
+    actor_tg_id: int,
+) -> tuple[str, list[tuple[int, bool]]]:
+    """Delete a property atomically with all its readings/tariffs/links and clean up orphaned tenants.
+
+    Returns (property_label, [(tenant_telegram_id, fully_removed), ...]).
+    """
+    async with UnitOfWork() as s:
+        apt = await s.get(Apartment, apartment_id)
+        if not apt:
+            raise LookupError("Объект недвижимости не найден")
+
+        prop_label = format_property_short(apt)
+
+        res_tenants = await s.execute(
+            select(User)
+            .join(ApartmentUser, ApartmentUser.user_id == User.id)
+            .where(
+                ApartmentUser.apartment_id == apartment_id,
+                User.role == "tenant",
+            )
+        )
+        linked_tenants = list(res_tenants.scalars().all())
+
+        await s.delete(apt)
+        await s.flush()
+
+        affected_tenants: list[tuple[int, bool]] = []
+        for tenant in linked_tenants:
+            if tenant.telegram_id == config.ADMIN_TELEGRAM_ID:
+                continue
+            res_other = await s.execute(
+                select(ApartmentUser.id).where(ApartmentUser.user_id == tenant.id).limit(1)
+            )
+            fully_removed = res_other.scalar_one_or_none() is None
+            if fully_removed:
+                await s.delete(tenant)
+            affected_tenants.append((tenant.telegram_id, fully_removed))
+
+        s.add(AuditLog(
+            user_telegram_id=actor_tg_id,
+            action="delete_apartment",
+            details=(
+                f"Удалён объект {prop_label} (id={apartment_id}), "
+                f"откреплено нанимателей: {len(affected_tenants)}"
+            ),
+        ))
+        return prop_label, affected_tenants

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from config import local_today
 from database import crud, operations
@@ -16,6 +16,7 @@ from database.models import (
 )
 from services.access import get_accessible_apartments, is_admin, user_can_access_apartment
 from services.calculations import calculate_billing, get_prev_value
+from services.notifications import notify_tenant_removed
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import (
     ApartmentCreateBody,
@@ -106,6 +107,8 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
         else []
     )
 
+    readings_count = await crud.get_readings_count(apt_id) if user.role in ("admin", "landlord") else 0
+
     return {
         "apartment": serialize_apartment(apt),
         "tariffs": tariffs,
@@ -113,6 +116,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
         "prev_readings": prev_vals,
         "billing": billing.to_dict(),
         "tenants": tenants,
+        "readings_count": readings_count,
     }
 
 
@@ -152,6 +156,39 @@ async def api_create_apartment(body: ApartmentCreateBody, user: WebAppUser = Dep
         f"Создан объект {format_property_short(apt)} (id={apt.id}, type={apt.property_type}, family_id={family_id})",
     )
     return {"ok": True, "apartment": serialize_apartment(apt)}
+
+@router.delete("/api/apartments/{apt_id}")
+async def api_delete_apartment(
+    apt_id: int,
+    request: Request,
+    user: WebAppUser = Depends(get_current_user),
+):
+    require_role(user, ("admin", "landlord"))
+    if not await user_can_access_apartment(user.telegram_id, apt_id):
+        raise HTTPException(403, "Нет доступа к объекту недвижимости")
+
+    try:
+        prop_label, affected_tenants = await operations.delete_apartment_atomic(
+            apartment_id=apt_id,
+            actor_tg_id=user.telegram_id,
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+
+    for tenant_tg_id, fully_removed in affected_tenants:
+        await notify_tenant_removed(
+            request.app.state.bot,
+            tenant_tg_id,
+            apt_number=prop_label,
+            fully_removed=fully_removed,
+        )
+
+    return {
+        "ok": True,
+        "deleted": prop_label,
+        "affected_tenants": len(affected_tenants),
+    }
+
 
 
 @router.put("/api/apartments/{apt_id}/settings")

@@ -289,7 +289,7 @@ function openEditOwnNameModal() {
 document.getElementById("edit-profile-btn")?.addEventListener("click", openEditOwnNameModal);
 
 // ── Bootstrap ─────────────────────────────────────────────────────────
-async function loadBootstrap() {
+async function loadBootstrap(applyUrlTab = false) {
   try {
     const me = await api("/api/me");
     state.user = me.user;
@@ -302,16 +302,22 @@ async function loadBootstrap() {
     renderAptSelector();
     renderNav();
 
-    const params = new URLSearchParams(window.location.search);
-    const tabParam = params.get("tab");
-    if (tabParam === "water" || tabParam === "electricity" || tabParam === "gas") {
-      state.activeTab = "submit";
-      state.submitSubtab = tabParam;
-    } else if (tabParam && ["dashboard", "apartments", "families", "history", "photo", "admin"].includes(tabParam)) {
-      state.activeTab = tabParam;
+    if (applyUrlTab) {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get("tab");
+      if (tabParam === "water" || tabParam === "electricity" || tabParam === "gas") {
+        state.activeTab = "submit";
+        state.submitSubtab = tabParam;
+      } else if (tabParam && ["dashboard", "apartments", "families", "history", "photo", "admin"].includes(tabParam)) {
+        state.activeTab = tabParam;
+      }
     }
 
-    if (state.selectedAptId) await loadApartmentDetail(state.selectedAptId);
+    if (state.selectedAptId) {
+      await loadApartmentDetail(state.selectedAptId);
+    } else {
+      state.aptDetail = null;
+    }
     await renderTab();
   } catch (err) {
     document.getElementById("content").innerHTML = `
@@ -923,6 +929,9 @@ function renderApartments(root) {
         <div class="row-gap">
           <button class="btn" id="btn-save-settings">💾 Сохранить настройки и тарифы</button>
           <button class="btn btn-secondary" id="btn-tariff-hist">📋 История тарифов</button>
+        </div>
+        <div class="danger-zone">
+          <button class="btn btn-danger" id="btn-delete-property">🗑 Удалить объект недвижимости</button>
         </div>`;
     } else if (state.manageSubtab === "initial") {
       const enabledMeta = METER_META.filter(m => enabled.includes(m.id));
@@ -1078,6 +1087,44 @@ function renderApartments(root) {
           : `<p class="muted">История тарифов пуста.</p>`;
         openModal(`История тарифов — ${propShort(apt)}`, `<div style="max-height:55vh;overflow:auto">${html}</div>`, [{ label: "Закрыть", cls: "btn-secondary" }]);
       } catch (err) { showToast("❌ " + err.message, "error"); }
+    });
+
+    document.getElementById("btn-delete-property")?.addEventListener("click", () => {
+      const rCount = state.aptDetail?.readings_count ?? 0;
+      const tCount = tenants.length;
+      const details = [
+        `показания счётчиков (${rCount} шт.)`,
+        "тарифы, начальные показания и данные договора",
+      ];
+      const tenantsWarn = tCount > 0
+        ? `<p class="small muted">Наниматели (${tCount} чел.) будут откреплены и получат уведомление в Telegram.</p>`
+        : "";
+
+      openModal("🗑 Удалить объект недвижимости?", `
+        <p>Удалить <b>${esc(propIcon(apt))} ${esc(propTitle(apt))}</b>?</p>
+        <p class="small muted">Будут безвозвратно удалены: ${details.join(", ")}.</p>
+        ${tenantsWarn}
+        <p class="small muted">Если история ещё может пригодиться, сначала сделайте выгрузку в Excel или PDF.</p>
+      `, [
+        { label: "Отмена", cls: "btn-secondary" },
+        {
+          label: "🗑 Удалить навсегда",
+          cls: "btn-danger",
+          onClick: async () => {
+            try {
+              const res = await api(`/api/apartments/${apt.id}`, { method: "DELETE" });
+              showToast(`✅ Объект «${res.deleted || propShort(apt)}» удалён`);
+              state.selectedAptId = null;
+              state.aptDetail = null;
+              state.historyMonth = "";
+              await loadBootstrap(false);
+            } catch (err) {
+              showToast("❌ " + err.message, "error");
+              return false;
+            }
+          },
+        },
+      ]);
     });
   }
 
@@ -1434,4 +1481,4 @@ async function renderAdmin(root) {
   bindExportButtons(apt);
 }
 
-loadBootstrap();
+loadBootstrap(true);
