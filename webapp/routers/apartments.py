@@ -10,7 +10,14 @@ from config import local_today
 from database import crud, operations
 from database.models import (
     ALL_METERS,
-    METER_LABELS,
+    ALL_TARIFF_TYPES,
+    IRRIGATION_METERS,
+    IRRIGATION_MODE_AFTER_COLD,
+    get_apartment_irrigation_mode,
+    MULTI_ELECTRICITY_METERS,
+    SEWERAGE_TARIFF,
+    SINGLE_ELECTRICITY_METER,
+    TARIFF_LABELS,
     format_property_short,
     get_apartment_enabled_meters,
 )
@@ -32,18 +39,26 @@ router = APIRouter()
 MAX_TARIFF_RATE = Decimal("1000000")
 
 
-def _validate_enabled_meters(raw_meters: list[str] | None) -> list[str] | None:
+def _validate_enabled_meters(
+    raw_meters: list[str] | None,
+    property_type: str = "apartment",
+) -> list[str] | None:
     if raw_meters is None:
         return None
     valid = [m for m in ALL_METERS if m in set(raw_meters)]
     if not valid:
         raise HTTPException(400, "Выберите хотя бы один счётчик для объекта")
+    if SINGLE_ELECTRICITY_METER in valid and any(m in valid for m in MULTI_ELECTRICITY_METERS):
+        raise HTTPException(400, "Нельзя одновременно выбрать «Один тариф (Т)» и тарифы Т1, Т2, Т3")
+    if property_type != "house" and any(m in valid for m in IRRIGATION_METERS):
+        raise HTTPException(400, "Счётчик «Полив» доступен только для типа недвижимости «Дом»")
     return valid
 
 
 @router.get("/api/me")
 async def api_me(user: WebAppUser = Depends(get_current_user)):
     apts = await get_accessible_apartments(user.telegram_id)
+    tenant_apt_ids = await crud.get_apartment_ids_with_tenants() if user.role != "tenant" else set()
     return {
         "user": {
             "telegram_id": user.telegram_id,
@@ -51,7 +66,10 @@ async def api_me(user: WebAppUser = Depends(get_current_user)):
             "role": user.role,
             "family_id": user.family_id,
         },
-        "apartments": [serialize_apartment(a) for a in apts],
+        "apartments": [
+            serialize_apartment(a, has_linked_tenants=(a.id in tenant_apt_ids))
+            for a in apts
+        ],
     }
 
 
@@ -110,7 +128,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
     tariffs_raw = await crud.get_all_tariffs(apt_id, as_of_date=local_today())
     tariffs = {
         mt: float(tariffs_raw[mt].rate) if tariffs_raw.get(mt) else None
-        for mt in ALL_METERS
+        for mt in ALL_TARIFF_TYPES
     }
     initial = await crud.get_all_initial_readings(apt_id)
     prev_vals = {
@@ -130,8 +148,9 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
 
     readings_count = await crud.get_readings_count(apt_id) if user.role in ("admin", "landlord") else 0
 
+    has_linked = bool(tenants) if user.role in ("admin", "landlord") else True
     return {
-        "apartment": serialize_apartment(apt),
+        "apartment": serialize_apartment(apt, has_linked_tenants=has_linked),
         "tariffs": tariffs,
         "initial_readings": initial,
         "prev_readings": prev_vals,
@@ -150,7 +169,7 @@ async def api_create_apartment(body: ApartmentCreateBody, user: WebAppUser = Dep
     if len(number) > 50:
         raise HTTPException(400, "Название/номер объекта не длиннее 50 символов")
 
-    enabled_meters = _validate_enabled_meters(body.enabled_meters)
+    enabled_meters = _validate_enabled_meters(body.enabled_meters, property_type=body.property_type)
 
     if is_admin(user.telegram_id):
         family_id = body.family_id
@@ -170,6 +189,7 @@ async def api_create_apartment(body: ApartmentCreateBody, user: WebAppUser = Dep
         family_id=family_id,
         property_type=body.property_type,
         enabled_meters=enabled_meters,
+        irrigation_mode=body.irrigation_mode,
     )
     await crud.add_audit_log(
         user.telegram_id,
@@ -232,15 +252,24 @@ async def api_update_settings(
         if len(clean_number) > 50:
             raise HTTPException(400, "Название/номер объекта не длиннее 50 символов")
 
-    enabled_meters = _validate_enabled_meters(body.enabled_meters)
+    existing_apt = await crud.get_apartment(apt_id)
+    if not existing_apt:
+        raise HTTPException(404, "Объект недвижимости не найден")
+    effective_ptype = body.property_type or existing_apt.property_type or "apartment"
+    enabled_meters = _validate_enabled_meters(body.enabled_meters, property_type=effective_ptype)
+    effective_irr_mode = body.irrigation_mode or get_apartment_irrigation_mode(existing_apt)
 
     parsed_tariffs: dict[str, Decimal] = {}
     for mt, raw_rate in body.tariffs.items():
-        if mt not in ALL_METERS or raw_rate in (None, ""):
+        if mt not in ALL_TARIFF_TYPES or raw_rate in (None, ""):
+            continue
+        if mt in IRRIGATION_METERS and effective_irr_mode == IRRIGATION_MODE_AFTER_COLD:
             continue
         try:
             rate = Decimal(str(raw_rate).strip().replace(",", "."))
-            if not rate.is_finite() or rate <= 0 or rate > MAX_TARIFF_RATE:
+            min_allowed = Decimal("0") if mt == SEWERAGE_TARIFF else Decimal("0")
+            too_small = rate < min_allowed if mt == SEWERAGE_TARIFF else rate <= min_allowed
+            if not rate.is_finite() or too_small or rate > MAX_TARIFF_RATE:
                 raise ValueError
         except (InvalidOperation, ValueError):
             raise HTTPException(400, f"Некорректный тариф для {mt}")
@@ -258,6 +287,7 @@ async def api_update_settings(
             number=clean_number,
             property_type=body.property_type,
             enabled_meters=enabled_meters,
+            irrigation_mode=body.irrigation_mode,
         )
     except LookupError as e:
         raise HTTPException(404, str(e))
@@ -274,7 +304,7 @@ async def api_tariff_history(apt_id: int, user: WebAppUser = Depends(get_current
             {
                 "id": r.id,
                 "tariff_type": r.tariff_type,
-                "label": METER_LABELS.get(r.tariff_type, r.tariff_type),
+                "label": TARIFF_LABELS.get(r.tariff_type, r.tariff_type),
                 "rate": float(r.rate),
                 "effective_from": r.effective_from.strftime("%d.%m.%Y"),
                 "changed_by": r.changed_by,

@@ -16,7 +16,7 @@ from database.models import (
     Apartment,
     ELECTRICITY_METERS,
     GAS_METERS,
-    WATER_METERS,
+    WATER_SUBMISSION_METERS,
     format_property_short,
     get_apartment_enabled_meters,
 )
@@ -93,7 +93,7 @@ async def check_meter_reminders(bot: Bot, today: datetime.date | None = None) ->
             apt=apt,
             cur=cur,
             configured_day=apt.water_submission_day,
-            active_group_meters=[m for m in WATER_METERS if m in enabled],
+            active_group_meters=[m for m in WATER_SUBMISSION_METERS if m in enabled],
             on_day_text=f"💧 Пора подавать показания водомеров ({prop_label}).",
             overdue_text=f"⚠️ Внимание! Показания водомеров не были поданы в срок ({prop_label}).",
             button_label="💧 Внести показания воды",

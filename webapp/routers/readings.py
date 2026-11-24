@@ -100,7 +100,11 @@ async def api_submit_water(
 ):
     meters = {
         k: v
-        for k, v in (("cold_water", body.cold_water), ("hot_water", body.hot_water))
+        for k, v in (
+            ("cold_water", body.cold_water),
+            ("hot_water", body.hot_water),
+            ("irrigation", body.irrigation),
+        )
         if v is not None
     }
     if not meters:
@@ -117,7 +121,7 @@ async def api_submit_electricity(
 ):
     meters = {
         k: v
-        for k, v in (("t1", body.t1), ("t2", body.t2), ("t3", body.t3))
+        for k, v in (("t", body.t), ("t1", body.t1), ("t2", body.t2), ("t3", body.t3))
         if v is not None
     }
     if not meters:

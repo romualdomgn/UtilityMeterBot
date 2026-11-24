@@ -25,15 +25,20 @@ const PROPERTY_TYPES = [
 ];
 
 const METER_META = [
-  { id: "cold_water", group: "water", label: "💧 ХВС", plain: "ХВС", unit: "м³", tariffLabel: "💧 ХВС (₽/м³)" },
-  { id: "hot_water", group: "water", label: "♨️ ГВС", plain: "ГВС", unit: "м³", tariffLabel: "♨️ ГВС (₽/м³)" },
-  { id: "t1", group: "electricity", label: "⚡ Т1", plain: "Т1", unit: "кВт·ч", tariffLabel: "⚡ Т1 (₽)" },
-  { id: "t2", group: "electricity", label: "⚡ Т2", plain: "Т2", unit: "кВт·ч", tariffLabel: "⚡ Т2 (₽)" },
-  { id: "t3", group: "electricity", label: "⚡ Т3", plain: "Т3", unit: "кВт·ч", tariffLabel: "⚡ Т3 (₽)" },
-  { id: "gas", group: "gas", label: "🔥 Газ", plain: "Газ", unit: "м³", tariffLabel: "🔥 Газ (₽/м³)" },
+  { id: "cold_water", group: "water", label: "💧 ХВС", plain: "ХВС", unit: "м³", tariffLabel: "💧 ХВС (руб/м³)" },
+  { id: "hot_water", group: "water", label: "♨️ ГВС", plain: "ГВС", unit: "м³", tariffLabel: "♨️ ГВС (руб/м³)" },
+  { id: "irrigation", group: "water", houseOnly: true, label: "🌱 Полив", plain: "Полив", unit: "м³", tariffLabel: "🌱 Полив (руб/м³)" },
+  { id: "t", group: "electricity", label: "⚡ Т", plain: "Т", unit: "кВт·ч", tariffLabel: "⚡ Т (руб/кВт·ч)" },
+  { id: "t1", group: "electricity", label: "⚡ Т1", plain: "Т1", unit: "кВт·ч", tariffLabel: "⚡ Т1 (руб/кВт·ч)" },
+  { id: "t2", group: "electricity", label: "⚡ Т2", plain: "Т2", unit: "кВт·ч", tariffLabel: "⚡ Т2 (руб/кВт·ч)" },
+  { id: "t3", group: "electricity", label: "⚡ Т3", plain: "Т3", unit: "кВт·ч", tariffLabel: "⚡ Т3 (руб/кВт·ч)" },
+  { id: "gas", group: "gas", label: "🔥 Газ", plain: "Газ", unit: "м³", tariffLabel: "🔥 Газ (руб/м³)" },
 ];
 
-const DEFAULT_NEW_METERS = ["cold_water", "hot_water", "t1"];
+const WATER_GAS_METERS = METER_META.filter(m => m.group === "water" || m.group === "gas");
+const ELECTRICITY_METER_META = METER_META.filter(m => m.group === "electricity");
+const MULTI_ELEC_IDS = ["t1", "t2", "t3"];
+const DEFAULT_NEW_METERS = ["cold_water", "hot_water", "t"];
 
 function esc(v) {
   return String(v ?? "").replace(/[&<>"']/g, s => ({
@@ -41,10 +46,182 @@ function esc(v) {
   }[s]));
 }
 
+function fmtNum(val) {
+  if (val === null || val === undefined || val === "") return "—";
+  const num = Number(val);
+  if (!Number.isFinite(num)) return String(val);
+  const parts = String(num).split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, "\u00A0");
+  return parts.join(".");
+}
+
+function formatIntSpaces(raw) {
+  if (raw === null || raw === undefined) return "";
+  let digits = String(raw).replace(/\D/g, "").slice(0, 12);
+  if (!digits) return "";
+  digits = digits.replace(/^0+(?=\d)/, "");
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, "\u00A0");
+}
+
+function parseIntSpaces(raw) {
+  const cleaned = String(raw ?? "").replace(/[\s\u00A0\u202F]+/g, "");
+  if (cleaned === "") return { empty: true, ok: true, digits: "", value: null };
+  if (!/^\d+$/.test(cleaned)) return { empty: false, ok: false, digits: "", value: null };
+  const norm = cleaned.replace(/^0+(?=\d)/, "");
+  return { empty: false, ok: true, digits: norm, value: parseInt(norm, 10) };
+}
+
+function attachIntMask(input) {
+  if (!input || input.dataset.intMaskBound === "1") return;
+  input.dataset.intMaskBound = "1";
+
+  const setCaretByDigitIndex = (formatted, digitIdx) => {
+    let seen = 0;
+    let pos = formatted.length;
+    if (digitIdx <= 0) {
+      pos = 0;
+    } else {
+      for (let i = 0; i < formatted.length; i++) {
+        if (/\d/.test(formatted[i])) {
+          seen++;
+          if (seen === digitIdx) {
+            pos = i + 1;
+            break;
+          }
+        }
+      }
+    }
+    try { input.setSelectionRange(pos, pos); } catch (_) {}
+  };
+
+  if (input.value) {
+    input.value = formatIntSpaces(input.value);
+  }
+
+  input.addEventListener("keydown", (e) => {
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? 0;
+    if (start !== end) return;
+
+    if (e.key === "Backspace" && start > 0 && input.value[start - 1] === "\u00A0") {
+      e.preventDefault();
+      const digitsBefore = input.value.slice(0, start - 1).replace(/\D/g, "").length;
+      const before = input.value.slice(0, Math.max(0, start - 2));
+      const after = input.value.slice(start);
+      const formatted = formatIntSpaces(before + after);
+      input.value = formatted;
+      setCaretByDigitIndex(formatted, Math.max(0, digitsBefore - 1));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (e.key === "Delete" && start < input.value.length && input.value[start] === "\u00A0") {
+      e.preventDefault();
+      const digitsBefore = input.value.slice(0, start).replace(/\D/g, "").length;
+      const before = input.value.slice(0, start);
+      const after = input.value.slice(start + 2);
+      const formatted = formatIntSpaces(before + after);
+      input.value = formatted;
+      setCaretByDigitIndex(formatted, digitsBefore);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  });
+
+  input.addEventListener("input", () => {
+    const raw = input.value;
+    const caret = input.selectionStart ?? raw.length;
+    const digitsBefore = raw.slice(0, caret).replace(/\D/g, "").length;
+    const formatted = formatIntSpaces(raw);
+    if (formatted !== raw) {
+      input.value = formatted;
+      setCaretByDigitIndex(formatted, digitsBefore);
+    }
+  });
+}
+
+function hasContract(apt) {
+  if (!apt) return false;
+  return Boolean(
+    String(apt.agreement_no || "").trim() ||
+    apt.agreement_date_start ||
+    apt.agreement_date_finish
+  );
+}
+
+function isPropertyRented(apt) {
+  if (!apt) return false;
+  return Boolean(apt.is_rented || apt.has_tenant || hasContract(apt));
+}
+
 function fmtDate(iso) {
   if (!iso) return "—";
   const [y, m, d] = iso.split("-");
   return d ? `${d}.${m}.${y}` : iso;
+}
+
+function isoToDisplayDate(iso) {
+  if (!iso) return "";
+  const m = String(iso).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+}
+
+function formatDateMask(raw) {
+  const trimmed = String(raw || "").trim();
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`;
+  }
+  const digits = trimmed.replace(/\D/g, "").slice(0, 8);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}/${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4, 8)}`;
+}
+
+function parseDisplayDate(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return { ok: true, iso: null, display: null };
+  const m = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) {
+    return { ok: false, error: "Укажите дату в формате ДД/ММ/ГГГГ (например, 25/11/2026)" };
+  }
+  const day = Number(m[1]);
+  const month = Number(m[2]);
+  const year = Number(m[3]);
+  if (year < 1900 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) {
+    return { ok: false, error: `Некорректная дата: ${trimmed}` };
+  }
+  const dt = new Date(year, month - 1, day);
+  if (dt.getFullYear() !== year || dt.getMonth() !== month - 1 || dt.getDate() !== day) {
+    return { ok: false, error: `Такой даты не существует: ${trimmed}` };
+  }
+  return {
+    ok: true,
+    iso: `${m[3]}-${m[2]}-${m[1]}`,
+    display: `${m[1]}/${m[2]}/${m[3]}`,
+  };
+}
+
+function attachDateField(textId, nativeId) {
+  const textEl = document.getElementById(textId);
+  const nativeEl = document.getElementById(nativeId);
+  if (!textEl) return;
+
+  textEl.addEventListener("input", () => {
+    const formatted = formatDateMask(textEl.value);
+    textEl.value = formatted;
+    if (!nativeEl) return;
+    const parsed = parseDisplayDate(formatted);
+    if (parsed.ok) {
+      nativeEl.value = parsed.iso || "";
+    }
+  });
+
+  if (nativeEl) {
+    nativeEl.addEventListener("click", () => {
+      try { nativeEl.showPicker?.(); } catch (_) {}
+    });
+    nativeEl.addEventListener("change", () => {
+      textEl.value = isoToDisplayDate(nativeEl.value);
+      textEl.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
 }
 
 function haptic(kind = "light") {
@@ -111,8 +288,8 @@ function getEnabledMeters(apt) {
 function getEnabledGroups(apt) {
   const enabled = new Set(getEnabledMeters(apt));
   const groups = [];
-  if (enabled.has("cold_water") || enabled.has("hot_water")) groups.push("water");
-  if (enabled.has("t1") || enabled.has("t2") || enabled.has("t3")) groups.push("electricity");
+  if (enabled.has("cold_water") || enabled.has("hot_water") || enabled.has("irrigation")) groups.push("water");
+  if (enabled.has("t") || enabled.has("t1") || enabled.has("t2") || enabled.has("t3")) groups.push("electricity");
   if (enabled.has("gas")) groups.push("gas");
   return groups;
 }
@@ -201,6 +378,7 @@ function openModal(title, bodyHtml, buttons) {
   const bodyEl = document.getElementById("modal-body");
   bodyEl.innerHTML = bodyHtml;
   bodyEl.querySelectorAll(".phone-mask").forEach(attachPhoneMask);
+  bodyEl.querySelectorAll(".int-mask").forEach(attachIntMask);
   wireTelegramLinks(bodyEl);
 
   const actions = document.getElementById("modal-actions");
@@ -209,7 +387,10 @@ function openModal(title, bodyHtml, buttons) {
     const btn = document.createElement("button");
     btn.className = `btn ${b.cls || ""}`;
     btn.textContent = b.label;
+    if (b.id) btn.id = b.id;
+    if (b.disabled) btn.disabled = true;
     btn.onclick = async () => {
+      if (btn.disabled) return;
       if (!b.onClick) { closeModal(); return; }
       const result = await b.onClick();
       if (result !== false) closeModal();
@@ -259,6 +440,7 @@ function updateUserBadge() {
 
 function openEditOwnNameModal() {
   if (!state.user) return;
+  const initialName = String(state.user.name || "").trim();
   openModal("✏️ Изменить моё имя", `
     <div class="field">
       <label>Ваше отображаемое имя</label>
@@ -267,7 +449,9 @@ function openEditOwnNameModal() {
   `, [
     { label: "Отмена", cls: "btn-secondary" },
     {
+      id: "modal-save-own-name",
       label: "Сохранить",
+      disabled: true,
       onClick: async () => {
         const name = document.getElementById("own-name-input").value.trim();
         if (!name) { showToast("Имя не может быть пустым", "error"); return false; }
@@ -285,6 +469,13 @@ function openEditOwnNameModal() {
       },
     },
   ]);
+
+  const inputEl = document.getElementById("own-name-input");
+  const saveBtn = document.getElementById("modal-save-own-name");
+  inputEl?.addEventListener("input", () => {
+    const val = inputEl.value.trim();
+    if (saveBtn) saveBtn.disabled = !val || val === initialName;
+  });
 }
 
 document.getElementById("edit-profile-btn")?.addEventListener("click", openEditOwnNameModal);
@@ -336,6 +527,13 @@ async function loadApartmentDetail(aptId) {
   const detail = await api(`/api/apartments/${aptId}`);
   if (seq !== state.aptReqSeq || aptId !== state.selectedAptId) return false;
   state.aptDetail = detail;
+  if (detail?.apartment) {
+    const idx = state.apartments.findIndex(a => a.id === detail.apartment.id);
+    if (idx !== -1) {
+      state.apartments[idx] = detail.apartment;
+      renderAptSelector();
+    }
+  }
   return true;
 }
 
@@ -343,8 +541,9 @@ function renderAptSelector() {
   const sel = document.getElementById("apt-selector");
   if (state.apartments.length <= 1) { sel.classList.add("hidden"); return; }
   sel.classList.remove("hidden");
+  const isTenant = state.user?.role === "tenant";
   sel.innerHTML = state.apartments
-    .map(a => `<option value="${a.id}" ${a.id === state.selectedAptId ? "selected" : ""}>${esc(propIcon(a))} ${esc(propShort(a))}</option>`)
+    .map(a => `<option value="${a.id}" ${a.id === state.selectedAptId ? "selected" : ""}>${esc(propIcon(a))} ${esc(propShort(a))}${!isTenant && isPropertyRented(a) ? " 👤" : ""}</option>`)
     .join("");
   sel.onchange = async () => {
     haptic("light");
@@ -361,7 +560,7 @@ function getNavItems() {
   const r = state.user.role;
   if (r === "tenant") {
     return [
-      { id: "dashboard", ico: "📊", label: "Табло" },
+      { id: "dashboard", ico: "📊", label: "Обзор" },
       { id: "submit", ico: "💧", label: "Подать" },
       { id: "history", ico: "📜", label: "История" },
       { id: "photo", ico: "📷", label: "Фото" },
@@ -426,33 +625,98 @@ async function renderTab() {
 }
 
 // ── Dashboard (Обзор) ─────────────────────────────────────────────────
-function renderMeterRow(m) {
+function formatTenantContractLine(apt) {
+  const rawNo = String(apt.agreement_no || "").trim().replace(/^№\s*/i, "");
+  const numPart = rawNo ? `№${esc(rawNo)}` : "б/н";
+  if (!rawNo && !apt.agreement_date_start && !apt.agreement_date_finish) {
+    return "📄 Договор: не указан";
+  }
+  return `📄 Договор ${numPart} от ${fmtDate(apt.agreement_date_start)} до ${fmtDate(apt.agreement_date_finish)}`;
+}
+
+function renderMeterRow(m, isTenant = false, irrigationMode = "parallel") {
+  const displayLabel = m.meter_type === "t" ? "⚡ Электричество" : m.label;
+  const isIrrAfterCold = m.meter_type === "irrigation" && irrigationMode === "after_cold";
   let subline;
   let rightCol;
-  if (!m.submitted) {
-    const prevTxt = m.has_base ? `пред.: ${m.previous} ${esc(m.unit)}` : "начальное не задано";
-    subline = `Ещё не подано (${prevTxt})`;
-    rightCol = `<span class="small muted">0 ₽</span>`;
-  } else if (!m.has_base) {
-    subline = `Подано: ${m.current} ${esc(m.unit)} · <b>не задано начальное показание</b>`;
-    rightCol = `<span class="small muted">—</span>`;
-  } else if (!m.has_tariff) {
-    subline = `${m.previous} → ${m.current} ${esc(m.unit)} (расход ${m.consumption}) · <b>не задан тариф</b>`;
-    rightCol = `<span class="small muted">—</span>`;
+  if (isTenant) {
+    if (!m.submitted) {
+      const prevTxt = m.has_base ? `пред.: ${fmtNum(m.previous)} ${esc(m.unit)}` : "начальное не задано";
+      subline = `Ещё не подано (${prevTxt})`;
+      rightCol = `<span class="small muted">0 ${esc(m.unit)}</span>`;
+    } else if (!m.has_base) {
+      subline = `Подано: ${fmtNum(m.current)} ${esc(m.unit)} · <b>не задано начальное показание</b>`;
+      rightCol = `<span class="small muted">${fmtNum(m.current)} ${esc(m.unit)}</span>`;
+    } else {
+      subline = `${fmtNum(m.previous)} → ${fmtNum(m.current)} ${esc(m.unit)}`;
+      rightCol = `<div class="bold">${fmtNum(m.consumption)} ${esc(m.unit)}</div>`;
+    }
+  } else if (isIrrAfterCold) {
+    if (!m.submitted) {
+      const prevTxt = m.has_base ? `пред.: ${fmtNum(m.previous)} ${esc(m.unit)}` : "начальное не задано";
+      subline = `Ещё не подано (${prevTxt}) · после ХВС`;
+      rightCol = `<span class="small muted">в ХВС</span>`;
+    } else if (!m.has_base) {
+      subline = `Подано: ${fmtNum(m.current)} ${esc(m.unit)} · <b>не задано начальное показание</b>`;
+      rightCol = `<span class="small muted">—</span>`;
+    } else {
+      subline = `${fmtNum(m.previous)} → ${fmtNum(m.current)} ${esc(m.unit)} (расход ${fmtNum(m.consumption)} ${esc(m.unit)}, по тарифу ХВС · вычет из водоотведения)`;
+      rightCol = `<span class="small muted">в ХВС</span>`;
+    }
   } else {
-    subline = `${m.previous} → ${m.current} ${esc(m.unit)} (расход ${m.consumption}, тариф ${m.tariff} ₽)`;
-    rightCol = `<div class="bold">${m.cost} ₽</div>`;
+    if (!m.submitted) {
+      const prevTxt = m.has_base ? `пред.: ${fmtNum(m.previous)} ${esc(m.unit)}` : "начальное не задано";
+      subline = `Ещё не подано (${prevTxt})`;
+      rightCol = `<span class="small muted">0 ₽</span>`;
+    } else if (!m.has_base) {
+      subline = `Подано: ${fmtNum(m.current)} ${esc(m.unit)} · <b>не задано начальное показание</b>`;
+      rightCol = `<span class="small muted">—</span>`;
+    } else if (!m.has_tariff) {
+      subline = `${fmtNum(m.previous)} → ${fmtNum(m.current)} ${esc(m.unit)} (расход ${fmtNum(m.consumption)} ${esc(m.unit)}) · <b>не задан тариф</b>`;
+      rightCol = `<span class="small muted">—</span>`;
+    } else {
+      subline = `${fmtNum(m.previous)} → ${fmtNum(m.current)} ${esc(m.unit)} (расход ${fmtNum(m.consumption)} ${esc(m.unit)}, тариф ${fmtNum(m.tariff)} ₽)`;
+      rightCol = `<div class="bold">${fmtNum(m.cost)} ₽</div>`;
+    }
   }
   return `
     <div class="table-row">
-      <div><div class="bold">${esc(m.label)}</div><div class="small muted">${subline}</div></div>
+      <div><div class="bold">${esc(displayLabel)}</div><div class="small muted">${subline}</div></div>
+      ${rightCol}
+    </div>`;
+}
+
+function renderSewerageRow(sew, billing = null) {
+  if (!sew) return "";
+  const hasGvs = Boolean(billing?.meters?.hot_water);
+  const isAfterCold = billing?.irrigation_mode === "after_cold" && Boolean(billing?.meters?.irrigation);
+  const formula = isAfterCold
+    ? (hasGvs ? "ХВС + ГВС − Полив" : "ХВС − Полив")
+    : (hasGvs ? "ХВС + ГВС" : "ХВС");
+
+  let subline;
+  let rightCol;
+  if (!sew.submitted) {
+    subline = `${formula} · ещё не подано (тариф ${fmtNum(sew.tariff)} ₽)`;
+    rightCol = `<span class="small muted">0 ₽</span>`;
+  } else if (!sew.has_base) {
+    subline = `${formula} · <b>не задано начальное показание</b>`;
+    rightCol = `<span class="small muted">—</span>`;
+  } else {
+    subline = `${formula}: ${fmtNum(sew.consumption)} м³ (тариф ${fmtNum(sew.tariff)} ₽)`;
+    rightCol = `<div class="bold">${fmtNum(sew.cost)} ₽</div>`;
+  }
+  return `
+    <div class="table-row">
+      <div><div class="bold">${esc(sew.label || "🚰 Водоотведение")}</div><div class="small muted">${subline}</div></div>
       ${rightCol}
     </div>`;
 }
 
 function renderDashboard(root) {
+  const isTenant = state.user.role === "tenant";
   if (!state.aptDetail) {
-    const canCreate = state.user.role !== "tenant";
+    const canCreate = !isTenant;
     root.innerHTML = `
       <div class="card center">
         <h3>Объекты недвижимости не найдены</h3>
@@ -464,39 +728,108 @@ function renderDashboard(root) {
   }
 
   const { apartment: apt, billing, tenants } = state.aptDetail;
+  const enabled = new Set(getEnabledMeters(apt));
   const groups = getEnabledGroups(apt);
-  const rows = Object.values(billing.meters).map(renderMeterRow).join("");
+  const hasDomesticWater = enabled.has("cold_water") || enabled.has("hot_water");
+  const hasIrrigation = enabled.has("irrigation");
+
+  const irrMode = billing.irrigation_mode || apt.irrigation_mode || "parallel";
+  const meterRows = [];
+  let sewerageInserted = false;
+  const meterList = Object.values(billing.meters);
+  meterList.forEach((m, idx) => {
+    meterRows.push(renderMeterRow(m, isTenant, irrMode));
+    const isDomWater = m.meter_type === "cold_water" || m.meter_type === "hot_water";
+    const nextIsDomWater = meterList[idx + 1] && (meterList[idx + 1].meter_type === "cold_water" || meterList[idx + 1].meter_type === "hot_water");
+    if (!isTenant && billing.sewerage && isDomWater && !nextIsDomWater && !sewerageInserted) {
+      meterRows.push(renderSewerageRow(billing.sewerage, billing));
+      sewerageInserted = true;
+    }
+  });
+  if (!isTenant && billing.sewerage && !sewerageInserted) {
+    meterRows.push(renderSewerageRow(billing.sewerage, billing));
+  }
+  const rows = meterRows.join("");
 
   const statBoxes = [];
-  if (groups.includes("water")) {
-    statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${billing.water_total} ₽</div></div>`);
+  if (isTenant) {
+    if (hasDomesticWater) {
+      statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${fmtNum(billing.water_consumption_total)} м³</div></div>`);
+    }
+    if (hasIrrigation) {
+      statBoxes.push(`<div class="stat-box"><div class="label">🌱 Полив</div><div class="val">${fmtNum(billing.irrigation_consumption_total || 0)} м³</div></div>`);
+    }
+    if (groups.includes("electricity")) {
+      statBoxes.push(`<div class="stat-box"><div class="label">⚡ Электричество</div><div class="val">${fmtNum(billing.electricity_consumption_total)} кВт·ч</div></div>`);
+    }
+    if (groups.includes("gas")) {
+      statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${fmtNum(billing.gas_consumption_total)} м³</div></div>`);
+    }
+    if (statBoxes.length > 2 && statBoxes.length % 2 === 1) {
+      statBoxes[statBoxes.length - 1] = statBoxes[statBoxes.length - 1].replace('class="stat-box"', 'class="stat-box stat-box-wide"');
+    }
+  } else {
+    if (hasDomesticWater) {
+      statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${fmtNum(billing.water_total)} ₽</div></div>`);
+    }
+    if (billing.sewerage) {
+      statBoxes.push(`<div class="stat-box"><div class="label">🚰 Водоотведение</div><div class="val">${fmtNum(billing.sewerage_total)} ₽</div></div>`);
+    }
+    if (hasIrrigation && irrMode !== "after_cold") {
+      statBoxes.push(`<div class="stat-box"><div class="label">🌱 Полив</div><div class="val">${fmtNum(billing.irrigation_total || 0)} ₽</div></div>`);
+    }
+    if (groups.includes("electricity")) {
+      statBoxes.push(`<div class="stat-box"><div class="label">⚡ Электричество</div><div class="val">${fmtNum(billing.electricity_total)} ₽</div></div>`);
+    }
+    if (groups.includes("gas")) {
+      statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${fmtNum(billing.gas_total)} ₽</div></div>`);
+    }
+    const isTotalWide = statBoxes.length >= 2 && statBoxes.length % 2 === 0;
+    statBoxes.push(`<div class="stat-box ${isTotalWide ? "stat-box-wide" : ""}"><div class="label">💰 Итого</div><div class="val">${fmtNum(billing.grand_total)} ₽</div></div>`);
   }
-  if (groups.includes("electricity")) {
-    statBoxes.push(`<div class="stat-box"><div class="label">⚡ Свет</div><div class="val">${billing.electricity_total} ₽</div></div>`);
-  }
-  if (groups.includes("gas")) {
-    statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${billing.gas_total} ₽</div></div>`);
-  }
-  statBoxes.push(`<div class="stat-box"><div class="label">💰 Итого</div><div class="val">${billing.grand_total} ₽</div></div>`);
-  const statGridClass = statBoxes.length === 3 ? "grid-3" : "grid-2";
+  const statGridClass = statBoxes.length >= 2 ? "grid-2" : "";
 
   const quickButtons = [];
   if (groups.includes("water")) quickButtons.push(`<button class="btn" id="quick-water">💧 Подать воду</button>`);
-  if (groups.includes("electricity")) quickButtons.push(`<button class="btn" id="quick-elec">⚡ Подать свет</button>`);
+  if (groups.includes("electricity")) quickButtons.push(`<button class="btn" id="quick-elec">⚡ Подать электричество</button>`);
   if (groups.includes("gas")) quickButtons.push(`<button class="btn" id="quick-gas">🔥 Подать газ</button>`);
   const quickGridClass = quickButtons.length === 3 ? "grid-3" : quickButtons.length === 2 ? "grid-2" : "";
 
+  const rented = isPropertyRented(apt);
+  const statusPillHtml = !isTenant && rented
+    ? `<span class="pill ok">👤 Сдан</span>`
+    : "";
+
+  const contractExists = hasContract(apt);
+  const contractLineHtml = contractExists
+    ? (isTenant
+        ? formatTenantContractLine(apt)
+        : `📄 Договор: ${esc(apt.agreement_no || "—")} · ${fmtDate(apt.agreement_date_start)} — ${fmtDate(apt.agreement_date_finish)}`)
+    : "";
+
+  const showDashChips = state.apartments.length > 0 && (!isTenant || state.apartments.length > 1);
+  const dashChipsHtml = showDashChips
+    ? `
+      <div class="card">
+        <div id="dash-apt-chips-list" class="apt-chips-list">
+          ${state.apartments.map(a => `
+            <button type="button" class="btn btn-sm apt-chip ${a.id === state.selectedAptId ? "" : "btn-secondary"}" data-apt="${a.id}">
+              ${esc(propIcon(a))} ${esc(propShort(a))}${!isTenant && isPropertyRented(a) ? " 👤" : ""}
+            </button>`).join("")}
+        </div>
+      </div>`
+    : "";
+
   root.innerHTML = `
+    ${dashChipsHtml}
     <div class="card">
       <div class="row-between">
         <h2>${esc(propIcon(apt))} ${esc(propTitle(apt))}</h2>
-        <span class="pill ${apt.has_tenant ? "ok" : ""}">${apt.has_tenant ? "👤 Сдан" : "Свободен"}</span>
+        ${statusPillHtml}
       </div>
-      <div class="small muted">📄 Договор: ${esc(apt.agreement_no || "—")} · ${fmtDate(apt.agreement_date_start)} — ${fmtDate(apt.agreement_date_finish)}</div>
-      ${tenants.length ? `<div class="small muted mt-8">Наниматели: ${tenants.map(t => esc(t.name || t.telegram_id)).join(", ")}</div>` : ""}
-      <div class="${statGridClass} mt-12">
-        ${statBoxes.join("")}
-      </div>
+      ${contractLineHtml ? `<div class="small muted">${contractLineHtml}</div>` : ""}
+      ${!isTenant && tenants.length ? `<div class="small muted mt-8">Наниматели: ${tenants.map(t => esc(t.name || t.telegram_id)).join(", ")}</div>` : ""}
+      ${statBoxes.length ? `<div class="${statGridClass} mt-12">${statBoxes.join("")}</div>` : ""}
     </div>
     <div class="card">
       <h3>📊 Расход за ${esc(billing.period_label)}</h3>
@@ -504,6 +837,25 @@ function renderDashboard(root) {
     </div>
     ${quickButtons.length ? `<div class="${quickGridClass}">${quickButtons.join("")}</div>` : ""}
   `;
+
+  const dashChipsContainer = document.getElementById("dash-apt-chips-list");
+  if (!isTenant && state.apartments.length > 1 && dashChipsContainer) {
+    initPropertyDragAndDrop(dashChipsContainer, root);
+  }
+  dashChipsContainer?.querySelectorAll("[data-apt]").forEach(btn => {
+    btn.onclick = async () => {
+      if (dashChipsContainer.dataset.justDragged === "1") return;
+      const nextId = Number(btn.dataset.apt);
+      if (nextId === state.selectedAptId) return;
+      haptic("light");
+      state.selectedAptId = nextId;
+      state.historyMonth = "";
+      renderAptSelector();
+      showLoading(root, "Загружаю объект...");
+      const ok = await loadApartmentDetail(state.selectedAptId);
+      if (ok) renderDashboard(root);
+    };
+  });
 
   document.getElementById("quick-water")?.addEventListener("click", () => { state.activeTab = "submit"; state.submitSubtab = "water"; renderTab(); });
   document.getElementById("quick-elec")?.addEventListener("click", () => { state.activeTab = "submit"; state.submitSubtab = "electricity"; renderTab(); });
@@ -547,8 +899,10 @@ function bindExportButtons(apt) {
 
 // ── Submit Readings (Подать) ──────────────────────────────────────────
 function fmtPrevLabel(val, unit, tariff) {
-  const p = val === null || val === undefined ? "не задано" : `<b>${val}</b> ${unit}`;
-  const t = tariff === null || tariff === undefined ? "тариф не задан" : `тариф: ${tariff} ₽`;
+  const p = val === null || val === undefined ? "не задано" : `<b>${fmtNum(val)}</b> ${unit}`;
+  const isTenant = state.user?.role === "tenant";
+  if (isTenant) return `предыдущее: ${p}`;
+  const t = tariff === null || tariff === undefined ? "тариф не задан" : `тариф: ${fmtNum(tariff)} ₽`;
   return `предыдущее: ${p}, ${t}`;
 }
 
@@ -579,12 +933,22 @@ function renderSubmit(root) {
     ? `<div class="subtabs">${groups.map(g => `<button class="subtab ${state.submitSubtab === g ? "active" : ""}" data-sub="${g}">${groupDefs[g].label}</button>`).join("")}</div>`
     : "";
 
-  const fieldsHtml = activeGroup.meters.map(m => `
-    <div class="field">
-      <label>${esc(m.label)} (${fmtPrevLabel(prev[m.id], m.unit, tariffs[m.id])})</label>
-      <input type="number" inputmode="numeric" min="0" step="1" id="in-${m.id}" placeholder="${prev[m.id] ?? ""}" />
-    </div>
-  `).join("");
+  const isIrrAfterCold = apt.irrigation_mode === "after_cold";
+  const fieldsHtml = activeGroup.meters.map(m => {
+    let prevInfo;
+    if (m.id === "irrigation" && isIrrAfterCold && state.user?.role !== "tenant") {
+      const pTxt = prev[m.id] === null || prev[m.id] === undefined ? "не задано" : `<b>${fmtNum(prev[m.id])}</b> ${m.unit}`;
+      prevInfo = `предыдущее: ${pTxt}, по тарифу ХВС (вычет из водоотведения)`;
+    } else {
+      prevInfo = fmtPrevLabel(prev[m.id], m.unit, tariffs[m.id]);
+    }
+    return `
+      <div class="field">
+        <label>${esc(m.label)} (${prevInfo})</label>
+        <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="in-${m.id}" placeholder="${prev[m.id] !== null && prev[m.id] !== undefined ? esc(formatIntSpaces(prev[m.id])) : ""}" />
+      </div>
+    `;
+  }).join("");
 
   root.innerHTML = `
     <div class="card">
@@ -592,7 +956,7 @@ function renderSubmit(root) {
       ${subtabsHtml}
       ${fieldsHtml}
       <div id="calc-preview" class="preview-box muted">Введите целые значения для предрасчёта стоимости.</div>
-      <button class="btn" id="btn-submit-group">${activeGroup.btn}</button>
+      <button class="btn" id="btn-submit-group" disabled>${activeGroup.btn}</button>
     </div>
     ${state.user.role === "tenant" ? "" : `<div class="card"><button class="btn btn-secondary" id="open-photo-btn">📷 Отправить фото счётчиков</button></div>`}
   `;
@@ -602,38 +966,56 @@ function renderSubmit(root) {
   });
   document.getElementById("open-photo-btn")?.addEventListener("click", () => { state.activeTab = "photo"; renderTab(); });
 
+  const submitBtn = document.getElementById("btn-submit-group");
   const updatePreview = () => {
     const box = document.getElementById("calc-preview");
     const entered = [];
     for (const m of activeGroup.meters) {
-      const raw = document.getElementById(`in-${m.id}`).value.trim();
-      if (raw === "") continue;
-      if (!/^\d+$/.test(raw)) {
+      const parsed = parseIntSpaces(document.getElementById(`in-${m.id}`).value);
+      if (parsed.empty) continue;
+      if (!parsed.ok) {
         box.textContent = "Допускаются только целые неотрицательные числа.";
+        if (submitBtn) submitBtn.disabled = true;
         return;
       }
-      entered.push({ m, val: parseInt(raw, 10) });
+      entered.push({ m, val: parsed.value });
     }
     if (!entered.length) {
       box.textContent = "Введите целые значения для предрасчёта стоимости.";
+      if (submitBtn) submitBtn.disabled = true;
       return;
     }
+    if (submitBtn) submitBtn.disabled = false;
 
     const parts = [];
     let totalCost = 0;
+    let waterDiffSum = 0;
+    let irrDiff = 0;
     let missingBase = false;
     let missingTariff = false;
 
+    let hasDomWaterDiff = false;
     for (const { m, val } of entered) {
       const pv = prev[m.id];
       const tf = tariffs[m.id];
       if (pv === null || pv === undefined) {
         missingBase = true;
-        parts.push(`${m.plain}: <b>${val} ${m.unit}</b> (нет начального)`);
+        parts.push(`${m.plain}: <b>${fmtNum(val)} ${m.unit}</b> (нет начального)`);
         continue;
       }
       const diff = Math.max(0, val - pv);
-      parts.push(`${m.plain}: <b>${diff} ${m.unit}</b>`);
+      parts.push(`${m.plain}: <b>${fmtNum(diff)} ${m.unit}</b>`);
+      if (m.id === "cold_water" || m.id === "hot_water") {
+        waterDiffSum += diff;
+        hasDomWaterDiff = true;
+      }
+      if (m.id === "irrigation") {
+        irrDiff = diff;
+        if (isIrrAfterCold) {
+          // Полив после ХВС: вода уже оплачивается по счётчику ХВС, отдельного тарифа нет
+          continue;
+        }
+      }
       if (tf === null || tf === undefined) {
         missingTariff = true;
       } else {
@@ -641,16 +1023,34 @@ function renderSubmit(root) {
       }
     }
 
-    const costLine = missingBase
-      ? "⚠️ Для части счётчиков не задано начальное показание"
-      : missingTariff
-        ? "⚠️ Для части счётчиков не задан тариф"
-        : `Ориентировочно: <b>${totalCost} ₽</b>`;
-    box.innerHTML = `Расход — ${parts.join(" · ")}<br>${costLine}`;
+    const sewRate = tariffs.sewerage;
+    let sewCost = 0;
+    if (state.submitSubtab === "water" && hasDomWaterDiff && sewRate !== null && sewRate !== undefined && sewRate > 0 && !missingBase) {
+      const sewVol = isIrrAfterCold ? Math.max(0, waterDiffSum - irrDiff) : waterDiffSum;
+      sewCost = Math.round(sewVol * sewRate);
+      totalCost += sewCost;
+      parts.push(`Водоотведение: <b>${fmtNum(sewVol)} м³</b>`);
+    }
+
+    const isTenant = state.user.role === "tenant";
+    if (isTenant) {
+      box.innerHTML = `Расход — ${parts.join(" · ")}`;
+    } else {
+      const costLine = missingBase
+        ? "⚠️ Для части счётчиков не задано начальное показание"
+        : missingTariff
+          ? "⚠️ Для части счётчиков не задан тариф"
+          : sewCost > 0
+            ? `Ориентировочно: <b>${fmtNum(totalCost)} ₽</b> (вкл. водоотведение ${fmtNum(sewCost)} ₽)`
+            : `Ориентировочно: <b>${fmtNum(totalCost)} ₽</b>`;
+      box.innerHTML = `Расход — ${parts.join(" · ")}<br>${costLine}`;
+    }
   };
 
   activeGroup.meters.forEach(m => {
-    document.getElementById(`in-${m.id}`).oninput = updatePreview;
+    const el = document.getElementById(`in-${m.id}`);
+    attachIntMask(el);
+    el?.addEventListener("input", updatePreview);
   });
 
   document.getElementById("btn-submit-group").onclick = () => submitMeterGroup(apt.id, state.submitSubtab, activeGroup.meters, false);
@@ -660,12 +1060,12 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force) {
   const payload = { force };
   let count = 0;
   for (const m of groupMeters) {
-    const raw = document.getElementById(`in-${m.id}`).value.trim();
-    if (raw === "") continue;
-    if (!/^\d+$/.test(raw)) {
+    const parsed = parseIntSpaces(document.getElementById(`in-${m.id}`).value);
+    if (parsed.empty) continue;
+    if (!parsed.ok) {
       return showToast(`Некорректное значение для ${m.plain}: введите целое число`, "error");
     }
-    payload[m.id] = parseInt(raw, 10);
+    payload[m.id] = parsed.value;
     count++;
   }
   if (!count) return showToast("Введите хотя бы одно показание счётчика", "error");
@@ -681,11 +1081,24 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force) {
         { label: "Сохранить", cls: "btn-danger", onClick: () => { submitMeterGroup(aptId, groupName, groupMeters, true); } },
       ]);
     }
-    const costMap = {
-      water: `Вода сохранена (${res.billing.water_total} ₽)`,
-      electricity: `Электричество сохранено (${res.billing.electricity_total} ₽)`,
-      gas: `Газ сохранён (${res.billing.gas_total} ₽)`,
-    };
+    const isTenant = state.user.role === "tenant";
+    const sewAdd = res.billing.sewerage_total || 0;
+    const irrAdd = res.billing.irrigation_total || 0;
+    const waterSum = (res.billing.water_total || 0) + sewAdd + irrAdd;
+    const waterVolSum = (res.billing.water_consumption_total || 0) + (res.billing.irrigation_consumption_total || 0);
+    const costMap = isTenant
+      ? {
+          water: `Вода сохранена (${fmtNum(waterVolSum)} м³)`,
+          electricity: `Электричество сохранено (${fmtNum(res.billing.electricity_consumption_total)} кВт·ч)`,
+          gas: `Газ сохранён (${fmtNum(res.billing.gas_consumption_total)} м³)`,
+        }
+      : {
+          water: sewAdd > 0
+            ? `Вода сохранена (${fmtNum(waterSum)} ₽, вкл. водоотведение ${fmtNum(sewAdd)} ₽)`
+            : `Вода сохранена (${fmtNum(waterSum)} ₽)`,
+          electricity: `Электричество сохранено (${fmtNum(res.billing.electricity_total)} ₽)`,
+          gas: `Газ сохранён (${fmtNum(res.billing.gas_total)} ₽)`,
+        };
     showToast(`✅ ${costMap[groupName] || "Показания сохранены"}`);
     await loadApartmentDetail(aptId);
     state.activeTab = "dashboard";
@@ -716,24 +1129,46 @@ async function renderHistory(root) {
     ? data.readings.map(r => `
         <div class="table-row">
           <div>
-            <div class="bold">${esc(r.label)}: ${r.value} ${esc(r.unit)}</div>
+            <div class="bold">${esc(r.meter_type === "t" ? "⚡ Электричество" : r.label)}: ${fmtNum(r.value)} ${esc(r.unit)}</div>
             <div class="small muted">#${r.id} · ${esc(r.reading_date)} · ID ${r.submitted_by}</div>
           </div>
           ${canEdit ? `<button class="btn btn-secondary btn-sm edit-reading-btn" data-id="${r.id}" data-val="${r.value}" data-lbl="${esc(r.label)}">✏️</button>` : ""}
         </div>`).join("")
     : `<p class="muted center">Показаний за выбранный период нет.</p>`;
 
+  const isTenantHist = state.user.role === "tenant";
   const billParts = [];
-  if (data.billing.water_total || Object.keys(data.billing.meters).some(k => k.includes("water"))) {
-    billParts.push(`вода <b>${data.billing.water_total} ₽</b>`);
+  if (isTenantHist) {
+    if (Object.keys(data.billing.meters).some(k => k === "cold_water" || k === "hot_water")) {
+      billParts.push(`вода <b>${fmtNum(data.billing.water_consumption_total)} м³</b>`);
+    }
+    if (Object.keys(data.billing.meters).includes("irrigation")) {
+      billParts.push(`полив <b>${fmtNum(data.billing.irrigation_consumption_total || 0)} м³</b>`);
+    }
+    if (Object.keys(data.billing.meters).some(k => ["t", "t1", "t2", "t3"].includes(k))) {
+      billParts.push(`электричество <b>${fmtNum(data.billing.electricity_consumption_total)} кВт·ч</b>`);
+    }
+    if (Object.keys(data.billing.meters).includes("gas")) {
+      billParts.push(`газ <b>${fmtNum(data.billing.gas_consumption_total)} м³</b>`);
+    }
+  } else {
+    if (data.billing.water_total || Object.keys(data.billing.meters).some(k => k === "cold_water" || k === "hot_water")) {
+      billParts.push(`вода <b>${fmtNum(data.billing.water_total)} ₽</b>`);
+    }
+    if (data.billing.sewerage) {
+      billParts.push(`водоотведение <b>${fmtNum(data.billing.sewerage_total)} ₽</b>`);
+    }
+    if (data.billing.irrigation_mode !== "after_cold" && (data.billing.irrigation_total || Object.keys(data.billing.meters).includes("irrigation"))) {
+      billParts.push(`полив <b>${fmtNum(data.billing.irrigation_total || 0)} ₽</b>`);
+    }
+    if (data.billing.electricity_total || Object.keys(data.billing.meters).some(k => ["t", "t1", "t2", "t3"].includes(k))) {
+      billParts.push(`электричество <b>${fmtNum(data.billing.electricity_total)} ₽</b>`);
+    }
+    if (data.billing.gas_total || Object.keys(data.billing.meters).includes("gas")) {
+      billParts.push(`газ <b>${fmtNum(data.billing.gas_total)} ₽</b>`);
+    }
+    billParts.push(`всего <b>${fmtNum(data.billing.grand_total)} ₽</b>`);
   }
-  if (data.billing.electricity_total || Object.keys(data.billing.meters).some(k => ["t1", "t2", "t3"].includes(k))) {
-    billParts.push(`свет <b>${data.billing.electricity_total} ₽</b>`);
-  }
-  if (data.billing.gas_total || Object.keys(data.billing.meters).includes("gas")) {
-    billParts.push(`газ <b>${data.billing.gas_total} ₽</b>`);
-  }
-  billParts.push(`всего <b>${data.billing.grand_total} ₽</b>`);
 
   root.innerHTML = `
     <div class="card">
@@ -755,19 +1190,21 @@ async function renderHistory(root) {
   root.querySelectorAll(".edit-reading-btn").forEach(btn => {
     btn.onclick = () => {
       const id = Number(btn.dataset.id);
+      const initialDigits = parseIntSpaces(btn.dataset.val).digits;
       openModal(`Корректировка #${id}`, `
         <p class="small muted">${esc(btn.dataset.lbl)}</p>
-        <div class="field"><label>Новое целое значение</label><input type="number" min="0" step="1" id="corr-val" value="${btn.dataset.val}" /></div>
+        <div class="field"><label>Новое целое значение</label><input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="corr-val" value="${esc(formatIntSpaces(btn.dataset.val))}" /></div>
       `, [
         { label: "Отмена", cls: "btn-secondary" },
         {
+          id: "modal-save-corr",
           label: "Сохранить",
+          disabled: true,
           onClick: async () => {
-            const raw = document.getElementById("corr-val").value.trim();
-            if (!/^\d+$/.test(raw)) { showToast("Введите целое число >= 0", "error"); return false; }
-            const val = parseInt(raw, 10);
+            const parsed = parseIntSpaces(document.getElementById("corr-val").value);
+            if (parsed.empty || !parsed.ok) { showToast("Введите целое число >= 0", "error"); return false; }
             try {
-              await api(`/api/readings/${id}`, { method: "PUT", body: { value: val } });
+              await api(`/api/readings/${id}`, { method: "PUT", body: { value: parsed.value } });
               showToast("✅ Показание исправлено");
               await loadApartmentDetail(state.selectedAptId);
               await renderHistory(root);
@@ -775,31 +1212,113 @@ async function renderHistory(root) {
           },
         },
       ]);
+
+      const corrInput = document.getElementById("corr-val");
+      const saveBtn = document.getElementById("modal-save-corr");
+      corrInput?.addEventListener("input", () => {
+        const parsed = parseIntSpaces(corrInput.value);
+        if (saveBtn) saveBtn.disabled = parsed.empty || !parsed.ok || parsed.digits === initialDigits;
+      });
     };
   });
 }
 
 // ── Photo (Фото) ──────────────────────────────────────────────────────
+function getPhotoResourceOptions(apt) {
+  const enabled = new Set(getEnabledMeters(apt));
+  const opts = [];
+  if (enabled.has("cold_water")) opts.push({ id: "cold_water", icon: "💧", label: "ХВС" });
+  if (enabled.has("hot_water")) opts.push({ id: "hot_water", icon: "♨️", label: "ГВС" });
+  if (enabled.has("irrigation")) opts.push({ id: "irrigation", icon: "🌱", label: "Полив" });
+  if (enabled.has("t") || enabled.has("t1") || enabled.has("t2") || enabled.has("t3")) {
+    opts.push({ id: "electricity", icon: "⚡", label: "Электричество" });
+  }
+  if (enabled.has("gas")) opts.push({ id: "gas", icon: "🔥", label: "Газ" });
+  return opts;
+}
+
 function renderPhoto(root) {
   if (!state.aptDetail) { root.innerHTML = `<div class="card center muted">Нет доступных объектов недвижимости.</div>`; return; }
   const apt = state.aptDetail.apartment;
+  const isTenant = state.user.role === "tenant";
+  const resources = getPhotoResourceOptions(apt);
+  const selectedIds = new Set();
+
+  const recipientHint = isTenant
+    ? "Фото будет переслано наймодателю в Telegram и сохранено на сервере на 30 дней."
+    : "Фото будет переслано владельцам объекта в Telegram и сохранено на сервере на 30 дней.";
+  const sendBtnLabel = isTenant ? "📤 Отправить фото наймодателю" : "📤 Отправить владельцам";
+
   root.innerHTML = `
     <div class="card">
       <h2>📷 Фото счётчиков — ${esc(propShort(apt))}</h2>
-      <p class="small muted">Фото будет переслано владельцам объекта в Telegram и сохранено на сервере на 30 дней.</p>
+      <p class="small muted">${recipientHint}</p>
       <div class="field mt-8"><label>Выберите или сделайте фото (до 15 МБ)</label><input type="file" id="photo-file" accept="image/*" /></div>
-      <div class="field"><label>Комментарий (необязательно)</label><input type="text" id="photo-comment" placeholder="Например: счётчики воды за ноябрь" /></div>
-      <button class="btn" id="btn-send-photo">📤 Отправить владельцам</button>
+      ${resources.length ? `
+        <div class="field" id="photo-resources-field">
+          <label>Что на фото? (нажмите, чтобы добавить в описание)</label>
+          <div class="resource-chips" id="photo-resource-chips">
+            ${resources.map(r => `<button type="button" class="resource-chip" data-res-id="${r.id}">${r.icon} ${esc(r.label)}</button>`).join("")}
+          </div>
+        </div>` : ""}
+      <div class="field"><label>Дополнительный комментарий (необязательно)</label><input type="text" id="photo-comment" placeholder="Например: за ноябрь" /></div>
+      <div id="photo-caption-preview" class="photo-caption-preview hidden"></div>
+      <button class="btn" id="btn-send-photo" disabled>${sendBtnLabel}</button>
     </div>
   `;
-  document.getElementById("btn-send-photo").onclick = async () => {
-    const fileInput = document.getElementById("photo-file");
-    if (!fileInput.files.length) return showToast("Выберите фотографию", "error");
+
+  const fileInput = document.getElementById("photo-file");
+  const commentInput = document.getElementById("photo-comment");
+  const previewBox = document.getElementById("photo-caption-preview");
+  const sendBtn = document.getElementById("btn-send-photo");
+
+  const buildPhotoComment = () => {
+    const chosenLabels = resources.filter(r => selectedIds.has(r.id)).map(r => r.label);
+    const extra = (commentInput?.value || "").trim();
+    if (chosenLabels.length && extra) return `${chosenLabels.join(", ")} — ${extra}`;
+    if (chosenLabels.length) return chosenLabels.join(", ");
+    return extra;
+  };
+
+  const updatePhotoUi = () => {
+    const caption = buildPhotoComment();
+    if (previewBox) {
+      if (caption) {
+        previewBox.innerHTML = `💬 Описание под фото: <b>${esc(caption)}</b>`;
+        previewBox.classList.remove("hidden");
+      } else {
+        previewBox.classList.add("hidden");
+      }
+    }
+    if (sendBtn) {
+      sendBtn.disabled = !(fileInput?.files?.length > 0);
+    }
+  };
+
+  fileInput?.addEventListener("change", updatePhotoUi);
+  commentInput?.addEventListener("input", updatePhotoUi);
+
+  root.querySelectorAll(".resource-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      haptic("light");
+      const id = btn.dataset.resId;
+      if (selectedIds.has(id)) {
+        selectedIds.delete(id);
+        btn.classList.remove("active");
+      } else {
+        selectedIds.add(id);
+        btn.classList.add("active");
+      }
+      updatePhotoUi();
+    });
+  });
+
+  sendBtn.onclick = async () => {
+    if (!fileInput?.files?.length) return showToast("Выберите фотографию", "error");
     const fd = new FormData();
     fd.append("file", fileInput.files[0]);
-    fd.append("comment", document.getElementById("photo-comment").value);
-    const btn = document.getElementById("btn-send-photo");
-    btn.disabled = true;
+    fd.append("comment", buildPhotoComment());
+    sendBtn.disabled = true;
     try {
       const res = await api(`/api/apartments/${apt.id}/photo`, { method: "POST", body: fd });
       if (res.recipients_count > 0) {
@@ -808,21 +1327,193 @@ function renderPhoto(root) {
         showToast("⚠️ Фото сохранено, но получателей в Telegram не найдено");
       }
       fileInput.value = "";
-      document.getElementById("photo-comment").value = "";
-    } catch (err) { showToast("❌ " + err.message, "error"); }
-    finally { btn.disabled = false; }
+      if (commentInput) commentInput.value = "";
+      selectedIds.clear();
+      root.querySelectorAll(".resource-chip.active").forEach(b => b.classList.remove("active"));
+      updatePhotoUi();
+    } catch (err) {
+      showToast("❌ " + err.message, "error");
+      updatePhotoUi();
+    }
   };
 }
 
 // ── Properties (Недвижимость) ─────────────────────────────────────────
+function detectElectricityMode(enabledMeters) {
+  return enabledMeters.some(m => MULTI_ELEC_IDS.includes(m)) ? "multi" : "single";
+}
+
+const IRRIGATION_MODE_HINTS = {
+  after_cold: "Цена воды на полив = цене ХВС (отдельный тариф не нужен). Водоотведение = ХВС − Полив.",
+  parallel: "Задаётся отдельный тариф «Полив» (руб/м³). Расчёт полива идёт отдельно, без учёта в водоотведении.",
+};
+
+function renderMeterSelectorHtml(prefix, enabledMeters, propertyType = "apartment", irrigationMode = "parallel") {
+  const elecMode = detectElectricityMode(enabledMeters);
+  const isHouse = propertyType === "house";
+  const irrMode = irrigationMode === "after_cold" ? "after_cold" : "parallel";
+  const showIrrMode = isHouse && enabledMeters.includes("irrigation");
+
+  const waterGasHtml = WATER_GAS_METERS.map(m => {
+    const hiddenByType = Boolean(m.houseOnly) && !isHouse;
+    const isChecked = !hiddenByType && enabledMeters.includes(m.id);
+    return `
+      <label class="meter-check ${hiddenByType ? "hidden" : ""}" ${m.houseOnly ? `data-${prefix}-house-only="1"` : ""}>
+        <input type="checkbox" class="${prefix}-meter-cb" value="${m.id}" ${isChecked ? "checked" : ""} ${hiddenByType ? "disabled" : ""} />
+        <span>${esc(m.label)}</span>
+      </label>
+    `;
+  }).join("");
+
+  const elecChecksHtml = ELECTRICITY_METER_META.map(m => {
+    const isSingle = m.id === "t";
+    const isLocked = elecMode === "single" ? !isSingle : isSingle;
+    const isChecked = !isLocked && enabledMeters.includes(m.id);
+    return `
+      <label class="meter-check ${isLocked ? "is-disabled" : ""}" data-${prefix}-elec-label="${m.id}">
+        <input type="checkbox" class="${prefix}-meter-cb" value="${m.id}" ${isChecked ? "checked" : ""} ${isLocked ? "disabled" : ""} />
+        <span>${esc(m.label)}</span>
+      </label>
+    `;
+  }).join("");
+
+  return `
+    <div class="field">
+      <label>Подключённые счётчики (вода и газ)</label>
+      <div class="meter-check-grid">${waterGasHtml}</div>
+    </div>
+    <div class="field ${showIrrMode ? "" : "hidden"}" id="${prefix}-irr-mode-wrap">
+      <label>🌱 Схема подключения поливного водомера</label>
+      <div class="irr-mode-picker" id="${prefix}-irr-mode-picker">
+        <button type="button" class="type-btn irr-mode-btn ${irrMode === "after_cold" ? "active" : ""}" data-${prefix}-irr-mode="after_cold">Поливной водомер после водомера ХВС</button>
+        <button type="button" class="type-btn irr-mode-btn ${irrMode === "parallel" ? "active" : ""}" data-${prefix}-irr-mode="parallel">Поливной водомер параллельно водомеру ХВС</button>
+      </div>
+      <div class="irr-mode-hint" id="${prefix}-irr-mode-hint">${IRRIGATION_MODE_HINTS[irrMode]}</div>
+    </div>
+    <div class="field">
+      <label>⚡ Тип показаний электричества</label>
+      <div class="elec-mode-picker" id="${prefix}-elec-mode-picker">
+        <button type="button" class="type-btn ${elecMode === "single" ? "active" : ""}" data-${prefix}-elec-mode="single">Один тариф</button>
+        <button type="button" class="type-btn ${elecMode === "multi" ? "active" : ""}" data-${prefix}-elec-mode="multi">Тарифы Т1, Т2, Т3</button>
+      </div>
+      <div class="meter-check-grid-4">${elecChecksHtml}</div>
+    </div>
+  `;
+}
+
+function wireMeterSelector(prefix, initialMode, onChange, initialIrrMode = "parallel") {
+  let currentMode = initialMode;
+  let currentIrrMode = initialIrrMode === "after_cold" ? "after_cold" : "parallel";
+
+  const applyMode = (mode, autoCheck) => {
+    currentMode = mode;
+    document.querySelectorAll(`#${prefix}-elec-mode-picker [data-${prefix}-elec-mode]`).forEach(btn => {
+      btn.classList.toggle("active", btn.getAttribute(`data-${prefix}-elec-mode`) === mode);
+    });
+
+    const singleCb = document.querySelector(`.${prefix}-meter-cb[value="t"]`);
+    const singleLabel = document.querySelector(`[data-${prefix}-elec-label="t"]`);
+    const multiCbs = MULTI_ELEC_IDS.map(id => ({
+      cb: document.querySelector(`.${prefix}-meter-cb[value="${id}"]`),
+      label: document.querySelector(`[data-${prefix}-elec-label="${id}"]`),
+    }));
+
+    if (mode === "single") {
+      if (singleCb) {
+        singleCb.disabled = false;
+        if (autoCheck) singleCb.checked = true;
+      }
+      singleLabel?.classList.remove("is-disabled");
+      multiCbs.forEach(({ cb, label }) => {
+        if (cb) {
+          cb.checked = false;
+          cb.disabled = true;
+        }
+        label?.classList.add("is-disabled");
+      });
+    } else {
+      if (singleCb) {
+        singleCb.checked = false;
+        singleCb.disabled = true;
+      }
+      singleLabel?.classList.add("is-disabled");
+      const anyMultiChecked = multiCbs.some(({ cb }) => cb?.checked);
+      multiCbs.forEach(({ cb, label }) => {
+        if (cb) {
+          cb.disabled = false;
+          if (autoCheck && !anyMultiChecked) cb.checked = true;
+        }
+        label?.classList.remove("is-disabled");
+      });
+    }
+    onChange?.();
+  };
+
+  document.querySelectorAll(`#${prefix}-elec-mode-picker [data-${prefix}-elec-mode]`).forEach(btn => {
+    btn.onclick = () => {
+      const nextMode = btn.getAttribute(`data-${prefix}-elec-mode`);
+      if (nextMode === currentMode) return;
+      haptic("light");
+      applyMode(nextMode, true);
+    };
+  });
+
+  const syncIrrModeVisibility = () => {
+    const irrCb = document.querySelector(`.${prefix}-meter-cb[value="irrigation"]`);
+    const show = Boolean(irrCb && !irrCb.disabled && irrCb.checked);
+    document.getElementById(`${prefix}-irr-mode-wrap`)?.classList.toggle("hidden", !show);
+  };
+
+  document.querySelectorAll(`#${prefix}-irr-mode-picker [data-${prefix}-irr-mode]`).forEach(btn => {
+    btn.onclick = () => {
+      const nextIrr = btn.getAttribute(`data-${prefix}-irr-mode`);
+      if (nextIrr === currentIrrMode) return;
+      haptic("light");
+      currentIrrMode = nextIrr;
+      document.querySelectorAll(`#${prefix}-irr-mode-picker [data-${prefix}-irr-mode]`).forEach(b => {
+        b.classList.toggle("active", b.getAttribute(`data-${prefix}-irr-mode`) === currentIrrMode);
+      });
+      const hintEl = document.getElementById(`${prefix}-irr-mode-hint`);
+      if (hintEl) hintEl.textContent = IRRIGATION_MODE_HINTS[currentIrrMode] || "";
+      onChange?.();
+    };
+  });
+
+  document.querySelectorAll(`.${prefix}-meter-cb`).forEach(cb => {
+    cb.onchange = () => {
+      syncIrrModeVisibility();
+      onChange?.();
+    };
+  });
+
+  const setPropertyType = (ptype) => {
+    const isHouse = ptype === "house";
+    document.querySelectorAll(`[data-${prefix}-house-only="1"]`).forEach(label => {
+      label.classList.toggle("hidden", !isHouse);
+      const cb = label.querySelector("input[type='checkbox']");
+      if (cb) {
+        cb.disabled = !isHouse;
+        if (!isHouse) cb.checked = false;
+      }
+    });
+    syncIrrModeVisibility();
+    onChange?.();
+  };
+
+  syncIrrModeVisibility();
+
+  return {
+    getMode: () => currentMode,
+    getIrrigationMode: () => currentIrrMode,
+    setPropertyType,
+    getEnabledMeters: () =>
+      Array.from(document.querySelectorAll(`.${prefix}-meter-cb:checked:not(:disabled)`)).map(cb => cb.value),
+  };
+}
+
 function openCreatePropertyModal() {
   let chosenType = "apartment";
-  const meterChecksHtml = METER_META.map(m => `
-    <label class="meter-check">
-      <input type="checkbox" class="new-meter-cb" value="${m.id}" ${DEFAULT_NEW_METERS.includes(m.id) ? "checked" : ""} />
-      <span>${esc(m.label)}</span>
-    </label>
-  `).join("");
+  const initMeters = DEFAULT_NEW_METERS.slice();
 
   openModal("➕ Новый объект недвижимости", `
     <div class="field">
@@ -839,23 +1530,27 @@ function openCreatePropertyModal() {
       <label id="new-prop-num-label">${getPropertyMeta(chosenType).numLabel}</label>
       <input type="text" id="new-apt-num" maxlength="50" placeholder="${getPropertyMeta(chosenType).placeholder}" />
     </div>
-    <div class="field">
-      <label>Счётчики на объекте</label>
-      <div class="meter-check-grid">${meterChecksHtml}</div>
-    </div>
+    ${renderMeterSelectorHtml("new", initMeters, chosenType)}
   `, [
     { label: "Отмена", cls: "btn-secondary" },
     {
+      id: "modal-create-apt-btn",
       label: "Создать",
+      disabled: true,
       onClick: async () => {
         const number = document.getElementById("new-apt-num").value.trim();
         if (!number) { showToast("Укажите номер или название объекта", "error"); return false; }
-        const enabledMeters = Array.from(document.querySelectorAll(".new-meter-cb:checked")).map(cb => cb.value);
+        const enabledMeters = meterSelector.getEnabledMeters();
         if (!enabledMeters.length) { showToast("Выберите хотя бы один счётчик", "error"); return false; }
         try {
           const res = await api("/api/apartments", {
             method: "POST",
-            body: { number, property_type: chosenType, enabled_meters: enabledMeters },
+            body: {
+              number,
+              property_type: chosenType,
+              enabled_meters: enabledMeters,
+              irrigation_mode: meterSelector.getIrrigationMode(),
+            },
           });
           state.selectedAptId = res.apartment.id;
           showToast(`✅ Создано: ${propTitle(res.apartment)}`);
@@ -865,6 +1560,17 @@ function openCreatePropertyModal() {
     },
   ]);
 
+  const updateCreateBtn = () => {
+    const createBtn = document.getElementById("modal-create-apt-btn");
+    const numVal = document.getElementById("new-apt-num")?.value.trim() || "";
+    const meters = meterSelector.getEnabledMeters();
+    if (createBtn) createBtn.disabled = !numVal || !meters.length;
+  };
+
+  const meterSelector = wireMeterSelector("new", detectElectricityMode(initMeters), updateCreateBtn);
+
+  document.getElementById("new-apt-num")?.addEventListener("input", updateCreateBtn);
+
   document.querySelectorAll("#new-type-picker .type-btn").forEach(btn => {
     btn.onclick = () => {
       chosenType = btn.dataset.ptype;
@@ -872,6 +1578,7 @@ function openCreatePropertyModal() {
       const meta = getPropertyMeta(chosenType);
       document.getElementById("new-prop-num-label").textContent = meta.numLabel;
       document.getElementById("new-apt-num").placeholder = meta.placeholder;
+      meterSelector.setPropertyType(chosenType);
     };
   });
 }
@@ -897,7 +1604,7 @@ async function saveApartmentOrder(newIds, root) {
   } catch (err) {
     state.apartments = prevApartments;
     renderAptSelector();
-    renderApartments(root);
+    renderTab();
     showToast("❌ " + err.message, "error");
   }
 }
@@ -1214,7 +1921,7 @@ function renderApartments(root) {
 
   const aptListChips = state.apartments.map(a => `
     <button type="button" class="btn btn-sm apt-chip ${a.id === state.selectedAptId ? "" : "btn-secondary"}" data-apt="${a.id}">
-      ${state.reorderMode ? '<span class="drag-grip">⠿</span>' : ""}${esc(propIcon(a))} ${esc(propShort(a))}${a.has_tenant ? " 👤" : ""}
+      ${state.reorderMode ? '<span class="drag-grip">⠿</span>' : ""}${esc(propIcon(a))} ${esc(propShort(a))}${isPropertyRented(a) ? " 👤" : ""}
     </button>`).join("");
 
   let bodyHtml = "";
@@ -1236,32 +1943,44 @@ function renderApartments(root) {
           <label id="edit-prop-num-label">${curMeta.numLabel}</label>
           <input type="text" id="s-number" maxlength="50" value="${esc(apt.number)}" placeholder="${curMeta.placeholder}" />
         </div>
-        <div class="field">
-          <label>Подключённые счётчики</label>
-          <div class="meter-check-grid">
-            ${METER_META.map(m => `
-              <label class="meter-check">
-                <input type="checkbox" class="edit-meter-cb" value="${m.id}" ${enabled.includes(m.id) ? "checked" : ""} />
-                <span>${esc(m.label)}</span>
-              </label>
+        ${renderMeterSelectorHtml("edit", enabled, apt.property_type, apt.irrigation_mode)}
+        <div id="settings-days-section" class="settings-section">
+          <div class="section-label">📅 Выберите день отправки показаний счётчиков (с 1 по 31 число)</div>
+          <div id="settings-days-wrap" class="grid-3">
+            <div class="field" data-day-group="water"><label>💧 Вода</label><input type="number" min="1" max="31" id="s-wday" placeholder="1–31" value="${apt.water_submission_day ?? ""}" /></div>
+            <div class="field" data-day-group="electricity"><label>⚡ Электричество</label><input type="number" min="1" max="31" id="s-eday" placeholder="1–31" value="${apt.electricity_submission_day ?? ""}" /></div>
+            <div class="field" data-day-group="gas"><label>🔥 Газ</label><input type="number" min="1" max="31" id="s-gday" placeholder="1–31" value="${apt.gas_submission_day ?? ""}" /></div>
+          </div>
+        </div>
+        <div id="settings-tariffs-section" class="settings-section">
+          <div class="section-label">💰 Тарифы</div>
+          <div class="grid-2" id="settings-tariffs-wrap">
+            ${METER_META.filter(m => m.id === "cold_water" || m.id === "hot_water").map(m => `
+              <div class="field" data-tariff-meter="${m.id}">
+                <label>${esc(m.tariffLabel)}</label>
+                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
+              </div>
+            `).join("")}
+            <div class="field" data-tariff-group="water">
+              <label>🚰 Водоотведение (руб/м³)</label>
+              <input type="text" inputmode="decimal" id="t-sewerage" placeholder="ХВС + ГВС" value="${tariffs.sewerage ? tariffs.sewerage : ""}" />
+            </div>
+            ${METER_META.filter(m => m.id === "irrigation").map(m => `
+              <div class="field" data-tariff-meter="${m.id}">
+                <label>${esc(m.tariffLabel)}</label>
+                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
+              </div>
+            `).join("")}
+            ${METER_META.filter(m => m.group !== "water").map(m => `
+              <div class="field" data-tariff-meter="${m.id}">
+                <label>${esc(m.tariffLabel)}</label>
+                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
+              </div>
             `).join("")}
           </div>
         </div>
-        <div id="settings-days-wrap" class="grid-3">
-          <div class="field" data-day-group="water"><label>📅 День воды (1–31)</label><input type="number" min="1" max="31" id="s-wday" value="${apt.water_submission_day ?? ""}" /></div>
-          <div class="field" data-day-group="electricity"><label>📅 День света (1–31)</label><input type="number" min="1" max="31" id="s-eday" value="${apt.electricity_submission_day ?? ""}" /></div>
-          <div class="field" data-day-group="gas"><label>📅 День газа (1–31)</label><input type="number" min="1" max="31" id="s-gday" value="${apt.gas_submission_day ?? ""}" /></div>
-        </div>
-        <div class="grid-2" id="settings-tariffs-wrap">
-          ${METER_META.map(m => `
-            <div class="field" data-tariff-meter="${m.id}">
-              <label>${esc(m.tariffLabel)}</label>
-              <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
-            </div>
-          `).join("")}
-        </div>
         <div class="row-gap">
-          <button class="btn" id="btn-save-settings">💾 Сохранить настройки и тарифы</button>
+          <button class="btn" id="btn-save-settings" disabled>💾 Сохранить настройки и тарифы</button>
           <button class="btn btn-secondary" id="btn-tariff-hist">📋 История тарифов</button>
         </div>
         <div class="danger-zone">
@@ -1275,21 +1994,39 @@ function renderApartments(root) {
           ${enabledMeta.map(m => `
             <div class="field">
               <label>${esc(m.label)} (${esc(m.unit)})</label>
-              <input type="number" min="0" id="i-${m.id}" placeholder="Не задано" value="${initR[m.id] ?? ""}" />
+              <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="i-${m.id}" placeholder="Не задано" value="${initR[m.id] !== null && initR[m.id] !== undefined ? esc(formatIntSpaces(initR[m.id])) : ""}" />
             </div>
           `).join("")}
         </div>
-        <button class="btn" id="btn-save-initial">💾 Сохранить начальные показания</button>`;
+        <button class="btn" id="btn-save-initial" disabled>💾 Сохранить начальные показания</button>`;
     } else {
       bodyHtml = `
         <div class="field"><label><input type="checkbox" id="c-has" ${apt.has_tenant ? "checked" : ""} style="width:auto;margin-right:6px" /> Наниматель проживает</label></div>
         <div class="field"><label>🔢 Номер договора</label><input type="text" id="c-no" value="${esc(apt.agreement_no || "")}" /></div>
         <div class="grid-2">
-          <div class="field"><label>📅 Дата начала</label><input type="date" id="c-start" value="${apt.agreement_date_start || ""}" /></div>
-          <div class="field"><label>📅 Дата окончания</label><input type="date" id="c-end" value="${apt.agreement_date_finish || ""}" /></div>
+          <div class="field">
+            <label>📅 Дата начала</label>
+            <div class="date-input-wrap">
+              <input type="text" inputmode="numeric" id="c-start" class="date-mask" maxlength="10" placeholder="ДД/ММ/ГГГГ" value="${esc(isoToDisplayDate(apt.agreement_date_start))}" />
+              <span class="date-picker-trigger" title="Выбрать в календаре">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                <input type="date" id="c-start-native" class="date-native-overlay" tabindex="-1" aria-label="Выбрать дату начала" value="${esc(apt.agreement_date_start || "")}" />
+              </span>
+            </div>
+          </div>
+          <div class="field">
+            <label>📅 Дата окончания</label>
+            <div class="date-input-wrap">
+              <input type="text" inputmode="numeric" id="c-end" class="date-mask" maxlength="10" placeholder="ДД/ММ/ГГГГ" value="${esc(isoToDisplayDate(apt.agreement_date_finish))}" />
+              <span class="date-picker-trigger" title="Выбрать в календаре">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                <input type="date" id="c-end-native" class="date-native-overlay" tabindex="-1" aria-label="Выбрать дату окончания" value="${esc(apt.agreement_date_finish || "")}" />
+              </span>
+            </div>
+          </div>
         </div>
         <div class="grid-2">
-          <button class="btn" id="btn-save-contract">💾 Сохранить договор</button>
+          <button class="btn" id="btn-save-contract" disabled>💾 Сохранить договор</button>
           <button class="btn btn-danger" id="btn-del-contract">🗑 Удалить договор</button>
         </div>
         <h3 class="mt-12">👤 Наниматели</h3>
@@ -1325,7 +2062,7 @@ function renderApartments(root) {
         <div class="subtabs">
           <button class="subtab ${state.manageSubtab === "settings" ? "active" : ""}" data-m="settings">⚙️ Настройки</button>
           <button class="subtab ${state.manageSubtab === "initial" ? "active" : ""}" data-m="initial">📏 Начальные</button>
-          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract">📋 Аренда</button>
+          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract">📋 Аренда${isPropertyRented(apt) ? " ✅" : ""}</button>
         </div>
         ${bodyHtml}
       </div>` : ""}
@@ -1380,25 +2117,93 @@ function renderApartments(root) {
 
   if (state.manageSubtab === "settings") {
     let editPropType = apt.property_type || "apartment";
+    const saveSettingsBtn = document.getElementById("btn-save-settings");
 
-    const syncSettingsVisibility = () => {
-      const checked = new Set(Array.from(document.querySelectorAll(".edit-meter-cb:checked")).map(cb => cb.value));
-      const hasW = checked.has("cold_water") || checked.has("hot_water");
-      const hasE = checked.has("t1") || checked.has("t2") || checked.has("t3");
-      const hasG = checked.has("gas");
-
-      document.querySelector('[data-day-group="water"]')?.classList.toggle("hidden", !hasW);
-      document.querySelector('[data-day-group="electricity"]')?.classList.toggle("hidden", !hasE);
-      document.querySelector('[data-day-group="gas"]')?.classList.toggle("hidden", !hasG);
-
-      document.querySelectorAll("[data-tariff-meter]").forEach(el => {
-        el.classList.toggle("hidden", !checked.has(el.dataset.tariffMeter));
+    const getSettingsSnapshot = () => {
+      const enabledNow = editMeterSelector.getEnabledMeters();
+      const irrModeNow = editMeterSelector.getIrrigationMode();
+      const tariffsNow = {};
+      for (const m of METER_META) {
+        if (!enabledNow.includes(m.id)) continue;
+        if (m.id === "irrigation" && irrModeNow === "after_cold") continue;
+        tariffsNow[m.id] = (document.getElementById(`t-${m.id}`)?.value || "").trim().replace(",", ".");
+      }
+      if (enabledNow.includes("cold_water") || enabledNow.includes("hot_water")) {
+        tariffsNow.sewerage = (document.getElementById("t-sewerage")?.value || "").trim().replace(",", ".");
+      }
+      return JSON.stringify({
+        number: (document.getElementById("s-number")?.value || "").trim(),
+        property_type: editPropType,
+        enabled_meters: enabledNow,
+        irrigation_mode: enabledNow.includes("irrigation") ? irrModeNow : "parallel",
+        wday: (document.getElementById("s-wday")?.value || "").trim(),
+        eday: (document.getElementById("s-eday")?.value || "").trim(),
+        gday: (document.getElementById("s-gday")?.value || "").trim(),
+        tariffs: tariffsNow,
       });
     };
 
+    let initialSettingsSnapshot = "";
+
+    const updateSettingsDirty = () => {
+      if (!saveSettingsBtn || !initialSettingsSnapshot) return;
+      saveSettingsBtn.disabled = getSettingsSnapshot() === initialSettingsSnapshot;
+    };
+
+    const syncSettingsVisibility = () => {
+      const checked = new Set(editMeterSelector.getEnabledMeters());
+      const hasDomW = checked.has("cold_water") || checked.has("hot_water");
+      const hasWaterAny = hasDomW || checked.has("irrigation");
+      const hasE = checked.has("t") || checked.has("t1") || checked.has("t2") || checked.has("t3");
+      const hasG = checked.has("gas");
+
+      const visibleGroups = [hasWaterAny, hasE, hasG].filter(Boolean).length;
+      document.getElementById("settings-days-section")?.classList.toggle("hidden", visibleGroups === 0);
+      const daysWrap = document.getElementById("settings-days-wrap");
+      if (daysWrap && visibleGroups > 0) {
+        daysWrap.style.gridTemplateColumns = `repeat(${visibleGroups}, 1fr)`;
+      }
+
+      document.querySelector('[data-day-group="water"]')?.classList.toggle("hidden", !hasWaterAny);
+      document.querySelector('[data-day-group="electricity"]')?.classList.toggle("hidden", !hasE);
+      document.querySelector('[data-day-group="gas"]')?.classList.toggle("hidden", !hasG);
+
+      const irrModeNow = editMeterSelector.getIrrigationMode();
+      const hideIrrTariff = irrModeNow === "after_cold";
+      const hasVisibleTariff = Array.from(checked).some(id => !(id === "irrigation" && hideIrrTariff)) || hasDomW;
+
+      document.getElementById("settings-tariffs-section")?.classList.toggle("hidden", !hasVisibleTariff);
+      document.querySelectorAll("[data-tariff-meter]").forEach(el => {
+        const mt = el.dataset.tariffMeter;
+        const hidden = !checked.has(mt) || (mt === "irrigation" && hideIrrTariff);
+        el.classList.toggle("hidden", hidden);
+      });
+      document.querySelector('[data-tariff-group="water"]')?.classList.toggle("hidden", !hasDomW);
+
+      const sewInput = document.getElementById("t-sewerage");
+      if (sewInput) {
+        if (checked.has("irrigation") && hideIrrTariff) {
+          sewInput.placeholder = checked.has("hot_water") ? "ХВС + ГВС − Полив" : "ХВС − Полив";
+        } else {
+          sewInput.placeholder = checked.has("hot_water") ? "ХВС + ГВС" : "ХВС";
+        }
+      }
+
+      updateSettingsDirty();
+    };
+
+    const editMeterSelector = wireMeterSelector(
+      "edit",
+      detectElectricityMode(enabled),
+      syncSettingsVisibility,
+      apt.irrigation_mode || "parallel"
+    );
     syncSettingsVisibility();
-    document.querySelectorAll(".edit-meter-cb").forEach(cb => {
-      cb.onchange = syncSettingsVisibility;
+    initialSettingsSnapshot = getSettingsSnapshot();
+    updateSettingsDirty();
+
+    ["s-number", "s-wday", "s-eday", "s-gday", "t-sewerage", ...METER_META.map(m => `t-${m.id}`)].forEach(id => {
+      document.getElementById(id)?.addEventListener("input", updateSettingsDirty);
     });
 
     document.querySelectorAll("#edit-type-picker .type-btn").forEach(btn => {
@@ -1408,25 +2213,38 @@ function renderApartments(root) {
         const meta = getPropertyMeta(editPropType);
         document.getElementById("edit-prop-num-label").textContent = meta.numLabel;
         document.getElementById("s-number").placeholder = meta.placeholder;
+        editMeterSelector.setPropertyType(editPropType);
       };
     });
 
-    document.getElementById("btn-save-settings")?.addEventListener("click", async () => {
+    saveSettingsBtn?.addEventListener("click", async () => {
+      if (saveSettingsBtn.disabled) return;
       const number = document.getElementById("s-number").value.trim();
       if (!number) return showToast("Укажите номер или название объекта", "error");
-      const enabledMeters = Array.from(document.querySelectorAll(".edit-meter-cb:checked")).map(cb => cb.value);
+      const enabledMeters = editMeterSelector.getEnabledMeters();
       if (!enabledMeters.length) return showToast("Выберите хотя бы один счётчик", "error");
 
       const wday = document.getElementById("s-wday").value.trim();
       const eday = document.getElementById("s-eday").value.trim();
       const gday = document.getElementById("s-gday").value.trim();
+      const irrMode = editMeterSelector.getIrrigationMode();
       const tariffsPayload = {};
       for (const m of METER_META) {
         if (!enabledMeters.includes(m.id)) continue;
+        if (m.id === "irrigation" && irrMode === "after_cold") continue;
         const val = document.getElementById(`t-${m.id}`)?.value.trim();
         if (val) tariffsPayload[m.id] = val;
       }
+      if (enabledMeters.includes("cold_water") || enabledMeters.includes("hot_water")) {
+        const sewVal = document.getElementById("t-sewerage")?.value.trim();
+        if (sewVal) {
+          tariffsPayload.sewerage = sewVal;
+        } else if (tariffs.sewerage !== null && tariffs.sewerage !== undefined && tariffs.sewerage > 0) {
+          tariffsPayload.sewerage = "0";
+        }
+      }
 
+      saveSettingsBtn.disabled = true;
       try {
         await api(`/api/apartments/${apt.id}/settings`, {
           method: "PUT",
@@ -1434,6 +2252,7 @@ function renderApartments(root) {
             number,
             property_type: editPropType,
             enabled_meters: enabledMeters,
+            irrigation_mode: irrMode,
             water_submission_day: wday ? Number(wday) : null,
             electricity_submission_day: eday ? Number(eday) : null,
             gas_submission_day: gday ? Number(gday) : null,
@@ -1446,14 +2265,17 @@ function renderApartments(root) {
         renderAptSelector();
         await loadApartmentDetail(apt.id);
         renderApartments(root);
-      } catch (err) { showToast("❌ " + err.message, "error"); }
+      } catch (err) {
+        showToast("❌ " + err.message, "error");
+        updateSettingsDirty();
+      }
     });
 
     document.getElementById("btn-tariff-hist")?.addEventListener("click", async () => {
       try {
         const res = await api(`/api/apartments/${apt.id}/tariffs/history`);
         const html = res.items.length
-          ? res.items.map(i => `<div class="table-row"><span>${esc(i.label)} · ${esc(i.effective_from)}</span><b>${i.rate} ₽</b></div>`).join("")
+          ? res.items.map(i => `<div class="table-row"><span>${esc(i.label)} · ${esc(i.effective_from)}</span><b>${fmtNum(i.rate)} ₽</b></div>`).join("")
           : `<p class="muted">История тарифов пуста.</p>`;
         openModal(`История тарифов — ${propShort(apt)}`, `<div style="max-height:55vh;overflow:auto">${html}</div>`, [{ label: "Закрыть", cls: "btn-secondary" }]);
       } catch (err) { showToast("❌ " + err.message, "error"); }
@@ -1498,43 +2320,104 @@ function renderApartments(root) {
     });
   }
 
-  document.getElementById("btn-save-initial")?.addEventListener("click", async () => {
-    const body = {};
+  const saveInitialBtn = document.getElementById("btn-save-initial");
+  if (saveInitialBtn) {
     for (const m of METER_META) {
-      const el = document.getElementById(`i-${m.id}`);
-      if (!el) continue;
-      const v = el.value.trim();
-      if (v === "") {
-        body[m.id] = null;
-      } else if (!/^\d+$/.test(v)) {
-        return showToast(`Некорректное начальное показание для ${m.plain}`, "error");
-      } else {
-        body[m.id] = parseInt(v, 10);
-      }
+      attachIntMask(document.getElementById(`i-${m.id}`));
     }
-    try {
-      await api(`/api/apartments/${apt.id}/initial-readings`, { method: "PUT", body });
-      showToast("✅ Начальные показания сохранены");
-      await loadApartmentDetail(apt.id);
-    } catch (err) { showToast("❌ " + err.message, "error"); }
-  });
+    const getInitialSnapshot = () => {
+      const snap = {};
+      for (const m of METER_META) {
+        const el = document.getElementById(`i-${m.id}`);
+        if (el) snap[m.id] = parseIntSpaces(el.value).digits;
+      }
+      return JSON.stringify(snap);
+    };
+    const initialSnap = getInitialSnapshot();
+    const updateInitialDirty = () => {
+      saveInitialBtn.disabled = getInitialSnapshot() === initialSnap;
+    };
+    for (const m of METER_META) {
+      document.getElementById(`i-${m.id}`)?.addEventListener("input", updateInitialDirty);
+    }
 
-  document.getElementById("btn-save-contract")?.addEventListener("click", async () => {
-    try {
-      await api(`/api/apartments/${apt.id}/contract`, {
-        method: "PUT",
-        body: {
-          has_tenant: document.getElementById("c-has").checked,
-          agreement_no: document.getElementById("c-no").value.trim() || null,
-          agreement_date_start: document.getElementById("c-start").value || null,
-          agreement_date_finish: document.getElementById("c-end").value || null,
-        },
-      });
-      showToast("✅ Договор сохранён");
-      await loadApartmentDetail(apt.id);
-      renderApartments(root);
-    } catch (err) { showToast("❌ " + err.message, "error"); }
-  });
+    saveInitialBtn.addEventListener("click", async () => {
+      if (saveInitialBtn.disabled) return;
+      const body = {};
+      for (const m of METER_META) {
+        const el = document.getElementById(`i-${m.id}`);
+        if (!el) continue;
+        const parsed = parseIntSpaces(el.value);
+        if (parsed.empty) {
+          body[m.id] = null;
+        } else if (!parsed.ok) {
+          return showToast(`Некорректное начальное показание для ${m.plain}`, "error");
+        } else {
+          body[m.id] = parsed.value;
+        }
+      }
+      saveInitialBtn.disabled = true;
+      try {
+        await api(`/api/apartments/${apt.id}/initial-readings`, { method: "PUT", body });
+        showToast("✅ Начальные показания сохранены");
+        await loadApartmentDetail(apt.id);
+        renderApartments(root);
+      } catch (err) {
+        showToast("❌ " + err.message, "error");
+        updateInitialDirty();
+      }
+    });
+  }
+
+  attachDateField("c-start", "c-start-native");
+  attachDateField("c-end", "c-end-native");
+
+  const saveContractBtn = document.getElementById("btn-save-contract");
+  if (saveContractBtn) {
+    const getContractSnapshot = () => JSON.stringify({
+      has_tenant: Boolean(document.getElementById("c-has")?.checked),
+      agreement_no: (document.getElementById("c-no")?.value || "").trim(),
+      start: (document.getElementById("c-start")?.value || "").trim(),
+      end: (document.getElementById("c-end")?.value || "").trim(),
+    });
+    const initialContractSnap = getContractSnapshot();
+    const updateContractDirty = () => {
+      saveContractBtn.disabled = getContractSnapshot() === initialContractSnap;
+    };
+    document.getElementById("c-has")?.addEventListener("change", updateContractDirty);
+    document.getElementById("c-no")?.addEventListener("input", updateContractDirty);
+    document.getElementById("c-start")?.addEventListener("input", updateContractDirty);
+    document.getElementById("c-end")?.addEventListener("input", updateContractDirty);
+
+    saveContractBtn.addEventListener("click", async () => {
+      if (saveContractBtn.disabled) return;
+      const startDate = parseDisplayDate(document.getElementById("c-start").value);
+      if (!startDate.ok) return showToast(`❌ Дата начала: ${startDate.error}`, "error");
+      const endDate = parseDisplayDate(document.getElementById("c-end").value);
+      if (!endDate.ok) return showToast(`❌ Дата окончания: ${endDate.error}`, "error");
+      if (startDate.iso && endDate.iso && startDate.iso > endDate.iso) {
+        return showToast("❌ Дата начала договора не может быть позже даты окончания", "error");
+      }
+      saveContractBtn.disabled = true;
+      try {
+        await api(`/api/apartments/${apt.id}/contract`, {
+          method: "PUT",
+          body: {
+            has_tenant: document.getElementById("c-has").checked,
+            agreement_no: document.getElementById("c-no").value.trim() || null,
+            agreement_date_start: startDate.display,
+            agreement_date_finish: endDate.display,
+          },
+        });
+        showToast("✅ Договор сохранён");
+        await loadApartmentDetail(apt.id);
+        renderApartments(root);
+      } catch (err) {
+        showToast("❌ " + err.message, "error");
+        updateContractDirty();
+      }
+    });
+  }
 
   document.getElementById("btn-del-contract")?.addEventListener("click", () => {
     openModal("🗑 Удалить договор?", `<p>Очистить данные договора для объекта «${esc(propShort(apt))}»?</p>`, [
@@ -1681,10 +2564,13 @@ async function renderFamilies(root) {
 
   root.querySelectorAll(".ren-fam-btn").forEach(btn => {
     btn.onclick = () => {
+      const initialFamName = String(btn.dataset.name || "").trim();
       openModal("✏️ Переименовать семью", `<div class="field"><label>Название семьи</label><input type="text" id="rf-name" value="${esc(btn.dataset.name)}" /></div>`, [
         { label: "Отмена", cls: "btn-secondary" },
         {
+          id: "modal-save-fam-name",
           label: "Сохранить",
+          disabled: true,
           onClick: async () => {
             const name = document.getElementById("rf-name").value.trim();
             if (!name) { showToast("Название не может быть пустым", "error"); return false; }
@@ -1696,6 +2582,12 @@ async function renderFamilies(root) {
           },
         },
       ]);
+      const rfInput = document.getElementById("rf-name");
+      const saveBtn = document.getElementById("modal-save-fam-name");
+      rfInput?.addEventListener("input", () => {
+        const v = rfInput.value.trim();
+        if (saveBtn) saveBtn.disabled = !v || v === initialFamName;
+      });
     };
   });
 
@@ -1736,6 +2628,8 @@ async function renderFamilies(root) {
 
   root.querySelectorAll(".edit-owner-btn").forEach(btn => {
     btn.onclick = () => {
+      const initialOwnerName = String(btn.dataset.oname || "").trim();
+      const initialOwnerPhone = formatRuPhone(btn.dataset.ophone || "");
       openModal("✏️ Редактировать члена семьи", `
         <div class="field">
           <label>Имя</label>
@@ -1748,7 +2642,9 @@ async function renderFamilies(root) {
       `, [
         { label: "Отмена", cls: "btn-secondary" },
         {
+          id: "modal-save-owner",
           label: "Сохранить",
+          disabled: true,
           onClick: async () => {
             const name = document.getElementById("eo-name").value.trim();
             if (!name) { showToast("Имя не может быть пустым", "error"); return false; }
@@ -1769,6 +2665,17 @@ async function renderFamilies(root) {
           },
         },
       ]);
+      const nameEl = document.getElementById("eo-name");
+      const phoneEl = document.getElementById("eo-phone");
+      const saveBtn = document.getElementById("modal-save-owner");
+      const updateOwnerDirty = () => {
+        const curName = (nameEl?.value || "").trim();
+        const curPhone = formatRuPhone(phoneEl?.value || "");
+        const changed = curName !== initialOwnerName || curPhone !== initialOwnerPhone;
+        if (saveBtn) saveBtn.disabled = !curName || !changed;
+      };
+      nameEl?.addEventListener("input", updateOwnerDirty);
+      phoneEl?.addEventListener("input", updateOwnerDirty);
     };
   });
 

@@ -83,6 +83,7 @@ async def update_apartment_settings_atomic(
     number: str | None = None,
     property_type: str | None = None,
     enabled_meters: Iterable[str] | None = None,
+    irrigation_mode: str | None = None,
 ) -> int:
     """MEDIUM-10: validate and save property settings, days, and changed tariffs in one transaction.
 
@@ -99,6 +100,8 @@ async def update_apartment_settings_atomic(
             apt.property_type = property_type
         if enabled_meters is not None:
             apt.enabled_meters = serialize_enabled_meters(enabled_meters)
+        if irrigation_mode is not None:
+            apt.irrigation_mode = irrigation_mode
 
         apt.water_submission_day = water_submission_day
         apt.electricity_submission_day = electricity_submission_day

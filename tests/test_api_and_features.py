@@ -123,7 +123,7 @@ async def test_sqlite_migration_adds_new_columns_to_legacy_table(tmp_path):
         rows = (await conn.execute(text("PRAGMA table_info(apartments)"))).fetchall()
         cols = {r[1] for r in rows}
     await engine.dispose()
-    assert {"property_type", "enabled_meters", "gas_submission_day", "sort_order"}.issubset(cols)
+    assert {"property_type", "enabled_meters", "gas_submission_day", "sort_order", "irrigation_mode"}.issubset(cols)
 
 
 @pytest.mark.asyncio
@@ -421,3 +421,445 @@ def test_webapp_url_versioning_and_arenda_label():
     app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
     assert "📋 Аренда" in app_js
     assert "📋 Договор" not in app_js
+
+
+@pytest.mark.asyncio
+async def test_contract_date_dd_mm_yyyy_parsing_and_update(temp_db):
+    from webapp.schemas import ContractBody, parse_iso_date
+
+    assert parse_iso_date("25/11/2026") == datetime.date(2026, 11, 25)
+    assert parse_iso_date("25.11.2026") == datetime.date(2026, 11, 25)
+    assert parse_iso_date("2026-11-25") == datetime.date(2026, 11, 25)
+    assert parse_iso_date("") is None
+
+    with pytest.raises(HTTPException) as exc_bad:
+        parse_iso_date("31/02/2026")
+    assert exc_bad.value.status_code == 400
+
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("371", fam.id)
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    res = await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(
+            has_tenant=True,
+            agreement_no="1",
+            agreement_date_start="25/11/2026",
+            agreement_date_finish="25/12/2027",
+        ),
+        user=admin,
+    )
+    assert res["ok"] is True
+
+    updated = await crud.get_apartment(apt.id)
+    assert updated.agreement_date_start == datetime.date(2026, 11, 25)
+    assert updated.agreement_date_finish == datetime.date(2027, 12, 25)
+
+    with pytest.raises(HTTPException) as exc_inv:
+        await ten_router.api_update_contract(
+            apt.id,
+            ContractBody(
+                agreement_date_start="26/12/2027",
+                agreement_date_finish="25/12/2027",
+            ),
+            user=admin,
+        )
+    assert exc_inv.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_single_tariff_electricity_mutual_exclusion_billing_and_scheduler(temp_db):
+    from pathlib import Path
+    from webapp.schemas import InitialReadingsBody
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    bot = DummyBot()
+    req = make_request(bot)
+
+    # Reject combining single tariff "t" with T1/T2/T3
+    with pytest.raises(HTTPException) as exc_mix:
+        await apt_router.api_create_apartment(
+            ApartmentCreateBody(
+                number="55",
+                property_type="apartment",
+                enabled_meters=["cold_water", "t", "t1"],
+            ),
+            user=admin,
+        )
+    assert exc_mix.value.status_code == 400
+
+    # Create property with single electricity tariff "t"
+    res = await apt_router.api_create_apartment(
+        ApartmentCreateBody(
+            number="55",
+            property_type="apartment",
+            enabled_meters=["cold_water", "hot_water", "t", "gas"],
+        ),
+        user=admin,
+    )
+    apt_id = res["apartment"]["id"]
+    assert res["apartment"]["enabled_meters"] == ["cold_water", "hot_water", "t", "gas"]
+
+    # Reject updating settings to mix "t" and "t2"
+    with pytest.raises(HTTPException) as exc_mix_upd:
+        await apt_router.api_update_settings(
+            apt_id,
+            ApartmentSettingsBody(enabled_meters=["t", "t2"]),
+            user=admin,
+        )
+    assert exc_mix_upd.value.status_code == 400
+
+    # Set initial reading & tariff for "t"
+    await apt_router.api_update_initial_readings(
+        apt_id,
+        InitialReadingsBody(t=1000),
+        user=admin,
+    )
+    await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(
+            electricity_submission_day=24,
+            tariffs={"t": "5.5"},
+        ),
+        user=admin,
+    )
+
+    # Scheduler reminds about single-tariff electricity meter
+    await scheduler.check_meter_reminders(bot, today=datetime.date(2026, 11, 24))
+    assert any("электрического счётчика" in msg["text"] for msg in bot.sent)
+
+    # Submitting T1 when only "t" is enabled must fail
+    with pytest.raises(HTTPException) as exc_t1:
+        await read_router.api_submit_electricity(apt_id, ElectricityReadingBody(t1=1050), req, user=admin)
+    assert exc_t1.value.status_code == 400
+
+    # Submit single-tariff reading "t" and verify billing
+    sub = await read_router.api_submit_electricity(apt_id, ElectricityReadingBody(t=1100), req, user=admin)
+    assert sub["ok"] is True
+
+    bill = await calculations.calculate_billing(apt_id)
+    assert "t" in bill.meters
+    assert "t1" not in bill.meters
+    assert bill.electricity_consumption_total == 100
+    assert bill.electricity_total == 550
+
+    # Verify UI strings & labels in app.js
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "Один тариф" in app_js
+    assert "Тарифы Т1, Т2, Т3" in app_js
+    assert "Выберите день отправки показаний счётчиков (с 1 по 31 число)" in app_js
+    assert "руб/кВт·ч" in app_js
+    assert '📋 Аренда${isPropertyRented(apt) ? " ✅" : ""}' in app_js
+
+
+def test_tenant_dashboard_and_photo_ui_updates():
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    # Tenant nav button renamed from "Табло" to "Обзор"
+    assert 'label: "Табло"' not in app_js
+    # Tenant photo button & resource chips
+    assert "📤 Отправить фото наймодателю" in app_js
+    assert "getPhotoResourceOptions" in app_js
+    assert 'label: "ХВС"' in app_js
+    assert 'label: "ГВС"' in app_js
+    assert 'label: "Электричество"' in app_js
+    assert 'label: "Газ"' in app_js
+    # Tenant contract format & consumption-only dashboard
+    assert "formatTenantContractLine" in app_js
+    assert "Договор ${numPart} от ${fmtDate(apt.agreement_date_start)} до ${fmtDate(apt.agreement_date_finish)}" in app_js
+    assert "billing.water_consumption_total" in app_js
+    assert "billing.electricity_consumption_total" in app_js
+    assert "billing.gas_consumption_total" in app_js
+
+
+@pytest.mark.asyncio
+async def test_sewerage_tariff_equals_cold_plus_hot_water_and_dashboard_ui(temp_db):
+    from pathlib import Path
+    from webapp.schemas import InitialReadingsBody
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    bot = DummyBot()
+    req = make_request(bot)
+
+    res = await apt_router.api_create_apartment(
+        ApartmentCreateBody(
+            number="371",
+            property_type="apartment",
+            enabled_meters=["cold_water", "hot_water", "t"],
+        ),
+        user=admin,
+    )
+    apt_id = res["apartment"]["id"]
+
+    await apt_router.api_update_initial_readings(
+        apt_id,
+        InitialReadingsBody(cold_water=100, hot_water=50, t=1000),
+        user=admin,
+    )
+    upd = await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(
+            tariffs={"cold_water": "40", "hot_water": "150", "sewerage": "35", "t": "5"},
+        ),
+        user=admin,
+    )
+    assert upd["updated_tariffs"] == 4
+
+    detail = await apt_router.api_apartment_detail(apt_id, user=admin)
+    assert detail["tariffs"]["sewerage"] == 35.0
+
+    await read_router.api_submit_water(apt_id, WaterReadingBody(cold_water=107, hot_water=53), req, user=admin)
+    await read_router.api_submit_electricity(apt_id, ElectricityReadingBody(t=1020), req, user=admin)
+
+    bill = await calculations.calculate_billing(apt_id)
+    # ХВС = 7 м³ * 40 = 280 ₽, ГВС = 3 м³ * 150 = 450 ₽ => water_total = 730 ₽
+    assert bill.water_consumption_total == 10
+    assert bill.water_total == 730
+    # Водоотведение = ХВС + ГВС = 10 м³ * 35 = 350 ₽
+    assert bill.sewerage is not None
+    assert bill.sewerage_consumption_total == 10
+    assert bill.sewerage_total == 350
+    # Свет = 20 * 5 = 100 ₽ => grand_total = 730 + 350 + 100 = 1180 ₽
+    assert bill.electricity_total == 100
+    assert bill.grand_total == 1180
+
+    # Zeroing sewerage disables sewerage billing
+    await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(tariffs={"sewerage": "0"}),
+        user=admin,
+    )
+    bill_no_sew = await calculations.calculate_billing(apt_id)
+    assert bill_no_sew.sewerage is None
+    assert bill_no_sew.sewerage_total == 0
+    assert bill_no_sew.grand_total == 830
+
+    # Tariff history shows Russian label for sewerage
+    hist = await apt_router.api_tariff_history(apt_id, user=admin)
+    assert any(i["tariff_type"] == "sewerage" and "Водоотведение" in i["label"] for i in hist["items"])
+
+    # UI checks: sewerage input, dashboard chips, tenant 👤 in dropdown
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="t-sewerage"' in app_js
+    assert 'id="dash-apt-chips-list"' in app_js
+    assert 'propShort(a))}${!isTenant && isPropertyRented(a) ? " 👤" : ""}</option>' in app_js
+
+
+@pytest.mark.asyncio
+async def test_house_irrigation_excluded_from_sewerage_and_rented_status_logic(temp_db):
+    from pathlib import Path
+    from webapp.schemas import ContractBody, InitialReadingsBody
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    bot = DummyBot()
+    req = make_request(bot)
+
+    # Irrigation is NOT allowed for apartments or dachas
+    with pytest.raises(HTTPException) as exc_apt_irr:
+        await apt_router.api_create_apartment(
+            ApartmentCreateBody(
+                number="12",
+                property_type="apartment",
+                enabled_meters=["cold_water", "irrigation"],
+            ),
+            user=admin,
+        )
+    assert exc_apt_irr.value.status_code == 400
+
+    # Create a House with ХВС, ГВС, Полив, and single electricity tariff Т
+    res = await apt_router.api_create_apartment(
+        ApartmentCreateBody(
+            number="188",
+            property_type="house",
+            enabled_meters=["cold_water", "hot_water", "irrigation", "t"],
+        ),
+        user=admin,
+    )
+    apt_id = res["apartment"]["id"]
+    assert res["apartment"]["is_rented"] is False
+    assert "irrigation" in res["apartment"]["enabled_meters"]
+
+    # Set initial readings and tariffs (including sewerage and irrigation)
+    await apt_router.api_update_initial_readings(
+        apt_id,
+        InitialReadingsBody(cold_water=100, hot_water=50, irrigation=200, t=1000),
+        user=admin,
+    )
+    await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(
+            tariffs={
+                "cold_water": "40",
+                "hot_water": "150",
+                "sewerage": "30",
+                "irrigation": "25",
+                "t": "5",
+            },
+        ),
+        user=admin,
+    )
+
+    # Submit readings: ХВС +5 (200 ₽), ГВС +3 (450 ₽), Полив +20 (500 ₽), Т +100 (500 ₽)
+    await read_router.api_submit_water(
+        apt_id,
+        WaterReadingBody(cold_water=105, hot_water=53, irrigation=220),
+        req,
+        user=admin,
+    )
+    await read_router.api_submit_electricity(apt_id, ElectricityReadingBody(t=1100), req, user=admin)
+
+    bill = await calculations.calculate_billing(apt_id)
+    # Domestic water = 5 + 3 = 8 m3 -> 650 ₽
+    assert bill.water_consumption_total == 8
+    assert bill.water_total == 650
+    # Sewerage MUST equal ХВС + ГВС = 8 m3 (irrigation 20 m3 is EXCLUDED!) -> 8 * 30 = 240 ₽
+    assert bill.sewerage is not None
+    assert bill.sewerage_consumption_total == 8
+    assert bill.sewerage_total == 240
+    # Irrigation = 20 m3 * 25 = 500 ₽
+    assert bill.irrigation_consumption_total == 20
+    assert bill.irrigation_total == 500
+    # Electricity = 100 * 5 = 500 ₽ -> grand total = 650 + 240 + 500 + 500 = 1890 ₽
+    assert bill.grand_total == 1890
+
+    # Rented status logic: contract alone (even with has_tenant=False) marks property as rented
+    await ten_router.api_update_contract(
+        apt_id,
+        ContractBody(has_tenant=False, agreement_no="42", agreement_date_start="01/11/2026"),
+        user=admin,
+    )
+    det_contract = await apt_router.api_apartment_detail(apt_id, user=admin)
+    assert det_contract["apartment"]["is_rented"] is True
+
+    # Removing contract leaves property unrented (no tenant and no contract)
+    await ten_router.api_delete_contract(apt_id, user=admin)
+    det_free = await apt_router.api_apartment_detail(apt_id, user=admin)
+    assert det_free["apartment"]["is_rented"] is False
+
+    # Adding tenant (even without contract) marks property as rented
+    await ten_router.api_add_tenant(
+        apt_id,
+        TenantCreateBody(telegram_id=777, name="Жилец", force_no_contract=True),
+        req,
+        user=admin,
+    )
+    det_tenant = await apt_router.api_apartment_detail(apt_id, user=admin)
+    assert det_tenant["apartment"]["is_rented"] is True
+
+    # Number formatting & UI checks
+    assert calculations.fmt_num(17653) == "17 653"
+    base_dir = Path(__file__).resolve().parent.parent
+    index_html = (base_dir / "webapp" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "Счётчики</h1>" not in index_html
+    app_js = (base_dir / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function fmtNum(" in app_js
+    assert "🚰 Водоотведение</div>" in app_js
+    assert "⚡ Электричество</div>" in app_js
+    assert "🚰 Водоотвед." not in app_js
+    assert ">⚡ Свет<" not in app_js
+    assert '"Свободен"' not in app_js
+
+
+@pytest.mark.asyncio
+async def test_irrigation_after_cold_vs_parallel_billing_and_ui(temp_db):
+    from pathlib import Path
+    from webapp.schemas import InitialReadingsBody
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    bot = DummyBot()
+    req = make_request(bot)
+
+    # Create a house with irrigation AFTER cold water meter (series sub-meter)
+    res = await apt_router.api_create_apartment(
+        ApartmentCreateBody(
+            number="205",
+            property_type="house",
+            enabled_meters=["cold_water", "irrigation", "t"],
+            irrigation_mode="after_cold",
+        ),
+        user=admin,
+    )
+    apt_id = res["apartment"]["id"]
+    assert res["apartment"]["irrigation_mode"] == "after_cold"
+
+    await apt_router.api_update_initial_readings(
+        apt_id,
+        InitialReadingsBody(cold_water=100, irrigation=50, t=1000),
+        user=admin,
+    )
+    # Even if an irrigation tariff is passed in after_cold mode, backend ignores it
+    upd = await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(
+            irrigation_mode="after_cold",
+            tariffs={"cold_water": "40", "sewerage": "30", "irrigation": "999", "t": "5"},
+        ),
+        user=admin,
+    )
+    assert upd["updated_tariffs"] == 3
+
+    # ХВС: 100 -> 130 (30 м³), Полив: 50 -> 60 (10 м³), Т: 1000 -> 1020 (20 кВт·ч)
+    await read_router.api_submit_water(
+        apt_id,
+        WaterReadingBody(cold_water=130, irrigation=60),
+        req,
+        user=admin,
+    )
+    await read_router.api_submit_electricity(apt_id, ElectricityReadingBody(t=1020), req, user=admin)
+
+    bill_after = await calculations.calculate_billing(apt_id)
+    assert bill_after.irrigation_mode == "after_cold"
+    # ХВС = 30 * 40 = 1200 ₽ (already includes 10 m³ irrigation water)
+    assert bill_after.water_consumption_total == 30
+    assert bill_after.water_total == 1200
+    # Полив is NOT double-charged: cost = 0, consumption = 10
+    assert bill_after.irrigation_consumption_total == 10
+    assert bill_after.irrigation_total == 0
+    # Водоотведение = ХВС - Полив = 30 - 10 = 20 м³ * 30 = 600 ₽
+    assert bill_after.sewerage is not None
+    assert bill_after.sewerage_consumption_total == 20
+    assert bill_after.sewerage_total == 600
+    # Grand total = 1200 + 600 + 100 = 1900 ₽
+    assert bill_after.grand_total == 1900
+
+    # Clamp sewerage to 0 if irrigation exceeds ХВС
+    await read_router.api_submit_water(apt_id, WaterReadingBody(irrigation=95), req, user=admin)
+    bill_clamped = await calculations.calculate_billing(apt_id)
+    assert bill_clamped.sewerage_consumption_total == 0
+    assert bill_clamped.sewerage_total == 0
+
+    # Switch same house to "parallel" mode with separate irrigation tariff 25 ₽/м³
+    await apt_router.api_update_settings(
+        apt_id,
+        ApartmentSettingsBody(
+            irrigation_mode="parallel",
+            tariffs={"irrigation": "25"},
+        ),
+        user=admin,
+    )
+    bill_parallel = await calculations.calculate_billing(apt_id)
+    assert bill_parallel.irrigation_mode == "parallel"
+    # ХВС = 30 м³ -> 1200 ₽; Водоотведение = 30 м³ * 30 = 900 ₽; Полив = 45 м³ * 25 = 1125 ₽; Т = 100 ₽
+    assert bill_parallel.sewerage_consumption_total == 30
+    assert bill_parallel.sewerage_total == 900
+    assert bill_parallel.irrigation_consumption_total == 45
+    assert bill_parallel.irrigation_total == 1125
+    assert bill_parallel.grand_total == 1200 + 900 + 1125 + 100
+
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "Поливной водомер после водомера ХВС" in app_js
+    assert "Поливной водомер параллельно водомеру ХВС" in app_js
+
+
+def test_reading_inputs_use_nbsp_thousands_mask():
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function formatIntSpaces(" in app_js
+    assert "function parseIntSpaces(" in app_js
+    assert "function attachIntMask(" in app_js
+    assert 'class="int-mask" id="in-${m.id}"' in app_js
+    assert 'class="int-mask" id="i-${m.id}"' in app_js
+    assert 'class="int-mask" id="corr-val"' in app_js

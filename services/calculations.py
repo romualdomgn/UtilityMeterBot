@@ -13,10 +13,16 @@ from database.models import (
     ALL_METERS,
     ELECTRICITY_METERS,
     GAS_METERS,
+    IRRIGATION_METERS,
+    IRRIGATION_MODE_AFTER_COLD,
+    IRRIGATION_MODE_PARALLEL,
     METER_LABELS,
     METER_UNITS,
+    SEWERAGE_TARIFF,
+    TARIFF_LABELS,
     WATER_METERS,
     get_apartment_enabled_meters,
+    get_apartment_irrigation_mode,
 )
 
 MONTH_NAMES_RU = {
@@ -28,6 +34,17 @@ MONTH_NAMES_RU = {
 
 def fmt_date(dt: datetime.date | None) -> str:
     return dt.strftime("%d.%m.%Y") if dt else "—"
+
+
+def fmt_num(val: int | float | Decimal) -> str:
+    """Format number with space thousands separator, e.g. 17653 -> '17 653'."""
+    if isinstance(val, int):
+        return f"{val:,}".replace(",", " ")
+    raw = str(val)
+    if "." in raw:
+        int_part, frac_part = raw.split(".", 1)
+        return f"{int(int_part):,}".replace(",", " ") + "." + frac_part
+    return f"{int(raw):,}".replace(",", " ")
 
 
 def _round_to_rubles(amount: Decimal) -> int:
@@ -49,8 +66,8 @@ class MeterResult:
     def to_dict(self) -> dict:
         return {
             "meter_type": self.meter_type,
-            "label": METER_LABELS.get(self.meter_type, self.meter_type),
-            "unit": METER_UNITS.get(self.meter_type, ""),
+            "label": TARIFF_LABELS.get(self.meter_type, self.meter_type),
+            "unit": METER_UNITS.get(self.meter_type, "м³" if self.meter_type == SEWERAGE_TARIFF else ""),
             "previous": self.previous,
             "current": self.current,
             "consumption": self.consumption,
@@ -67,6 +84,8 @@ class BillingResult:
     apartment_id: int
     period_label: str
     meters: dict[str, MeterResult] = field(default_factory=dict)
+    sewerage: MeterResult | None = None
+    irrigation_mode: str = IRRIGATION_MODE_PARALLEL
 
     @property
     def water_consumption_total(self) -> int:
@@ -75,6 +94,22 @@ class BillingResult:
     @property
     def water_total(self) -> int:
         return sum(self.meters[m].cost for m in WATER_METERS if m in self.meters)
+
+    @property
+    def sewerage_consumption_total(self) -> int:
+        return self.sewerage.consumption if self.sewerage else 0
+
+    @property
+    def sewerage_total(self) -> int:
+        return self.sewerage.cost if self.sewerage else 0
+
+    @property
+    def irrigation_consumption_total(self) -> int:
+        return sum(self.meters[m].consumption for m in IRRIGATION_METERS if m in self.meters)
+
+    @property
+    def irrigation_total(self) -> int:
+        return sum(self.meters[m].cost for m in IRRIGATION_METERS if m in self.meters)
 
     @property
     def electricity_consumption_total(self) -> int:
@@ -94,15 +129,27 @@ class BillingResult:
 
     @property
     def grand_total(self) -> int:
-        return self.water_total + self.electricity_total + self.gas_total
+        return (
+            self.water_total
+            + self.sewerage_total
+            + self.irrigation_total
+            + self.electricity_total
+            + self.gas_total
+        )
 
     def to_dict(self) -> dict:
         return {
             "apartment_id": self.apartment_id,
             "period_label": self.period_label,
             "meters": {k: v.to_dict() for k, v in self.meters.items()},
+            "sewerage": self.sewerage.to_dict() if self.sewerage else None,
+            "irrigation_mode": self.irrigation_mode,
             "water_consumption_total": self.water_consumption_total,
             "water_total": self.water_total,
+            "sewerage_consumption_total": self.sewerage_consumption_total,
+            "sewerage_total": self.sewerage_total,
+            "irrigation_consumption_total": self.irrigation_consumption_total,
+            "irrigation_total": self.irrigation_total,
             "electricity_consumption_total": self.electricity_consumption_total,
             "electricity_total": self.electricity_total,
             "gas_consumption_total": self.gas_consumption_total,
@@ -144,6 +191,7 @@ async def calculate_billing(
 
     apt = await crud.get_apartment(apartment_id)
     enabled_set = set(get_apartment_enabled_meters(apt))
+    irrigation_mode = get_apartment_irrigation_mode(apt)
 
     tariffs = await crud.get_all_tariffs(apartment_id, as_of_date=tariff_date)
     initials = await crud.get_all_initial_readings(apartment_id)
@@ -154,7 +202,11 @@ async def calculate_billing(
             if r.meter_type not in latest_in_month:
                 latest_in_month[r.meter_type] = r.value
 
-    res = BillingResult(apartment_id=apartment_id, period_label=period_label)
+    res = BillingResult(
+        apartment_id=apartment_id,
+        period_label=period_label,
+        irrigation_mode=irrigation_mode,
+    )
 
     for mt in ALL_METERS:
         if current_readings is not None:
@@ -164,9 +216,16 @@ async def calculate_billing(
             if mt not in enabled_set and mt not in latest_in_month:
                 continue
 
-        tariff_obj = tariffs.get(mt)
-        has_tariff = tariff_obj is not None
-        rate = Decimal(tariff_obj.rate) if has_tariff else None
+        is_irrigation_after_cold = (
+            mt in IRRIGATION_METERS and irrigation_mode == IRRIGATION_MODE_AFTER_COLD
+        )
+        if is_irrigation_after_cold:
+            has_tariff = True
+            rate = None
+        else:
+            tariff_obj = tariffs.get(mt)
+            has_tariff = tariff_obj is not None
+            rate = Decimal(tariff_obj.rate) if has_tariff else None
         init_val = initials.get(mt)
 
         if current_readings is not None:
@@ -182,7 +241,10 @@ async def calculate_billing(
         has_base = prev_val is not None
         if submitted and has_base and curr_val is not None and prev_val is not None:
             consumption = max(0, curr_val - prev_val)
-            cost = _round_to_rubles(Decimal(consumption) * rate) if (has_tariff and rate is not None) else 0
+            if is_irrigation_after_cold:
+                cost = 0
+            else:
+                cost = _round_to_rubles(Decimal(consumption) * rate) if (has_tariff and rate is not None) else 0
         else:
             consumption = 0
             cost = 0
@@ -199,6 +261,38 @@ async def calculate_billing(
             submitted=submitted,
         )
 
+    water_in_res = [res.meters[m] for m in WATER_METERS if m in res.meters]
+    sew_obj = tariffs.get(SEWERAGE_TARIFF)
+    sew_rate = Decimal(sew_obj.rate) if sew_obj is not None else None
+    if water_in_res and sew_rate is not None and sew_rate > 0:
+        sew_submitted = any(m.submitted for m in water_in_res)
+        sew_has_base = any(m.submitted and m.has_base for m in water_in_res)
+        if sew_has_base:
+            if (
+                irrigation_mode == IRRIGATION_MODE_AFTER_COLD
+                and "irrigation" in res.meters
+                and res.meters["irrigation"].submitted
+                and res.meters["irrigation"].has_base
+            ):
+                sew_consumption = max(0, res.water_consumption_total - res.irrigation_consumption_total)
+            else:
+                sew_consumption = res.water_consumption_total
+            sew_cost = _round_to_rubles(Decimal(sew_consumption) * sew_rate)
+        else:
+            sew_consumption = 0
+            sew_cost = 0
+        res.sewerage = MeterResult(
+            meter_type=SEWERAGE_TARIFF,
+            previous=None,
+            current=None,
+            consumption=sew_consumption,
+            tariff=sew_rate,
+            cost=sew_cost,
+            has_base=sew_has_base,
+            has_tariff=True,
+            submitted=sew_submitted,
+        )
+
     return res
 
 
@@ -208,9 +302,9 @@ def format_reading_notification(
     prev_val: int | None,
     new_val: int,
 ) -> str:
-    label = METER_LABELS.get(meter_type, meter_type)
+    label = "⚡ Электричество" if meter_type == "t" else METER_LABELS.get(meter_type, meter_type)
     unit = METER_UNITS.get(meter_type, "")
     if prev_val is None:
-        return f"{label}: <b>{new_val}</b> {unit} (начальное показание не задано)"
+        return f"{label}: <b>{fmt_num(new_val)}</b> {unit} (начальное показание не задано)"
     diff = max(0, new_val - prev_val)
-    return f"{label}: {prev_val} → <b>{new_val}</b> {unit} (расход: {diff} {unit})"
+    return f"{label}: {fmt_num(prev_val)} → <b>{fmt_num(new_val)}</b> {unit} (расход: {fmt_num(diff)} {unit})"

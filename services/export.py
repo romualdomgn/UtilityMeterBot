@@ -18,13 +18,15 @@ from database.models import (
     ALL_METERS,
     ELECTRICITY_METERS,
     GAS_METERS,
+    IRRIGATION_METERS,
+    IRRIGATION_MODE_AFTER_COLD,
     METER_PLAIN_LABELS,
     METER_UNITS,
     WATER_METERS,
     format_property_short,
     format_property_title,
 )
-from services.calculations import calculate_billing, fmt_date
+from services.calculations import calculate_billing, fmt_date, fmt_num
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -83,21 +85,56 @@ async def generate_excel_report(apartments: list) -> Path:
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
+        is_irr_after_cold = (
+            billing.irrigation_mode == IRRIGATION_MODE_AFTER_COLD
+            and any(m in billing.meters for m in IRRIGATION_METERS)
+        )
         for mt in ALL_METERS:
             m = billing.meters.get(mt)
             if m:
+                if mt in IRRIGATION_METERS and is_irr_after_cold:
+                    tariff_cell = "по тарифу ХВС"
+                    cost_cell = "в составе ХВС"
+                else:
+                    tariff_cell = float(m.tariff) if m.tariff is not None else "Не задан"
+                    cost_cell = m.cost if (m.has_base and m.has_tariff and m.submitted) else "—"
                 ws.append([
                     METER_PLAIN_LABELS[mt],
                     _fmt_opt(m.previous),
                     _fmt_opt(m.current) if m.submitted else "Не подано",
                     m.consumption,
                     METER_UNITS[mt],
-                    float(m.tariff) if m.tariff is not None else "Не задан",
-                    m.cost if (m.has_base and m.has_tariff and m.submitted) else "—",
+                    tariff_cell,
+                    cost_cell,
                 ])
+
+        if billing.sewerage:
+            sew = billing.sewerage
+            has_gvs = "hot_water" in billing.meters
+            sew_label = (
+                "Водоотведение (ХВС+ГВС−Полив)" if (is_irr_after_cold and has_gvs)
+                else "Водоотведение (ХВС−Полив)" if is_irr_after_cold
+                else "Водоотведение (ХВС+ГВС)"
+            )
+            ws.append([
+                sew_label,
+                "—",
+                "—" if sew.submitted else "Не подано",
+                sew.consumption,
+                "м³",
+                float(sew.tariff) if sew.tariff is not None else "Не задан",
+                sew.cost if (sew.has_base and sew.has_tariff and sew.submitted) else "—",
+            ])
 
         if any(m in billing.meters for m in WATER_METERS):
             ws.append(["Итого вода", "", "", billing.water_consumption_total, "м³", "", billing.water_total])
+        if billing.sewerage:
+            ws.append(["Итого водоотведение", "", "", billing.sewerage_consumption_total, "м³", "", billing.sewerage_total])
+        if any(m in billing.meters for m in IRRIGATION_METERS):
+            if is_irr_after_cold:
+                ws.append(["Полив (вычет из водоотведения)", "", "", billing.irrigation_consumption_total, "м³", "", "в ХВС"])
+            else:
+                ws.append(["Итого полив", "", "", billing.irrigation_consumption_total, "м³", "", billing.irrigation_total])
         if any(m in billing.meters for m in ELECTRICITY_METERS):
             ws.append(["Итого электричество", "", "", billing.electricity_consumption_total, "кВт·ч", "", billing.electricity_total])
         if any(m in billing.meters for m in GAS_METERS):
@@ -171,31 +208,59 @@ async def generate_pdf_report(apartments: list) -> Path:
             pdf.cell(w, 7, h_txt, border=1, align="C")
         pdf.ln()
 
+        is_irr_after_cold = (
+            billing.irrigation_mode == IRRIGATION_MODE_AFTER_COLD
+            and any(m in billing.meters for m in IRRIGATION_METERS)
+        )
         pdf.set_font("DejaVu", "", 9)
         for mt in ALL_METERS:
             m = billing.meters.get(mt)
             if not m:
                 continue
+            if mt in IRRIGATION_METERS and is_irr_after_cold:
+                tariff_str = "= ХВС"
+                cost_str = "в ХВС"
+            else:
+                tariff_str = f"{float(m.tariff):.2f}" if m.tariff is not None else "—"
+                cost_str = str(m.cost) if (m.has_base and m.has_tariff and m.submitted) else "—"
             row = [
                 f"{METER_PLAIN_LABELS[mt]} ({METER_UNITS[mt]})",
                 _fmt_opt(m.previous),
                 _fmt_opt(m.current) if m.submitted else "—",
                 str(m.consumption),
-                f"{float(m.tariff):.2f}" if m.tariff is not None else "—",
-                str(m.cost) if (m.has_base and m.has_tariff and m.submitted) else "—",
+                tariff_str,
+                cost_str,
             ]
             for val, w in zip(row, widths):
                 pdf.cell(w, 7, val, border=1, align="C")
             pdf.ln()
 
+        if billing.sewerage:
+            sew = billing.sewerage
+            sew_row = [
+                "Водоотвед. (м³)",
+                "—",
+                "—",
+                str(sew.consumption),
+                f"{float(sew.tariff):.2f}" if sew.tariff is not None else "—",
+                str(sew.cost) if (sew.has_base and sew.has_tariff and sew.submitted) else "—",
+            ]
+            for val, w in zip(sew_row, widths):
+                pdf.cell(w, 7, val, border=1, align="C")
+            pdf.ln()
+
         totals_parts = []
         if any(m in billing.meters for m in WATER_METERS):
-            totals_parts.append(f"Вода: {billing.water_total} ₽")
+            totals_parts.append(f"Вода: {fmt_num(billing.water_total)} ₽")
+        if billing.sewerage:
+            totals_parts.append(f"Водоотведение: {fmt_num(billing.sewerage_total)} ₽")
+        if any(m in billing.meters for m in IRRIGATION_METERS) and not is_irr_after_cold:
+            totals_parts.append(f"Полив: {fmt_num(billing.irrigation_total)} ₽")
         if any(m in billing.meters for m in ELECTRICITY_METERS):
-            totals_parts.append(f"Электричество: {billing.electricity_total} ₽")
+            totals_parts.append(f"Электричество: {fmt_num(billing.electricity_total)} ₽")
         if any(m in billing.meters for m in GAS_METERS):
-            totals_parts.append(f"Газ: {billing.gas_total} ₽")
-        totals_parts.append(f"ИТОГО: {billing.grand_total} ₽")
+            totals_parts.append(f"Газ: {fmt_num(billing.gas_total)} ₽")
+        totals_parts.append(f"ИТОГО: {fmt_num(billing.grand_total)} ₽")
 
         pdf.set_font("DejaVu", "B", 10)
         pdf.ln(2)

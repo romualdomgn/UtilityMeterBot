@@ -14,10 +14,13 @@ from database.models import (
     format_property_short,
     format_property_title,
     get_apartment_enabled_meters,
+    get_apartment_irrigation_mode,
+    is_apartment_rented,
 )
 from webapp.auth import WebAppUser
 
 PropertyTypeLiteral = Literal["apartment", "house", "dacha"]
+IrrigationModeLiteral = Literal["after_cold", "parallel"]
 
 
 class ProfileUpdateBody(BaseModel):
@@ -28,6 +31,7 @@ class ApartmentCreateBody(BaseModel):
     number: str
     property_type: PropertyTypeLiteral = "apartment"
     enabled_meters: list[str] | None = None
+    irrigation_mode: IrrigationModeLiteral = "parallel"
     family_id: int | None = None
 
 
@@ -39,6 +43,7 @@ class ApartmentSettingsBody(BaseModel):
     number: str | None = None
     property_type: PropertyTypeLiteral | None = None
     enabled_meters: list[str] | None = None
+    irrigation_mode: IrrigationModeLiteral | None = None
     water_submission_day: int | None = None
     electricity_submission_day: int | None = None
     gas_submission_day: int | None = None
@@ -48,6 +53,8 @@ class ApartmentSettingsBody(BaseModel):
 class InitialReadingsBody(BaseModel):
     cold_water: int | None = None
     hot_water: int | None = None
+    irrigation: int | None = None
+    t: int | None = None
     t1: int | None = None
     t2: int | None = None
     t3: int | None = None
@@ -57,10 +64,12 @@ class InitialReadingsBody(BaseModel):
 class WaterReadingBody(BaseModel):
     cold_water: int | None = None
     hot_water: int | None = None
+    irrigation: int | None = None
     force: bool = False
 
 
 class ElectricityReadingBody(BaseModel):
+    t: int | None = None
     t1: int | None = None
     t2: int | None = None
     t3: int | None = None
@@ -114,15 +123,15 @@ def parse_iso_date(raw: str | None) -> datetime.date | None:
     if not raw or not raw.strip():
         return None
     raw = raw.strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y"):
         try:
             return datetime.datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
-    raise HTTPException(400, f"Неверный формат даты: {raw}")
+    raise HTTPException(400, f"Неверный формат даты: {raw} (ожидается ДД/ММ/ГГГГ)")
 
 
-def serialize_apartment(apt) -> dict:
+def serialize_apartment(apt, has_linked_tenants: bool = False) -> dict:
     ptype = getattr(apt, "property_type", None) or "apartment"
     return {
         "id": apt.id,
@@ -133,8 +142,10 @@ def serialize_apartment(apt) -> dict:
         "display_name": format_property_short(apt),
         "full_title": format_property_title(apt),
         "enabled_meters": get_apartment_enabled_meters(apt),
+        "irrigation_mode": get_apartment_irrigation_mode(apt),
         "family_id": apt.family_id,
         "has_tenant": apt.has_tenant,
+        "is_rented": is_apartment_rented(apt, has_linked_tenants=has_linked_tenants),
         "agreement_no": apt.agreement_no,
         "agreement_date_start": apt.agreement_date_start.isoformat() if apt.agreement_date_start else None,
         "agreement_date_finish": apt.agreement_date_finish.isoformat() if apt.agreement_date_finish else None,

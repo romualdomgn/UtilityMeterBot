@@ -34,6 +34,7 @@ APARTMENT_MIGRATIONS = (
     ("enabled_meters", "ALTER TABLE apartments ADD COLUMN enabled_meters TEXT"),
     ("gas_submission_day", "ALTER TABLE apartments ADD COLUMN gas_submission_day INTEGER"),
     ("sort_order", "ALTER TABLE apartments ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"),
+    ("irrigation_mode", "ALTER TABLE apartments ADD COLUMN irrigation_mode VARCHAR(20) NOT NULL DEFAULT 'parallel'"),
 )
 
 

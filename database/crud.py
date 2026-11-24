@@ -11,6 +11,7 @@ from sqlalchemy import and_, desc, extract, func, select
 import config
 from database.models import (
     ALL_METERS,
+    ALL_TARIFF_TYPES,
     Apartment,
     ApartmentUser,
     AuditLog,
@@ -27,6 +28,7 @@ ALLOWED_APARTMENT_FIELDS = frozenset({
     "number",
     "property_type",
     "enabled_meters",
+    "irrigation_mode",
     "has_tenant",
     "agreement_no",
     "agreement_date_start",
@@ -235,6 +237,7 @@ async def create_apartment(
     family_id: int,
     property_type: str = "apartment",
     enabled_meters: Iterable[str] | None = None,
+    irrigation_mode: str = "parallel",
 ) -> Apartment:
     meters_str = serialize_enabled_meters(enabled_meters) if enabled_meters is not None else None
     async with UnitOfWork() as s:
@@ -245,6 +248,7 @@ async def create_apartment(
             family_id=family_id,
             property_type=property_type,
             enabled_meters=meters_str or None,
+            irrigation_mode=irrigation_mode,
             sort_order=next_order,
         )
         s.add(apt)
@@ -315,6 +319,17 @@ async def get_apartment_tenants(apartment_id: int) -> list[User]:
         return list(res.scalars().all())
 
 
+async def get_apartment_ids_with_tenants() -> set[int]:
+    """Return IDs of properties that have at least one linked tenant."""
+    async with UnitOfWork() as s:
+        res = await s.execute(
+            select(ApartmentUser.apartment_id)
+            .where(ApartmentUser.role == "tenant")
+            .distinct()
+        )
+        return {int(row) for row in res.scalars().all()}
+
+
 async def get_apartment_owners(apartment_id: int) -> list[User]:
     async with UnitOfWork() as s:
         res = await s.execute(
@@ -374,7 +389,7 @@ async def get_all_tariffs(
 ) -> dict[str, Tariff | None]:
     """Fetch latest effective tariff per meter in a single session and query."""
     target_date = as_of_date or config.local_today()
-    result: dict[str, Tariff | None] = {mt: None for mt in ALL_METERS}
+    result: dict[str, Tariff | None] = {mt: None for mt in ALL_TARIFF_TYPES}
     async with UnitOfWork() as s:
         res = await s.execute(
             select(Tariff)

@@ -27,10 +27,20 @@ def utcnow_naive() -> datetime.datetime:
 
 
 WATER_METERS = ("cold_water", "hot_water")
-ELECTRICITY_METERS = ("t1", "t2", "t3")
+IRRIGATION_METERS = ("irrigation",)
+WATER_SUBMISSION_METERS = WATER_METERS + IRRIGATION_METERS
+SINGLE_ELECTRICITY_METER = "t"
+MULTI_ELECTRICITY_METERS = ("t1", "t2", "t3")
+ELECTRICITY_METERS = (SINGLE_ELECTRICITY_METER,) + MULTI_ELECTRICITY_METERS
 GAS_METERS = ("gas",)
-LEGACY_METERS = WATER_METERS + ELECTRICITY_METERS
-ALL_METERS = WATER_METERS + ELECTRICITY_METERS + GAS_METERS
+LEGACY_METERS = WATER_METERS + MULTI_ELECTRICITY_METERS
+ALL_METERS = WATER_METERS + IRRIGATION_METERS + ELECTRICITY_METERS + GAS_METERS
+SEWERAGE_TARIFF = "sewerage"
+ALL_TARIFF_TYPES = ALL_METERS + (SEWERAGE_TARIFF,)
+
+IRRIGATION_MODE_AFTER_COLD = "after_cold"
+IRRIGATION_MODE_PARALLEL = "parallel"
+IRRIGATION_MODES = (IRRIGATION_MODE_AFTER_COLD, IRRIGATION_MODE_PARALLEL)
 
 PROPERTY_TYPES = {
     "apartment": "Квартира",
@@ -53,6 +63,8 @@ PROPERTY_ICONS = {
 METER_LABELS = {
     "cold_water": "💧 ХВС",
     "hot_water": "♨️ ГВС",
+    "irrigation": "🌱 Полив",
+    "t": "⚡ Т",
     "t1": "⚡ Т1",
     "t2": "⚡ Т2",
     "t3": "⚡ Т3",
@@ -62,6 +74,8 @@ METER_LABELS = {
 METER_PLAIN_LABELS = {
     "cold_water": "ХВС",
     "hot_water": "ГВС",
+    "irrigation": "Полив",
+    "t": "Т",
     "t1": "Т1",
     "t2": "Т2",
     "t3": "Т3",
@@ -71,10 +85,22 @@ METER_PLAIN_LABELS = {
 METER_UNITS = {
     "cold_water": "м³",
     "hot_water": "м³",
+    "irrigation": "м³",
+    "t": "кВт·ч",
     "t1": "кВт·ч",
     "t2": "кВт·ч",
     "t3": "кВт·ч",
     "gas": "м³",
+}
+
+TARIFF_LABELS = {
+    **METER_LABELS,
+    SEWERAGE_TARIFF: "🚰 Водоотведение",
+}
+
+TARIFF_PLAIN_LABELS = {
+    **METER_PLAIN_LABELS,
+    SEWERAGE_TARIFF: "Водоотведение",
 }
 
 
@@ -95,6 +121,14 @@ def get_apartment_enabled_meters(apt) -> list[str]:
     return ordered or list(LEGACY_METERS)
 
 
+def get_apartment_irrigation_mode(apt) -> str:
+    """Return irrigation meter connection mode ('after_cold' or 'parallel')."""
+    mode = getattr(apt, "irrigation_mode", None)
+    if mode in IRRIGATION_MODES:
+        return mode
+    return IRRIGATION_MODE_PARALLEL
+
+
 def format_property_short(apt) -> str:
     """Compact human-readable property label, e.g. 'Кв. №371', 'Дом 12', 'Дача уч. 5'."""
     ptype = getattr(apt, "property_type", None) or "apartment"
@@ -113,6 +147,24 @@ def format_property_title(apt) -> str:
         return f"Квартира №{number}"
     label = PROPERTY_TYPES.get(ptype, "Квартира")
     return f"{label} {number}".strip()
+
+
+def has_apartment_contract(apt) -> bool:
+    """Return True if any lease contract field is populated."""
+    return bool(
+        (getattr(apt, "agreement_no", None) or "").strip()
+        or getattr(apt, "agreement_date_start", None)
+        or getattr(apt, "agreement_date_finish", None)
+    )
+
+
+def is_apartment_rented(apt, has_linked_tenants: bool = False) -> bool:
+    """Property is considered rented when a contract, a tenant, or both are present."""
+    return bool(
+        getattr(apt, "has_tenant", False)
+        or has_linked_tenants
+        or has_apartment_contract(apt)
+    )
 
 
 class Base(DeclarativeBase):
@@ -163,6 +215,9 @@ class Apartment(Base):
     number: Mapped[str] = mapped_column(String(50), nullable=False)
     property_type: Mapped[str] = mapped_column(String(20), nullable=False, default="apartment")
     enabled_meters: Mapped[str | None] = mapped_column(Text, nullable=True)
+    irrigation_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=IRRIGATION_MODE_PARALLEL
+    )
     family_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("families.id", ondelete="CASCADE"), nullable=False
     )
