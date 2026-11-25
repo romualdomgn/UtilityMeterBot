@@ -29,10 +29,33 @@ const VERIFY_INTERVALS = [
 ];
 
 const PROPERTY_TYPES = [
-  { id: "apartment", icon: "🏢", label: "Квартира", numLabel: "Номер квартиры", placeholder: "Например: 371" },
-  { id: "house", icon: "🏡", label: "Дом", numLabel: "Адрес или номер дома", placeholder: "Например: Лесная, 12" },
-  { id: "dacha", icon: "🌿", label: "Дача", numLabel: "Название или номер участка", placeholder: "Например: СНТ Весна, уч. 45" },
+  { id: "apartment", icon: "🏢", label: "Квартира", numLabel: "Номер квартиры", placeholder: "Например: 371", inLocative: "в квартире" },
+  { id: "house", icon: "🏡", label: "Дом", numLabel: "Адрес или номер дома", placeholder: "Например: Лесная, 12", inLocative: "в доме" },
+  { id: "dacha", icon: "🌿", label: "Дача", numLabel: "Название или номер участка", placeholder: "Например: СНТ Весна, уч. 45", inLocative: "на даче" },
 ];
+
+const METER_DEVICE_LABELS = {
+  cold_water: "💧 Водомер холодной воды",
+  hot_water: "♨️ Водомер горячей воды",
+  irrigation: "🌱 Полив",
+  t: "⚡ Электрический счётчик",
+  gas: "🔥 Газ",
+};
+
+function getPhysicalMeterDevices(enabledMeters) {
+  const result = [];
+  let elecAdded = false;
+  for (const mt of enabledMeters) {
+    if (mt === "t" || MULTI_ELEC_IDS.includes(mt)) {
+      if (elecAdded) continue;
+      elecAdded = true;
+      result.push("t");
+    } else {
+      result.push(mt);
+    }
+  }
+  return result;
+}
 
 const METER_META = [
   { id: "cold_water", group: "water", label: "💧 ХВС", plain: "ХВС", unit: "м³", tariffLabel: "💧 ХВС (руб/м³)" },
@@ -575,7 +598,6 @@ function openEditOwnNameModal() {
       <input type="text" id="own-name-input" maxlength="120" value="${esc(state.user.name)}" placeholder="Введите имя" />
     </div>
   `, [
-    { label: "Отмена", cls: "btn-secondary" },
     {
       id: "modal-save-own-name",
       label: "Сохранить",
@@ -596,6 +618,7 @@ function openEditOwnNameModal() {
         }
       },
     },
+    { label: "Отмена", cls: "btn-secondary" },
   ]);
 
   const inputEl = document.getElementById("own-name-input");
@@ -750,16 +773,16 @@ function getNavItems() {
     return [
       { id: "dashboard", ico: "📊", label: "Обзор" },
       { id: "submit", ico: "💧", label: "Подать" },
-      { id: "apartments", ico: "🏘", label: "Недвижимость" },
+      { id: "apartments", ico: "🌆", label: "Недвижимость" },
       { id: "history", ico: "📜", label: "История" },
-      { id: "families", ico: "👥", label: "Люди" },
+      { id: "families", ico: "👨‍👩‍👧‍👦", label: "Люди" },
     ];
   }
   return [
     { id: "dashboard", ico: "📊", label: "Обзор" },
     { id: "submit", ico: "💧", label: "Подать" },
-    { id: "apartments", ico: "🏘", label: "Недвижимость" },
-    { id: "families", ico: "👥", label: "Люди" },
+    { id: "apartments", ico: "🌆", label: "Недвижимость" },
+    { id: "families", ico: "👨‍👩‍👧‍👦", label: "Люди" },
     { id: "admin", ico: "🔧", label: "Управление" },
   ];
 }
@@ -956,56 +979,38 @@ function renderDashboard(root) {
   let sewerageInserted = false;
   const meterList = Object.values(billing.meters);
   meterList.forEach((m, idx) => {
-    meterRows.push(renderMeterRow(m, isTenant, irrMode));
+    meterRows.push(renderMeterRow(m, false, irrMode));
     const isDomWater = m.meter_type === "cold_water" || m.meter_type === "hot_water";
     const nextIsDomWater = meterList[idx + 1] && (meterList[idx + 1].meter_type === "cold_water" || meterList[idx + 1].meter_type === "hot_water");
-    if (!isTenant && billing.sewerage && isDomWater && !nextIsDomWater && !sewerageInserted) {
+    if (billing.sewerage && isDomWater && !nextIsDomWater && !sewerageInserted) {
       meterRows.push(renderSewerageRow(billing.sewerage, billing));
       sewerageInserted = true;
     }
   });
-  if (!isTenant && billing.sewerage && !sewerageInserted) {
+  if (billing.sewerage && !sewerageInserted) {
     meterRows.push(renderSewerageRow(billing.sewerage, billing));
   }
   const rows = meterRows.join("");
 
   const statBoxes = [];
-  if (isTenant) {
-    if (hasDomesticWater) {
-      statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${fmtNum(billing.water_consumption_total)} м³</div></div>`);
-    }
-    if (hasIrrigation) {
-      statBoxes.push(`<div class="stat-box"><div class="label">🌱 Полив</div><div class="val">${fmtNum(billing.irrigation_consumption_total || 0)} м³</div></div>`);
-    }
-    if (groups.includes("electricity")) {
-      statBoxes.push(`<div class="stat-box"><div class="label">⚡ Электричество</div><div class="val">${fmtNum(billing.electricity_consumption_total)} кВт·ч</div></div>`);
-    }
-    if (groups.includes("gas")) {
-      statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${fmtNum(billing.gas_consumption_total)} м³</div></div>`);
-    }
-    if (statBoxes.length > 2 && statBoxes.length % 2 === 1) {
-      statBoxes[statBoxes.length - 1] = statBoxes[statBoxes.length - 1].replace('class="stat-box"', 'class="stat-box stat-box-wide"');
-    }
-  } else {
-    if (hasDomesticWater) {
-      statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${fmtNum(billing.water_total)} ₽</div></div>`);
-    }
-    if (billing.sewerage) {
-      statBoxes.push(`<div class="stat-box"><div class="label">🚰 Водоотведение</div><div class="val">${fmtNum(billing.sewerage_total)} ₽</div></div>`);
-    }
-    if (hasIrrigation && irrMode !== "after_cold") {
-      statBoxes.push(`<div class="stat-box"><div class="label">🌱 Полив</div><div class="val">${fmtNum(billing.irrigation_total || 0)} ₽</div></div>`);
-    }
-    if (groups.includes("electricity")) {
-      statBoxes.push(`<div class="stat-box"><div class="label">⚡ Электричество</div><div class="val">${fmtNum(billing.electricity_total)} ₽</div></div>`);
-    }
-    if (groups.includes("gas")) {
-      statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${fmtNum(billing.gas_total)} ₽</div></div>`);
-    }
-    const isTotalWide = statBoxes.length >= 2 && statBoxes.length % 2 === 0;
-    const totalLbl = billing.is_complete === false ? "💰 Итого (предв.)" : "💰 Итого";
-    statBoxes.push(`<div class="stat-box ${isTotalWide ? "stat-box-wide" : ""}"><div class="label">${totalLbl}</div><div class="val">${fmtNum(billing.grand_total)} ₽</div></div>`);
+  if (hasDomesticWater) {
+    statBoxes.push(`<div class="stat-box"><div class="label">💧 Вода</div><div class="val">${fmtNum(billing.water_total)} ₽</div></div>`);
   }
+  if (billing.sewerage) {
+    statBoxes.push(`<div class="stat-box"><div class="label">🚰 Водоотведение</div><div class="val">${fmtNum(billing.sewerage_total)} ₽</div></div>`);
+  }
+  if (hasIrrigation && irrMode !== "after_cold") {
+    statBoxes.push(`<div class="stat-box"><div class="label">🌱 Полив</div><div class="val">${fmtNum(billing.irrigation_total || 0)} ₽</div></div>`);
+  }
+  if (groups.includes("electricity")) {
+    statBoxes.push(`<div class="stat-box"><div class="label">⚡ Электричество</div><div class="val">${fmtNum(billing.electricity_total)} ₽</div></div>`);
+  }
+  if (groups.includes("gas")) {
+    statBoxes.push(`<div class="stat-box"><div class="label">🔥 Газ</div><div class="val">${fmtNum(billing.gas_total)} ₽</div></div>`);
+  }
+  const isTotalWide = statBoxes.length >= 2 && statBoxes.length % 2 === 0;
+  const totalLbl = billing.is_complete === false ? "💰 Итого (предв.)" : "💰 Итого";
+  statBoxes.push(`<div class="stat-box ${isTotalWide ? "stat-box-wide" : ""}"><div class="label">${totalLbl}</div><div class="val">${fmtNum(billing.grand_total)} ₽</div></div>`);
   const statGridClass = statBoxes.length >= 2 ? "grid-2" : "";
 
   const quickButtons = [];
@@ -1026,7 +1031,7 @@ function renderDashboard(root) {
         : `📄 Договор: ${esc(apt.agreement_no || "—")} · ${fmtDate(apt.agreement_date_start)} — ${fmtDate(apt.agreement_date_finish)}`)
     : "";
 
-  const incompleteBannerHtml = (!isTenant && billing.is_complete === false && billing.incomplete_reasons?.length)
+  const incompleteBannerHtml = (billing.is_complete === false && billing.incomplete_reasons?.length)
     ? `<div class="incomplete-banner">ℹ️ Предварительный расчёт: ${esc(billing.incomplete_reasons.join(", "))}</div>`
     : "";
 
@@ -1367,13 +1372,13 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
     if (res.needs_confirm) {
       if (btn) btn.disabled = false;
       return openModal("⚠️ Повторная подача за этот месяц", `<p>${esc(res.warning)}</p>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Сохранить",
           onClick: () => {
             submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id);
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     }
 
@@ -1492,7 +1497,6 @@ async function renderHistory(root, renderSeq = state.tabRenderSeq) {
         <p class="small muted">${esc(btn.dataset.lbl)}</p>
         <div class="field"><label>Новое целое значение</label><input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="corr-val" value="${esc(formatIntSpaces(btn.dataset.val))}" /></div>
       `, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           id: "modal-save-corr",
           label: "Сохранить",
@@ -1508,6 +1512,7 @@ async function renderHistory(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
 
       const corrInput = document.getElementById("corr-val");
@@ -1642,12 +1647,13 @@ function renderPhoto(root) {
   };
 }
 
-// ── Meters Management & Replacement Modals (Счётчики / Замена) ────────
+// ── Settings & Meters Management Modals ───────────────────────────────
 async function openMetersModal(aptId) {
   const apt = state.aptDetail?.apartment;
   if (!apt || apt.id !== aptId) return;
   const enabled = getEnabledMeters(apt);
-  if (!enabled.length) {
+  const physicalDevices = getPhysicalMeterDevices(enabled);
+  if (!physicalDevices.length) {
     return showToast("Для объекта не подключено ни одного счётчика", "error");
   }
 
@@ -1662,25 +1668,25 @@ async function openMetersModal(aptId) {
 
   const devMap = new Map(devices.map(d => [d.meter_type, d]));
   const selectedIntervals = {};
-  enabled.forEach(mt => {
+  physicalDevices.forEach(mt => {
     const d = devMap.get(mt);
     selectedIntervals[mt] = new Set(Array.isArray(d?.notify_intervals) ? d.notify_intervals : []);
   });
 
-  const cardsHtml = enabled.map(mt => {
-    const meta = METER_META.find(m => m.id === mt) || { id: mt, label: mt };
+  const cardsHtml = physicalDevices.map(mt => {
+    const label = METER_DEVICE_LABELS[mt] || mt;
     const dev = devMap.get(mt) || {};
     const activeSet = selectedIntervals[mt];
     return `
       <div class="meter-device-card" data-dev-mt="${mt}">
-        <h4>${esc(meta.label)}</h4>
+        <h4>${esc(label)}</h4>
         <div class="field">
           <label>Номер счётчика (необязательно)</label>
           <input type="text" id="md-ser-${mt}" maxlength="100" placeholder="Например: 12345678" value="${esc(dev.serial_number || "")}" />
         </div>
         <div class="field">
           <label>Срок поверки (ДД/ММ/ГГГГ)</label>
-          ${dateFieldHtml(`md-due-${mt}`, `md-due-nat-${mt}`, dev.verification_due_date || "", `Срок поверки ${meta.label}`)}
+          ${dateFieldHtml(`md-due-${mt}`, `md-due-nat-${mt}`, dev.verification_due_date || "", `Срок поверки ${label}`)}
         </div>
         <div class="field" style="margin-bottom:0">
           <label>Уведомить о поверке или замене счётчика</label>
@@ -1703,19 +1709,18 @@ async function openMetersModal(aptId) {
     <div class="mt-8">${cardsHtml}</div>
   `;
 
-  openModal(`🔧 Счётчики — ${propShort(apt)}`, bodyHtml, [
-    { label: "Отмена", cls: "btn-secondary" },
+  openModal(`🔧 Управление счётчиками — ${propShort(apt)}`, bodyHtml, [
     {
       label: "💾 Сохранить",
       onClick: async () => {
         const items = [];
-        for (const mt of enabled) {
-          const meta = METER_META.find(m => m.id === mt) || { plain: mt };
+        for (const mt of physicalDevices) {
+          const label = METER_DEVICE_LABELS[mt] || mt;
           const serial = (document.getElementById(`md-ser-${mt}`)?.value || "").trim() || null;
           const dueRaw = document.getElementById(`md-due-${mt}`)?.value || "";
           const parsedDue = parseDisplayDate(dueRaw);
           if (!parsedDue.ok) {
-            showToast(`❌ ${meta.plain}: ${parsedDue.error}`, "error");
+            showToast(`❌ ${label}: ${parsedDue.error}`, "error");
             return false;
           }
           items.push({
@@ -1735,9 +1740,10 @@ async function openMetersModal(aptId) {
         }
       },
     },
+    { label: "Отмена", cls: "btn-secondary" },
   ]);
 
-  enabled.forEach(mt => attachDateField(`md-due-${mt}`, `md-due-nat-${mt}`));
+  physicalDevices.forEach(mt => attachDateField(`md-due-${mt}`, `md-due-nat-${mt}`));
 
   document.querySelectorAll(".notify-chip").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1764,37 +1770,63 @@ function openReplaceMeterModal(aptId) {
   const apt = state.aptDetail?.apartment;
   if (!apt || apt.id !== aptId) return;
   const enabled = getEnabledMeters(apt);
+  const physicalDevices = getPhysicalMeterDevices(enabled);
+  const multiElecEnabled = MULTI_ELEC_IDS.filter(id => enabled.includes(id));
   const prev = state.aptDetail?.prev_readings || {};
 
-  const optionsHtml = enabled.map(mt => {
-    const meta = METER_META.find(m => m.id === mt) || { label: mt };
-    return `<option value="${mt}">${esc(meta.label)}</option>`;
+  const optionsHtml = physicalDevices.map(mt => {
+    const label = METER_DEVICE_LABELS[mt] || mt;
+    return `<option value="${mt}">${esc(label)}</option>`;
   }).join("");
 
-  const firstMt = enabled[0];
-  const prevInfoText = (mt) => {
-    const meta = METER_META.find(m => m.id === mt) || { unit: "" };
-    const pv = prev[mt];
-    return pv === null || pv === undefined
+  const renderValueFields = (selectedDevice) => {
+    const isMultiElec = selectedDevice === "t" && multiElecEnabled.length > 0;
+    if (isMultiElec) {
+      return multiElecEnabled.map(mt => {
+        const meta = METER_META.find(m => m.id === mt) || { plain: mt, unit: "кВт·ч" };
+        const pv = prev[mt];
+        const pvTxt = pv === null || pv === undefined ? "не задано" : `${fmtNum(pv)} ${meta.unit}`;
+        return `
+          <div class="meter-device-card">
+            <h4>${esc(meta.label)} <span class="small muted">(последнее: ${esc(pvTxt)})</span></h4>
+            <div class="grid-2">
+              <div class="field" style="margin-bottom:0">
+                <label>Старый (финал)</label>
+                <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-old-${mt}" placeholder="Финал" />
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label>Новый (старт)</label>
+                <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-new-${mt}" value="0" placeholder="0" />
+              </div>
+            </div>
+          </div>`;
+      }).join("");
+    }
+    const meta = METER_META.find(m => m.id === selectedDevice) || { unit: "" };
+    const pv = prev[selectedDevice];
+    const pvTxt = pv === null || pv === undefined
       ? "Последнее показание не задано"
       : `Последнее зафиксированное показание: ${fmtNum(pv)} ${meta.unit}`;
+    return `
+      <div class="small muted" style="margin-bottom:8px">${esc(pvTxt)}</div>
+      <div class="field">
+        <label>Конечное показание старого счётчика</label>
+        <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-old-final" placeholder="Например: 12 480" />
+      </div>
+      <div class="field">
+        <label>Начальное показание нового счётчика</label>
+        <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-new-init" value="0" placeholder="Например: 0" />
+      </div>`;
   };
 
+  const firstDev = physicalDevices[0];
   openModal(`🔄 Замена счётчика — ${propShort(apt)}`, `
     <p class="small muted">Остаток потребления по старому счётчику будет учтён в текущем месяце, а дальнейший расчёт пойдёт с начального показания нового счётчика.</p>
     <div class="field mt-8">
       <label>Выберите счётчик для замены</label>
       <select id="rep-meter-type">${optionsHtml}</select>
-      <div id="rep-prev-hint" class="small muted mt-8">${esc(prevInfoText(firstMt))}</div>
     </div>
-    <div class="field">
-      <label>Конечное показание старого счётчика</label>
-      <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-old-final" placeholder="Например: 12 480" />
-    </div>
-    <div class="field">
-      <label>Начальное показание нового счётчика</label>
-      <input type="text" inputmode="numeric" autocomplete="off" class="int-mask" id="rep-new-init" value="0" placeholder="Например: 0" />
-    </div>
+    <div id="rep-values-wrap">${renderValueFields(firstDev)}</div>
     <div class="field">
       <label>Номер нового счётчика (необязательно)</label>
       <input type="text" id="rep-new-serial" maxlength="100" placeholder="Например: 87654321" />
@@ -1804,39 +1836,63 @@ function openReplaceMeterModal(aptId) {
       ${dateFieldHtml("rep-new-due", "rep-new-due-nat", "", "Срок поверки нового счётчика")}
     </div>
   `, [
-    { label: "Отмена", cls: "btn-secondary" },
     {
       label: "✅ Выполнить замену",
       onClick: async () => {
-        const mt = document.getElementById("rep-meter-type").value;
-        const oldParsed = parseIntSpaces(document.getElementById("rep-old-final").value);
-        if (oldParsed.empty || !oldParsed.ok) {
-          showToast(oldParsed.error || "Укажите конечное показание старого счётчика", "error");
-          return false;
-        }
-        const newParsed = parseIntSpaces(document.getElementById("rep-new-init").value);
-        if (newParsed.empty || !newParsed.ok) {
-          showToast(newParsed.error || "Укажите начальное показание нового счётчика", "error");
-          return false;
-        }
+        const devMt = document.getElementById("rep-meter-type").value;
         const dueParsed = parseDisplayDate(document.getElementById("rep-new-due").value);
         if (!dueParsed.ok) {
           showToast(dueParsed.error, "error");
           return false;
         }
         const newSerial = (document.getElementById("rep-new-serial").value || "").trim() || null;
+        const isMultiElec = devMt === "t" && multiElecEnabled.length > 0;
+
+        let body;
+        if (isMultiElec) {
+          const entries = [];
+          for (const mt of multiElecEnabled) {
+            const meta = METER_META.find(m => m.id === mt) || { plain: mt };
+            const oldP = parseIntSpaces(document.getElementById(`rep-old-${mt}`)?.value);
+            if (oldP.empty || !oldP.ok) {
+              showToast(`${meta.plain}: ${oldP.error || "укажите конечное показание старого счётчика"}`, "error");
+              return false;
+            }
+            const newP = parseIntSpaces(document.getElementById(`rep-new-${mt}`)?.value);
+            if (newP.empty || !newP.ok) {
+              showToast(`${meta.plain}: ${newP.error || "укажите начальное показание нового счётчика"}`, "error");
+              return false;
+            }
+            entries.push({ meter_type: mt, old_final_value: oldP.value, new_initial_value: newP.value });
+          }
+          body = {
+            meter_type: "t",
+            tariff_entries: entries,
+            new_serial_number: newSerial,
+            new_verification_due_date: dueParsed.display,
+          };
+        } else {
+          const oldParsed = parseIntSpaces(document.getElementById("rep-old-final")?.value);
+          if (oldParsed.empty || !oldParsed.ok) {
+            showToast(oldParsed.error || "Укажите конечное показание старого счётчика", "error");
+            return false;
+          }
+          const newParsed = parseIntSpaces(document.getElementById("rep-new-init")?.value);
+          if (newParsed.empty || !newParsed.ok) {
+            showToast(newParsed.error || "Укажите начальное показание нового счётчика", "error");
+            return false;
+          }
+          body = {
+            meter_type: devMt,
+            old_final_value: oldParsed.value,
+            new_initial_value: newParsed.value,
+            new_serial_number: newSerial,
+            new_verification_due_date: dueParsed.display,
+          };
+        }
 
         try {
-          await api(`/api/apartments/${aptId}/meters/replace`, {
-            method: "POST",
-            body: {
-              meter_type: mt,
-              old_final_value: oldParsed.value,
-              new_initial_value: newParsed.value,
-              new_serial_number: newSerial,
-              new_verification_due_date: dueParsed.display,
-            },
-          });
+          await api(`/api/apartments/${aptId}/meters/replace`, { method: "POST", body });
           showToast("✅ Замена счётчика зафиксирована");
           await loadApartmentDetail(aptId);
           await renderTab();
@@ -1846,12 +1902,289 @@ function openReplaceMeterModal(aptId) {
         }
       },
     },
+    { label: "Отмена", cls: "btn-secondary" },
   ]);
 
   attachDateField("rep-new-due", "rep-new-due-nat");
   document.getElementById("rep-meter-type")?.addEventListener("change", (e) => {
-    const hint = document.getElementById("rep-prev-hint");
-    if (hint) hint.textContent = prevInfoText(e.target.value);
+    const wrap = document.getElementById("rep-values-wrap");
+    if (!wrap) return;
+    wrap.innerHTML = renderValueFields(e.target.value);
+    wrap.querySelectorAll(".int-mask").forEach(attachIntMask);
+  });
+}
+
+function openEnabledMetersModal(aptId, activePropertyType) {
+  const apt = state.aptDetail?.apartment;
+  if (!apt || apt.id !== aptId) return;
+  const ptype = activePropertyType || apt.property_type || "apartment";
+  const pmeta = getPropertyMeta(ptype);
+  const enabled = getEnabledMeters(apt);
+  const initialIrrMode = apt.irrigation_mode || "parallel";
+
+  const getSnap = () => JSON.stringify({
+    meters: sel.getEnabledMeters(),
+    irr: sel.getEnabledMeters().includes("irrigation") ? sel.getIrrigationMode() : "parallel",
+  });
+
+  let initialSnap = "";
+  const doSave = async () => {
+    const enabledMeters = sel.getEnabledMeters();
+    if (!enabledMeters.length) {
+      showToast("Выберите хотя бы один счётчик", "error");
+      return false;
+    }
+    const irrMode = sel.getIrrigationMode();
+    try {
+      await api(`/api/apartments/${aptId}/settings`, {
+        method: "PUT",
+        body: {
+          property_type: ptype,
+          enabled_meters: enabledMeters,
+          irrigation_mode: irrMode,
+        },
+      });
+      showToast("✅ Состав счётчиков сохранён");
+      const me = await api("/api/me");
+      state.apartments = me.apartments;
+      renderAptSelector();
+      await loadApartmentDetail(aptId);
+      await renderTab();
+      return true;
+    } catch (err) {
+      showToast("❌ " + err.message, "error");
+      return false;
+    }
+  };
+
+  openModal(
+    `🚰 Счётчики ${pmeta.inLocative} — ${propShort(apt)}`,
+    renderMeterSelectorHtml("editm", enabled, ptype, initialIrrMode),
+    [
+      {
+        id: "modal-save-enabled-meters",
+        label: "💾 Сохранить",
+        disabled: true,
+        onClick: async () => {
+          const enabledMeters = sel.getEnabledMeters();
+          if (!enabledMeters.length) {
+            showToast("Выберите хотя бы один счётчик", "error");
+            return false;
+          }
+          const irrMode = sel.getIrrigationMode();
+          const irrChanged = enabledMeters.includes("irrigation") && irrMode !== initialIrrMode;
+          if (irrChanged && (state.aptDetail?.readings_count || 0) > 0) {
+            closeModal(true);
+            openModal("⚠️ Изменение схемы полива", `
+              <p>По объекту уже есть сохранённые показания. Изменение схемы подключения полива повлияет на расчёт водоотведения за исторические периоды.</p>
+              <p class="small muted">Вы уверены, что хотите сохранить изменения?</p>
+            `, [
+              { label: "💾 Сохранить", onClick: doSave },
+              { label: "Отмена", cls: "btn-secondary" },
+            ]);
+            return false;
+          }
+          return await doSave();
+        },
+      },
+      { label: "Отмена", cls: "btn-secondary" },
+    ]
+  );
+
+  const saveBtn = document.getElementById("modal-save-enabled-meters");
+  const updateDirty = () => {
+    if (!saveBtn || !initialSnap) return;
+    const ms = sel.getEnabledMeters();
+    saveBtn.disabled = !ms.length || getSnap() === initialSnap;
+  };
+  const sel = wireMeterSelector("editm", detectElectricityMode(enabled), updateDirty, initialIrrMode);
+  initialSnap = getSnap();
+  updateDirty();
+}
+
+function openSubmissionDaysModal(aptId) {
+  const apt = state.aptDetail?.apartment;
+  if (!apt || apt.id !== aptId) return;
+  const checked = new Set(getEnabledMeters(apt));
+  const hasWaterAny = checked.has("cold_water") || checked.has("hot_water") || checked.has("irrigation");
+  const hasE = checked.has("t") || checked.has("t1") || checked.has("t2") || checked.has("t3");
+  const hasG = checked.has("gas");
+
+  if (!hasWaterAny && !hasE && !hasG) {
+    return showToast("Сначала выберите хотя бы один счётчик для объекта", "error");
+  }
+
+  const bodyHtml = `
+    <p class="small muted">Выберите день отправки показаний счётчиков (с 1 по 31 число)</p>
+    <div class="mt-8">
+      ${hasWaterAny ? `<div class="field"><label>💧 Вода</label><input type="number" min="1" max="31" id="m-wday" placeholder="1–31" value="${apt.water_submission_day ?? ""}" /></div>` : ""}
+      ${hasE ? `<div class="field"><label>⚡ Электричество</label><input type="number" min="1" max="31" id="m-eday" placeholder="1–31" value="${apt.electricity_submission_day ?? ""}" /></div>` : ""}
+      ${hasG ? `<div class="field"><label>🔥 Газ</label><input type="number" min="1" max="31" id="m-gday" placeholder="1–31" value="${apt.gas_submission_day ?? ""}" /></div>` : ""}
+    </div>
+  `;
+
+  const readSnap = () => JSON.stringify({
+    w: hasWaterAny ? (document.getElementById("m-wday")?.value || "").trim() : null,
+    e: hasE ? (document.getElementById("m-eday")?.value || "").trim() : null,
+    g: hasG ? (document.getElementById("m-gday")?.value || "").trim() : null,
+  });
+
+  openModal(`📅 Дни подачи показаний — ${propShort(apt)}`, bodyHtml, [
+    {
+      id: "modal-save-days",
+      label: "💾 Сохранить",
+      disabled: true,
+      onClick: async () => {
+        const body = {};
+        if (hasWaterAny) {
+          const v = (document.getElementById("m-wday")?.value || "").trim();
+          body.water_submission_day = v ? Number(v) : null;
+        }
+        if (hasE) {
+          const v = (document.getElementById("m-eday")?.value || "").trim();
+          body.electricity_submission_day = v ? Number(v) : null;
+        }
+        if (hasG) {
+          const v = (document.getElementById("m-gday")?.value || "").trim();
+          body.gas_submission_day = v ? Number(v) : null;
+        }
+        try {
+          await api(`/api/apartments/${aptId}/settings`, { method: "PUT", body });
+          showToast("✅ Дни подачи сохранены");
+          const me = await api("/api/me");
+          state.apartments = me.apartments;
+          renderAptSelector();
+          await loadApartmentDetail(aptId);
+          await renderTab();
+        } catch (err) {
+          showToast("❌ " + err.message, "error");
+          return false;
+        }
+      },
+    },
+    { label: "Отмена", cls: "btn-secondary" },
+  ]);
+
+  const initialSnap = readSnap();
+  const saveBtn = document.getElementById("modal-save-days");
+  const updateDirty = () => {
+    if (saveBtn) saveBtn.disabled = readSnap() === initialSnap;
+  };
+  ["m-wday", "m-eday", "m-gday"].forEach(id => {
+    document.getElementById(id)?.addEventListener("input", updateDirty);
+  });
+}
+
+function openTariffsModal(aptId) {
+  const apt = state.aptDetail?.apartment;
+  const tariffs = state.aptDetail?.tariffs || {};
+  if (!apt || apt.id !== aptId) return;
+
+  const checked = new Set(getEnabledMeters(apt));
+  const hasDomW = checked.has("cold_water") || checked.has("hot_water");
+  const isIrrAfterCold = (apt.irrigation_mode || "parallel") === "after_cold";
+  const sewPlaceholder = checked.has("irrigation") && isIrrAfterCold
+    ? (checked.has("hot_water") ? "ХВС + ГВС минус Полив" : "ХВС минус Полив")
+    : (checked.has("hot_water") ? "ХВС + ГВС" : "ХВС");
+
+  const fields = [];
+  for (const m of METER_META.filter(x => x.id === "cold_water" || x.id === "hot_water")) {
+    if (checked.has(m.id)) {
+      fields.push(`<div class="field"><label>${esc(m.tariffLabel)}</label><input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" /></div>`);
+    }
+  }
+  if (hasDomW) {
+    fields.push(`<div class="field"><label>🚰 Водоотведение (руб/м³)</label><input type="text" inputmode="decimal" id="t-sewerage" placeholder="${esc(sewPlaceholder)}" value="${tariffs.sewerage ? tariffs.sewerage : ""}" /></div>`);
+  }
+  if (checked.has("irrigation") && !isIrrAfterCold) {
+    const m = METER_META.find(x => x.id === "irrigation");
+    fields.push(`<div class="field"><label>${esc(m.tariffLabel)}</label><input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" /></div>`);
+  }
+  for (const m of METER_META.filter(x => x.group !== "water")) {
+    if (checked.has(m.id)) {
+      fields.push(`<div class="field"><label>${esc(m.tariffLabel)}</label><input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" /></div>`);
+    }
+  }
+
+  const bodyHtml = `
+    <div style="margin-bottom:10px">
+      <button type="button" class="btn btn-secondary" id="btn-tariff-hist">📋 История тарифов</button>
+    </div>
+    <div class="grid-2">${fields.join("") || '<p class="small muted">Нет подключённых счётчиков с отдельным тарифом.</p>'}</div>
+  `;
+
+  const readSnap = () => {
+    const snap = {};
+    for (const m of METER_META) {
+      const el = document.getElementById(`t-${m.id}`);
+      if (el) snap[m.id] = el.value.trim().replace(",", ".");
+    }
+    const sewEl = document.getElementById("t-sewerage");
+    if (sewEl) snap.sewerage = sewEl.value.trim().replace(",", ".");
+    return JSON.stringify(snap);
+  };
+
+  openModal(`💰 Тарифы — ${propShort(apt)}`, bodyHtml, [
+    {
+      id: "modal-save-tariffs",
+      label: "💾 Сохранить",
+      disabled: true,
+      onClick: async () => {
+        const tariffsPayload = {};
+        for (const m of METER_META) {
+          const el = document.getElementById(`t-${m.id}`);
+          if (!el) continue;
+          const val = el.value.trim();
+          if (val) tariffsPayload[m.id] = val;
+        }
+        const sewEl = document.getElementById("t-sewerage");
+        if (sewEl) {
+          const sewVal = sewEl.value.trim();
+          if (sewVal) {
+            tariffsPayload.sewerage = sewVal;
+          } else if (tariffs.sewerage !== null && tariffs.sewerage !== undefined && tariffs.sewerage > 0) {
+            tariffsPayload.sewerage = "0";
+          }
+        }
+        try {
+          await api(`/api/apartments/${aptId}/settings`, {
+            method: "PUT",
+            body: { tariffs: tariffsPayload },
+          });
+          showToast("✅ Тарифы сохранены");
+          await loadApartmentDetail(aptId);
+          await renderTab();
+        } catch (err) {
+          showToast("❌ " + err.message, "error");
+          return false;
+        }
+      },
+    },
+    { label: "Отмена", cls: "btn-secondary" },
+  ]);
+
+  const initialSnap = readSnap();
+  const saveBtn = document.getElementById("modal-save-tariffs");
+  const updateDirty = () => {
+    if (saveBtn) saveBtn.disabled = readSnap() === initialSnap;
+  };
+  ["t-sewerage", ...METER_META.map(m => `t-${m.id}`)].forEach(id => {
+    document.getElementById(id)?.addEventListener("input", updateDirty);
+  });
+
+  document.getElementById("btn-tariff-hist")?.addEventListener("click", async () => {
+    try {
+      const res = await api(`/api/apartments/${aptId}/tariffs/history`);
+      const html = res.items.length
+        ? res.items.map(i => `<div class="table-row"><span>${esc(i.label)} · ${esc(i.effective_from)}</span><b>${fmtNum(i.rate)} ₽</b></div>`).join("")
+        : `<p class="muted">История тарифов пуста.</p>`;
+      closeModal(true);
+      openModal(`История тарифов — ${propShort(apt)}`, `<div style="max-height:55vh;overflow:auto">${html}</div>`, [
+        { label: "Закрыть", cls: "btn-secondary" },
+      ]);
+    } catch (err) {
+      showToast("❌ " + err.message, "error");
+    }
   });
 }
 
@@ -2049,7 +2382,6 @@ function openCreatePropertyModal() {
     </div>
     ${renderMeterSelectorHtml("new", initMeters, chosenType)}
   `, [
-    { label: "Отмена", cls: "btn-secondary" },
     {
       id: "modal-create-apt-btn",
       label: "Создать",
@@ -2075,6 +2407,7 @@ function openCreatePropertyModal() {
         } catch (err) { showToast("❌ " + err.message, "error"); return false; }
       },
     },
+    { label: "Отмена", cls: "btn-secondary" },
   ]);
 
   const updateCreateBtn = () => {
@@ -2455,48 +2788,24 @@ function renderApartments(root) {
           <label id="edit-prop-num-label">${curMeta.numLabel}</label>
           <input type="text" id="s-number" maxlength="50" value="${esc(apt.number)}" placeholder="${curMeta.placeholder}" />
         </div>
-        ${renderMeterSelectorHtml("edit", enabled, apt.property_type, apt.irrigation_mode)}
-        <div class="field">
-          <button type="button" class="btn btn-secondary" id="btn-meters-manage">🔧 Счётчики</button>
-        </div>
-        <div id="settings-days-section" class="settings-section">
-          <div class="section-label">📅 Выберите день отправки показаний счётчиков (с 1 по 31 число)</div>
-          <div id="settings-days-wrap" class="grid-3">
-            <div class="field" data-day-group="water"><label>💧 Вода</label><input type="number" min="1" max="31" id="s-wday" placeholder="1–31" value="${apt.water_submission_day ?? ""}" /></div>
-            <div class="field" data-day-group="electricity"><label>⚡ Электричество</label><input type="number" min="1" max="31" id="s-eday" placeholder="1–31" value="${apt.electricity_submission_day ?? ""}" /></div>
-            <div class="field" data-day-group="gas"><label>🔥 Газ</label><input type="number" min="1" max="31" id="s-gday" placeholder="1–31" value="${apt.gas_submission_day ?? ""}" /></div>
-          </div>
-        </div>
-        <div id="settings-tariffs-section" class="settings-section">
-          <div class="section-label">💰 Тарифы</div>
-          <div class="grid-2" id="settings-tariffs-wrap">
-            ${METER_META.filter(m => m.id === "cold_water" || m.id === "hot_water").map(m => `
-              <div class="field" data-tariff-meter="${m.id}">
-                <label>${esc(m.tariffLabel)}</label>
-                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
-              </div>
-            `).join("")}
-            <div class="field" data-tariff-group="water">
-              <label>🚰 Водоотведение (руб/м³)</label>
-              <input type="text" inputmode="decimal" id="t-sewerage" placeholder="ХВС + ГВС" value="${tariffs.sewerage ? tariffs.sewerage : ""}" />
-            </div>
-            ${METER_META.filter(m => m.id === "irrigation").map(m => `
-              <div class="field" data-tariff-meter="${m.id}">
-                <label>${esc(m.tariffLabel)}</label>
-                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
-              </div>
-            `).join("")}
-            ${METER_META.filter(m => m.group !== "water").map(m => `
-              <div class="field" data-tariff-meter="${m.id}">
-                <label>${esc(m.tariffLabel)}</label>
-                <input type="text" inputmode="decimal" id="t-${m.id}" value="${tariffs[m.id] ?? ""}" />
-              </div>
-            `).join("")}
-          </div>
-        </div>
-        <div class="row-gap">
-          <button class="btn" id="btn-save-settings" disabled>💾 Сохранить настройки и тарифы</button>
-          <button class="btn btn-secondary" id="btn-tariff-hist">📋 История тарифов</button>
+        <button class="btn" id="btn-save-basic" disabled>💾 Сохранить</button>
+        <div class="settings-menu-stack">
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-enabled-meters">
+            <span id="lbl-open-enabled-meters">🚰 Имеющиеся счётчики воды и газа ${curMeta.inLocative}</span>
+            <span class="settings-menu-arrow">›</span>
+          </button>
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-meters-manage">
+            <span>🔧 Управление счётчиками</span>
+            <span class="settings-menu-arrow">›</span>
+          </button>
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-days">
+            <span>📅 Дни подачи показаний</span>
+            <span class="settings-menu-arrow">›</span>
+          </button>
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-tariffs">
+            <span>💰 Тарифы</span>
+            <span class="settings-menu-arrow">›</span>
+          </button>
         </div>
         <div class="danger-zone">
           <button class="btn btn-danger" id="btn-delete-property">🗑 Удалить объект недвижимости</button>
@@ -2536,7 +2845,7 @@ function renderApartments(root) {
         ${tenants.length ? tenants.map(t => `
           <div class="table-row">
             <div><div class="bold">${esc(t.name || "—")}</div><div class="small muted">ID: ${t.telegram_id}${t.phone ? " · " + esc(t.phone) : ""}</div></div>
-            <button class="btn btn-danger btn-sm del-tenant-btn" data-tid="${t.telegram_id}">✕</button>
+            <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-btn" data-tid="${t.telegram_id}" title="Удалить"><span class="del-x">❌</span></button>
           </div>`).join("") : `<p class="small muted">Нанимателей пока нет.</p>`}
         <button class="btn btn-secondary mt-8" id="btn-add-tenant">➕ Добавить нанимателя</button>`;
     }
@@ -2545,7 +2854,7 @@ function renderApartments(root) {
   root.innerHTML = `
     <div class="card">
       <div class="row-between">
-        <h2>🏘 Недвижимость</h2>
+        <h2>🌆 Недвижимость</h2>
         <div class="row-nowrap">
           ${canReorder ? `<button type="button" class="btn btn-sm ${state.reorderMode ? "" : "btn-secondary"}" id="btn-toggle-reorder" title="Изменить порядок объектов">${state.reorderMode ? "✓ Готово" : "⇅"}</button>` : ""}
           <button type="button" class="btn btn-sm" id="btn-new-apt">➕ Добавить</button>
@@ -2609,97 +2918,20 @@ function renderApartments(root) {
   if (!apt) return;
 
   if (state.manageSubtab === "settings") {
-    document.getElementById("btn-meters-manage")?.addEventListener("click", () => openMetersModal(apt.id));
-
     let editPropType = apt.property_type || "apartment";
-    const saveSettingsBtn = document.getElementById("btn-save-settings");
-
-    const getSettingsSnapshot = () => {
-      const enabledNow = editMeterSelector.getEnabledMeters();
-      const irrModeNow = editMeterSelector.getIrrigationMode();
-      const tariffsNow = {};
-      for (const m of METER_META) {
-        if (!enabledNow.includes(m.id)) continue;
-        if (m.id === "irrigation" && irrModeNow === "after_cold") continue;
-        tariffsNow[m.id] = (document.getElementById(`t-${m.id}`)?.value || "").trim().replace(",", ".");
-      }
-      if (enabledNow.includes("cold_water") || enabledNow.includes("hot_water")) {
-        tariffsNow.sewerage = (document.getElementById("t-sewerage")?.value || "").trim().replace(",", ".");
-      }
-      return JSON.stringify({
-        number: (document.getElementById("s-number")?.value || "").trim(),
-        property_type: editPropType,
-        enabled_meters: enabledNow,
-        irrigation_mode: enabledNow.includes("irrigation") ? irrModeNow : "parallel",
-        wday: (document.getElementById("s-wday")?.value || "").trim(),
-        eday: (document.getElementById("s-eday")?.value || "").trim(),
-        gday: (document.getElementById("s-gday")?.value || "").trim(),
-        tariffs: tariffsNow,
-      });
-    };
-
-    let initialSettingsSnapshot = "";
-
-    const updateSettingsDirty = () => {
-      if (!saveSettingsBtn || !initialSettingsSnapshot) return;
-      saveSettingsBtn.disabled = getSettingsSnapshot() === initialSettingsSnapshot;
-    };
-
-    const syncSettingsVisibility = () => {
-      const checked = new Set(editMeterSelector.getEnabledMeters());
-      const hasDomW = checked.has("cold_water") || checked.has("hot_water");
-      const hasWaterAny = hasDomW || checked.has("irrigation");
-      const hasE = checked.has("t") || checked.has("t1") || checked.has("t2") || checked.has("t3");
-      const hasG = checked.has("gas");
-
-      const visibleGroups = [hasWaterAny, hasE, hasG].filter(Boolean).length;
-      document.getElementById("settings-days-section")?.classList.toggle("hidden", visibleGroups === 0);
-      const daysWrap = document.getElementById("settings-days-wrap");
-      if (daysWrap && visibleGroups > 0) {
-        daysWrap.style.gridTemplateColumns = `repeat(${visibleGroups}, 1fr)`;
-      }
-
-      document.querySelector('[data-day-group="water"]')?.classList.toggle("hidden", !hasWaterAny);
-      document.querySelector('[data-day-group="electricity"]')?.classList.toggle("hidden", !hasE);
-      document.querySelector('[data-day-group="gas"]')?.classList.toggle("hidden", !hasG);
-
-      const irrModeNow = editMeterSelector.getIrrigationMode();
-      const hideIrrTariff = irrModeNow === "after_cold";
-      const hasVisibleTariff = Array.from(checked).some(id => !(id === "irrigation" && hideIrrTariff)) || hasDomW;
-
-      document.getElementById("settings-tariffs-section")?.classList.toggle("hidden", !hasVisibleTariff);
-      document.querySelectorAll("[data-tariff-meter]").forEach(el => {
-        const mt = el.dataset.tariffMeter;
-        const hidden = !checked.has(mt) || (mt === "irrigation" && hideIrrTariff);
-        el.classList.toggle("hidden", hidden);
-      });
-      document.querySelector('[data-tariff-group="water"]')?.classList.toggle("hidden", !hasDomW);
-
-      const sewInput = document.getElementById("t-sewerage");
-      if (sewInput) {
-        if (checked.has("irrigation") && hideIrrTariff) {
-          sewInput.placeholder = checked.has("hot_water") ? "ХВС + ГВС минус Полив" : "ХВС минус Полив";
-        } else {
-          sewInput.placeholder = checked.has("hot_water") ? "ХВС + ГВС" : "ХВС";
-        }
-      }
-
-      updateSettingsDirty();
-    };
-
-    const editMeterSelector = wireMeterSelector(
-      "edit",
-      detectElectricityMode(enabled),
-      syncSettingsVisibility,
-      apt.irrigation_mode || "parallel"
-    );
-    syncSettingsVisibility();
-    initialSettingsSnapshot = getSettingsSnapshot();
-    updateSettingsDirty();
-
-    ["s-number", "s-wday", "s-eday", "s-gday", "t-sewerage", ...METER_META.map(m => `t-${m.id}`)].forEach(id => {
-      document.getElementById(id)?.addEventListener("input", updateSettingsDirty);
+    const saveBasicBtn = document.getElementById("btn-save-basic");
+    const initBasicSnap = JSON.stringify({
+      number: String(apt.number || "").trim(),
+      property_type: editPropType,
     });
+    const updateBasicDirty = () => {
+      if (!saveBasicBtn) return;
+      const curNum = (document.getElementById("s-number")?.value || "").trim();
+      const curSnap = JSON.stringify({ number: curNum, property_type: editPropType });
+      saveBasicBtn.disabled = !curNum || curSnap === initBasicSnap;
+    };
+
+    document.getElementById("s-number")?.addEventListener("input", updateBasicDirty);
 
     document.querySelectorAll("#edit-type-picker .type-btn").forEach(btn => {
       btn.onclick = () => {
@@ -2708,49 +2940,26 @@ function renderApartments(root) {
         const meta = getPropertyMeta(editPropType);
         document.getElementById("edit-prop-num-label").textContent = meta.numLabel;
         document.getElementById("s-number").placeholder = meta.placeholder;
-        editMeterSelector.setPropertyType(editPropType);
+        const lbl = document.getElementById("lbl-open-enabled-meters");
+        if (lbl) lbl.textContent = `🚰 Имеющиеся счётчики воды и газа ${meta.inLocative}`;
+        updateBasicDirty();
       };
     });
 
-    const performSaveSettings = async () => {
+    saveBasicBtn?.addEventListener("click", async () => {
+      if (saveBasicBtn.disabled) return;
       const number = document.getElementById("s-number").value.trim();
-      const enabledMeters = editMeterSelector.getEnabledMeters();
-      const wday = document.getElementById("s-wday").value.trim();
-      const eday = document.getElementById("s-eday").value.trim();
-      const gday = document.getElementById("s-gday").value.trim();
-      const irrMode = editMeterSelector.getIrrigationMode();
-      const tariffsPayload = {};
-      for (const m of METER_META) {
-        if (!enabledMeters.includes(m.id)) continue;
-        if (m.id === "irrigation" && irrMode === "after_cold") continue;
-        const val = document.getElementById(`t-${m.id}`)?.value.trim();
-        if (val) tariffsPayload[m.id] = val;
+      if (!number) return showToast("Укажите номер или название объекта", "error");
+      const body = { number, property_type: editPropType };
+      if (editPropType !== "house" && enabled.includes("irrigation")) {
+        const filtered = enabled.filter(m => m !== "irrigation");
+        body.enabled_meters = filtered.length ? filtered : ["cold_water"];
+        body.irrigation_mode = "parallel";
       }
-      if (enabledMeters.includes("cold_water") || enabledMeters.includes("hot_water")) {
-        const sewVal = document.getElementById("t-sewerage")?.value.trim();
-        if (sewVal) {
-          tariffsPayload.sewerage = sewVal;
-        } else if (tariffs.sewerage !== null && tariffs.sewerage !== undefined && tariffs.sewerage > 0) {
-          tariffsPayload.sewerage = "0";
-        }
-      }
-
-      saveSettingsBtn.disabled = true;
+      saveBasicBtn.disabled = true;
       try {
-        await api(`/api/apartments/${apt.id}/settings`, {
-          method: "PUT",
-          body: {
-            number,
-            property_type: editPropType,
-            enabled_meters: enabledMeters,
-            irrigation_mode: irrMode,
-            water_submission_day: wday ? Number(wday) : null,
-            electricity_submission_day: eday ? Number(eday) : null,
-            gas_submission_day: gday ? Number(gday) : null,
-            tariffs: tariffsPayload,
-          },
-        });
-        showToast("✅ Настройки сохранены");
+        await api(`/api/apartments/${apt.id}/settings`, { method: "PUT", body });
+        showToast("✅ Настройки объекта сохранены");
         const me = await api("/api/me");
         state.apartments = me.apartments;
         renderAptSelector();
@@ -2758,41 +2967,16 @@ function renderApartments(root) {
         renderApartments(root);
       } catch (err) {
         showToast("❌ " + err.message, "error");
-        updateSettingsDirty();
+        updateBasicDirty();
       }
-    };
-
-    saveSettingsBtn?.addEventListener("click", async () => {
-      if (saveSettingsBtn.disabled) return;
-      const number = document.getElementById("s-number").value.trim();
-      if (!number) return showToast("Укажите номер или название объекта", "error");
-      const enabledMeters = editMeterSelector.getEnabledMeters();
-      if (!enabledMeters.length) return showToast("Выберите хотя бы один счётчик", "error");
-
-      const irrMode = editMeterSelector.getIrrigationMode();
-      const irrChanged = enabledMeters.includes("irrigation") && irrMode !== (apt.irrigation_mode || "parallel");
-      if (irrChanged && (state.aptDetail?.readings_count || 0) > 0) {
-        openModal("⚠️ Изменение схемы полива", `
-          <p>По объекту уже есть сохранённые показания. Изменение схемы подключения полива повлияет на расчёт водоотведения за исторические периоды.</p>
-          <p class="small muted">Вы уверены, что хотите сохранить изменения?</p>
-        `, [
-          { label: "Отмена", cls: "btn-secondary" },
-          { label: "Сохранить", onClick: performSaveSettings },
-        ]);
-        return;
-      }
-      await performSaveSettings();
     });
 
-    document.getElementById("btn-tariff-hist")?.addEventListener("click", async () => {
-      try {
-        const res = await api(`/api/apartments/${apt.id}/tariffs/history`);
-        const html = res.items.length
-          ? res.items.map(i => `<div class="table-row"><span>${esc(i.label)} · ${esc(i.effective_from)}</span><b>${fmtNum(i.rate)} ₽</b></div>`).join("")
-          : `<p class="muted">История тарифов пуста.</p>`;
-        openModal(`История тарифов — ${propShort(apt)}`, `<div style="max-height:55vh;overflow:auto">${html}</div>`, [{ label: "Закрыть", cls: "btn-secondary" }]);
-      } catch (err) { showToast("❌ " + err.message, "error"); }
+    document.getElementById("btn-open-enabled-meters")?.addEventListener("click", () => {
+      openEnabledMetersModal(apt.id, editPropType);
     });
+    document.getElementById("btn-meters-manage")?.addEventListener("click", () => openMetersModal(apt.id));
+    document.getElementById("btn-open-days")?.addEventListener("click", () => openSubmissionDaysModal(apt.id));
+    document.getElementById("btn-open-tariffs")?.addEventListener("click", () => openTariffsModal(apt.id));
 
     document.getElementById("btn-delete-property")?.addEventListener("click", () => {
       const rCount = state.aptDetail?.readings_count ?? 0;
@@ -2811,7 +2995,6 @@ function renderApartments(root) {
         ${tenantsWarn}
         <p class="small muted">Если история ещё может пригодиться, сначала сделайте выгрузку в Excel или PDF.</p>
       `, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "🗑 Удалить навсегда",
           cls: "btn-danger",
@@ -2829,6 +3012,7 @@ function renderApartments(root) {
             }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     });
   }
@@ -2894,8 +3078,8 @@ function renderApartments(root) {
           <p>По объекту уже подавались показания. Изменение начальных показаний повлияет на расчёт первого периода.</p>
           <p class="small muted">Подтвердить изменение?</p>
         `, [
-          { label: "Отмена", cls: "btn-secondary" },
           { label: "Сохранить", onClick: () => doSaveInitial(body) },
+          { label: "Отмена", cls: "btn-secondary" },
         ]);
         return;
       }
@@ -2971,7 +3155,7 @@ function renderApartments(root) {
         <p class="small muted">Выберите, как поступить с доступом нанимателей к боту:</p>
       `, [
         {
-          label: "Удалить только договор (доступ нанимателя к боту сохранится)",
+          label: "Удалить только договор\n(доступ нанимателя к боту сохранится)",
           cls: "btn-secondary",
           onClick: () => runDeleteContract(false),
         },
@@ -2984,8 +3168,8 @@ function renderApartments(root) {
       ], { stackActions: true });
     } else {
       openModal("🗑 Удалить договор?", `<p>Очистить данные договора для объекта «${esc(propShort(apt))}»?</p>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         { label: "Удалить", cls: "btn-danger", onClick: () => runDeleteContract(false) },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     }
   });
@@ -2998,7 +3182,6 @@ function renderApartments(root) {
     btn.onclick = () => {
       const tid = Number(btn.dataset.tid);
       openModal("Удалить нанимателя?", `<p>Отозвать доступ у ID ${tid} к объекту «${esc(propShort(apt))}»?</p>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
           onClick: async () => {
@@ -3010,6 +3193,7 @@ function renderApartments(root) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     };
   });
@@ -3038,7 +3222,6 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
     <div class="field"><label>Телефон (необязательно)</label><input type="tel" inputmode="tel" id="nt-phone" class="phone-mask" placeholder="+7-___-___-____" /></div>
     <p class="small muted">Бот сможет отправить приглашение только если наниматель ранее уже нажимал /start.</p>
   `, [
-    { label: "Отмена", cls: "btn-secondary" },
     {
       label: "Добавить",
       onClick: async () => {
@@ -3058,6 +3241,7 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
         }, onSuccess);
       },
     },
+    { label: "Отмена", cls: "btn-secondary" },
   ]);
 }
 
@@ -3067,8 +3251,8 @@ async function submitAddTenant(aptId, payload, onSuccess = null) {
     if (res.needs_confirm) {
       setTimeout(() => {
         openModal("⚠️ Договор не заполнен", `<p>${esc(res.warning)}</p>`, [
-          { label: "Отмена", cls: "btn-secondary" },
           { label: "Добавить", onClick: () => submitAddTenant(aptId, { ...payload, force_no_contract: true }, onSuccess) },
+          { label: "Отмена", cls: "btn-secondary" },
         ]);
       }, 0);
       return true;
@@ -3122,7 +3306,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
                 </div>
                 <div class="row-nowrap">
                   <button class="btn btn-secondary btn-sm edit-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || "")}" data-tphone="${esc(t.phone || "")}" title="Редактировать">✏️</button>
-                  <button class="btn btn-danger btn-sm del-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || t.telegram_id)}" data-first-apt="${firstAptId}" title="Удалить">✕</button>
+                  <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || t.telegram_id)}" data-first-apt="${firstAptId}" title="Удалить"><span class="del-x">❌</span></button>
                 </div>
               </div>`;
           }).join("")}
@@ -3135,10 +3319,10 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
     : "";
 
   root.innerHTML = `
-    <div class="card"><div class="row-between"><h2>👥 Люди</h2>${data.can_create ? `<button class="btn btn-sm" id="btn-new-fam">➕ Создать семью</button>` : ""}</div></div>
+    <div class="card"><div class="row-between"><h2>👨‍👩‍👧‍👦 Люди</h2>${data.can_create ? `<button class="btn btn-sm" id="btn-new-fam">➕ Создать семью</button>` : ""}</div></div>
     ${data.families.map(f => `
       <div class="card">
-        <div class="row-between"><h3>${esc(f.name)}</h3><span class="pill">🏘 ${f.apartments_count}</span></div>
+        <div class="row-between"><h3>${esc(f.name)}</h3><span class="pill">🌆 ${f.apartments_count}</span></div>
         <div class="mt-8">
           ${f.owners.length ? f.owners.map(o => `
             <div class="table-row">
@@ -3148,14 +3332,14 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
               </div>
               <div class="row-nowrap">
                 <button class="btn btn-secondary btn-sm edit-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || "")}" data-ophone="${esc(o.phone || "")}" title="Редактировать">✏️</button>
-                <button class="btn btn-danger btn-sm del-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || o.telegram_id)}" title="Удалить">✕</button>
+                <button class="btn btn-secondary btn-sm btn-del-icon del-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || o.telegram_id)}" title="Удалить"><span class="del-x">❌</span></button>
               </div>
             </div>`).join("") : `<p class="small muted">Владельцев нет.</p>`}
         </div>
         <div class="row-gap mt-12">
           <button class="btn btn-secondary btn-sm add-owner-btn" data-fid="${f.id}">🔑 + Владелец</button>
           <button class="btn btn-secondary btn-sm ren-fam-btn" data-fid="${f.id}" data-name="${esc(f.name)}">✏️ Имя семьи</button>
-          ${data.can_create ? `<button class="btn btn-danger btn-sm del-fam-btn" data-fid="${f.id}" data-name="${esc(f.name)}">🗑</button>` : ""}
+          ${data.can_create ? `<button class="btn btn-secondary btn-sm btn-del-icon del-fam-btn" data-fid="${f.id}" data-name="${esc(f.name)}" title="Удалить семью"><span class="del-x">❌</span></button>` : ""}
         </div>
       </div>`).join("")}
     ${tenantsCardHtml}
@@ -3163,7 +3347,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
 
   document.getElementById("btn-new-fam")?.addEventListener("click", () => {
     openModal("➕ Новая семья", `<div class="field"><label>Название</label><input type="text" id="nf-name" placeholder="Например: Семья Ивановых" /></div>`, [
-      { label: "Отмена", cls: "btn-secondary" },
       {
         label: "Создать",
         onClick: async () => {
@@ -3176,6 +3359,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           } catch (err) { showToast("❌ " + err.message, "error"); return false; }
         },
       },
+      { label: "Отмена", cls: "btn-secondary" },
     ]);
   });
 
@@ -3183,7 +3367,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
     btn.onclick = () => {
       const initialFamName = String(btn.dataset.name || "").trim();
       openModal("✏️ Переименовать семью", `<div class="field"><label>Название семьи</label><input type="text" id="rf-name" value="${esc(btn.dataset.name)}" /></div>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           id: "modal-save-fam-name",
           label: "Сохранить",
@@ -3198,6 +3381,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
       const rfInput = document.getElementById("rf-name");
       const saveBtn = document.getElementById("modal-save-fam-name");
@@ -3219,7 +3403,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
         <div class="field"><label>Имя</label><input type="text" id="no-name" placeholder="Введите имя" /></div>
         <div class="field"><label>Телефон (необязательно)</label><input type="tel" inputmode="tel" id="no-phone" class="phone-mask" placeholder="+7-___-___-____" /></div>
       `, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Добавить",
           onClick: async () => {
@@ -3239,6 +3422,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     };
   });
@@ -3257,7 +3441,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           <input type="tel" inputmode="tel" id="eo-phone" class="phone-mask" value="${esc(btn.dataset.ophone)}" placeholder="+7-___-___-____" />
         </div>
       `, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           id: "modal-save-owner",
           label: "Сохранить",
@@ -3281,6 +3464,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
       const nameEl = document.getElementById("eo-name");
       const phoneEl = document.getElementById("eo-phone");
@@ -3299,7 +3483,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   root.querySelectorAll(".del-owner-btn").forEach(btn => {
     btn.onclick = () => {
       openModal("Удалить владельца?", `<p>Удалить владельца <b>${esc(btn.dataset.oname)}</b> (ID ${btn.dataset.oid})?</p>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
           onClick: async () => {
@@ -3310,6 +3493,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     };
   });
@@ -3317,7 +3501,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   root.querySelectorAll(".del-fam-btn").forEach(btn => {
     btn.onclick = () => {
       openModal("🗑 Удалить семью?", `<p>Удалить «${esc(btn.dataset.name)}» вместе со всеми объектами недвижимости, показаниями и привязанными пользователями?</p>`, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           label: "Удалить", cls: "btn-danger",
           onClick: async () => {
@@ -3328,6 +3511,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
     };
   });
@@ -3352,7 +3536,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           <input type="tel" inputmode="tel" id="et-phone" class="phone-mask" value="${esc(btn.dataset.tphone)}" placeholder="+7-___-___-____" />
         </div>
       `, [
-        { label: "Отмена", cls: "btn-secondary" },
         {
           id: "modal-save-tenant",
           label: "Сохранить",
@@ -3370,6 +3553,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             } catch (err) { showToast("❌ " + err.message, "error"); return false; }
           },
         },
+        { label: "Отмена", cls: "btn-secondary" },
       ]);
       const nameEl = document.getElementById("et-name");
       const phoneEl = document.getElementById("et-phone");
@@ -3394,7 +3578,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
       if (linkedApts.length === 1) {
         const a = linkedApts[0];
         openModal("Удалить нанимателя?", `<p>Отозвать доступ у <b>${esc(btn.dataset.tname)}</b> (ID ${tid}) к объекту «${esc(a.display_name)}»?</p>`, [
-          { label: "Отмена", cls: "btn-secondary" },
           {
             label: "Удалить", cls: "btn-danger",
             onClick: async () => {
@@ -3406,6 +3589,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
               } catch (err) { showToast("❌ " + err.message, "error"); return false; }
             },
           },
+          { label: "Отмена", cls: "btn-secondary" },
         ]);
       } else {
         openModal("Открепить нанимателя", `
@@ -3416,7 +3600,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             </select>
           </div>
         `, [
-          { label: "Отмена", cls: "btn-secondary" },
           {
             label: "Открепить", cls: "btn-danger",
             onClick: async () => {
@@ -3429,6 +3612,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
               } catch (err) { showToast("❌ " + err.message, "error"); return false; }
             },
           },
+          { label: "Отмена", cls: "btn-secondary" },
         ]);
       }
     };

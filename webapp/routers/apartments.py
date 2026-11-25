@@ -10,6 +10,7 @@ from config import local_today
 from database import crud, operations
 from database.models import (
     ALL_METERS,
+    ELECTRICITY_METERS,
     ALL_TARIFF_TYPES,
     IRRIGATION_METERS,
     IRRIGATION_MODE_AFTER_COLD,
@@ -86,6 +87,27 @@ def _validate_effective_configuration(
         property_type=property_type,
         irrigation_mode=irrigation_mode,
     )
+
+
+def _build_canonical_meter_devices(enabled_meters: list[str], devices_map: dict) -> list[dict]:
+    """Build physical meter list: T1/T2/T3 collapse into one 't' electricity meter device."""
+    result: list[dict] = []
+    elec_added = False
+    for mt in enabled_meters:
+        if mt in ELECTRICITY_METERS:
+            if elec_added:
+                continue
+            elec_added = True
+            dev = (
+                devices_map.get(SINGLE_ELECTRICITY_METER)
+                or devices_map.get("t1")
+                or devices_map.get("t2")
+                or devices_map.get("t3")
+            )
+            result.append(serialize_meter_device(SINGLE_ELECTRICITY_METER, dev))
+        else:
+            result.append(serialize_meter_device(mt, devices_map.get(mt)))
+    return result
 
 
 @router.get("/api/me")
@@ -176,7 +198,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
             "initial_readings": initial,
             "prev_readings": prev_vals,
             "month_base_info": month_base_info,
-            "billing": sanitize_billing_for_tenant(billing.to_dict()),
+            "billing": billing.to_dict(),
             "tenants": [],
             "readings_count": 0,
         }
@@ -192,7 +214,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
     ]
     readings_count = await crud.get_readings_count(apt_id)
     devices_map = await crud.get_meter_devices(apt_id)
-    meter_devices = [serialize_meter_device(mt, devices_map.get(mt)) for mt in enabled_meters]
+    meter_devices = _build_canonical_meter_devices(enabled_meters, devices_map)
 
     return {
         "apartment": serialize_apartment(apt, has_linked_tenants=bool(tenants), has_overdue_meters=overdue),
@@ -334,12 +356,28 @@ async def api_update_settings(
             raise HTTPException(400, f"Некорректный тариф для {mt}")
         parsed_tariffs[mt] = rate
 
+    eff_wday = (
+        body.water_submission_day
+        if "water_submission_day" in body.model_fields_set
+        else existing_apt.water_submission_day
+    )
+    eff_eday = (
+        body.electricity_submission_day
+        if "electricity_submission_day" in body.model_fields_set
+        else existing_apt.electricity_submission_day
+    )
+    eff_gday = (
+        body.gas_submission_day
+        if "gas_submission_day" in body.model_fields_set
+        else existing_apt.gas_submission_day
+    )
+
     try:
         updated_tariffs = await operations.update_apartment_settings_atomic(
             apartment_id=apt_id,
-            water_submission_day=body.water_submission_day,
-            electricity_submission_day=body.electricity_submission_day,
-            gas_submission_day=body.gas_submission_day,
+            water_submission_day=eff_wday,
+            electricity_submission_day=eff_eday,
+            gas_submission_day=eff_gday,
             tariffs=parsed_tariffs,
             changed_by=user.telegram_id,
             effective_from=local_today(),
@@ -412,7 +450,7 @@ async def api_get_meter_devices(apt_id: int, user: WebAppUser = Depends(get_curr
     devices_map = await crud.get_meter_devices(apt_id)
     replacements = await crud.get_meter_replacements(apt_id, limit=20)
     return {
-        "devices": [serialize_meter_device(mt, devices_map.get(mt)) for mt in enabled],
+        "devices": _build_canonical_meter_devices(enabled, devices_map),
         "replacements": [
             {
                 "id": r.id,
@@ -470,16 +508,30 @@ async def api_replace_meter(
 
     due = parse_iso_date(body.new_verification_due_date)
     try:
-        rep = await operations.replace_meter_atomic(
-            apartment_id=apt_id,
-            meter_type=body.meter_type,
-            old_final_value=body.old_final_value,
-            new_initial_value=body.new_initial_value,
-            actor_tg_id=user.telegram_id,
-            replacement_date=local_today(),
-            new_serial_number=body.new_serial_number,
-            new_verification_due_date=due,
-        )
+        if body.tariff_entries:
+            reps = await operations.replace_meter_batch_atomic(
+                apartment_id=apt_id,
+                entries=[e.model_dump() for e in body.tariff_entries],
+                actor_tg_id=user.telegram_id,
+                replacement_date=local_today(),
+                new_serial_number=body.new_serial_number,
+                new_verification_due_date=due,
+            )
+            rep_id = reps[0].id if reps else None
+        else:
+            if body.old_final_value is None or body.new_initial_value is None:
+                raise HTTPException(400, "Укажите конечное показание старого и начальное показание нового счётчика")
+            rep = await operations.replace_meter_atomic(
+                apartment_id=apt_id,
+                meter_type=body.meter_type,
+                old_final_value=body.old_final_value,
+                new_initial_value=body.new_initial_value,
+                actor_tg_id=user.telegram_id,
+                replacement_date=local_today(),
+                new_serial_number=body.new_serial_number,
+                new_verification_due_date=due,
+            )
+            rep_id = rep.id
     except LookupError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -488,6 +540,6 @@ async def api_replace_meter(
     billing = await calculate_billing(apt_id)
     return {
         "ok": True,
-        "replacement_id": rep.id,
+        "replacement_id": rep_id,
         "billing": billing.to_dict(),
     }

@@ -16,6 +16,8 @@ import config
 from database.crud import ALLOWED_APARTMENT_FIELDS, UnitOfWork
 from database.models import (
     ALL_METERS,
+    ELECTRICITY_METERS,
+    SINGLE_ELECTRICITY_METER,
     Apartment,
     ApartmentUser,
     AuditLog,
@@ -343,10 +345,11 @@ async def replace_meter_atomic(
                 f"последнего зафиксированного значения ({prev_val})"
             )
 
+        device_meter_type = SINGLE_ELECTRICITY_METER if meter_type in ELECTRICITY_METERS else meter_type
         res_dev = await s.execute(
             select(MeterDevice).where(
                 MeterDevice.apartment_id == apartment_id,
-                MeterDevice.meter_type == meter_type,
+                MeterDevice.meter_type == device_meter_type,
             )
         )
         device = res_dev.scalar_one_or_none()
@@ -382,7 +385,7 @@ async def replace_meter_atomic(
             if device is None:
                 device = MeterDevice(
                     apartment_id=apartment_id,
-                    meter_type=meter_type,
+                    meter_type=device_meter_type,
                     serial_number=clean_new_serial,
                     verification_due_date=new_verification_due_date,
                     updated_at=now,
@@ -409,6 +412,110 @@ async def replace_meter_atomic(
         return rep
 
 
+async def replace_meter_batch_atomic(
+    apartment_id: int,
+    entries: list[dict],
+    actor_tg_id: int,
+    replacement_date: datetime.date,
+    new_serial_number: str | None = None,
+    new_verification_due_date: datetime.date | None = None,
+) -> list[MeterReplacement]:
+    """Atomically replace a multi-tariff electricity meter (T1/T2/T3) in a single transaction."""
+    if not entries:
+        raise ValueError("Укажите показания счётчика для замены")
+
+    async with UnitOfWork(write=True) as s:
+        apt = await s.get(Apartment, apartment_id)
+        if not apt:
+            raise LookupError("Объект недвижимости не найден")
+
+        enabled = set(get_apartment_enabled_meters(apt))
+        res_dev = await s.execute(
+            select(MeterDevice).where(
+                MeterDevice.apartment_id == apartment_id,
+                MeterDevice.meter_type == SINGLE_ELECTRICITY_METER,
+            )
+        )
+        device = res_dev.scalar_one_or_none()
+        old_serial = device.serial_number if device else None
+        clean_new_serial = (new_serial_number or "").strip() or None
+
+        reps: list[MeterReplacement] = []
+        audit_parts: list[str] = []
+        for entry in entries:
+            mt = entry["meter_type"]
+            old_final = int(entry["old_final_value"])
+            new_init = int(entry["new_initial_value"])
+            if mt not in ELECTRICITY_METERS or mt not in enabled:
+                label = METER_PLAIN_LABELS.get(mt, mt)
+                raise ValueError(f"Тариф «{label}» не подключён для этого объекта")
+
+            prev_val = await _get_prev_value_in_session(s, apartment_id, mt)
+            if prev_val is not None and old_final < prev_val:
+                label = METER_PLAIN_LABELS.get(mt, mt)
+                raise ValueError(
+                    f"Конечное показание старого счётчика ({label}: {old_final}) не может быть меньше "
+                    f"последнего зафиксированного значения ({prev_val})"
+                )
+
+            init_reading = MeterReading(
+                apartment_id=apartment_id,
+                meter_type=mt,
+                value=new_init,
+                submitted_by=actor_tg_id,
+                reading_date=replacement_date,
+                is_replacement_init=True,
+            )
+            s.add(init_reading)
+            await s.flush()
+
+            rep = MeterReplacement(
+                apartment_id=apartment_id,
+                meter_type=mt,
+                replacement_date=replacement_date,
+                old_final_value=old_final,
+                new_initial_value=new_init,
+                init_reading_id=init_reading.id,
+                old_serial_number=old_serial,
+                new_serial_number=clean_new_serial,
+                replaced_by=actor_tg_id,
+            )
+            s.add(rep)
+            reps.append(rep)
+            audit_parts.append(f"{METER_PLAIN_LABELS.get(mt, mt)}: {old_final}→{new_init}")
+
+        if clean_new_serial is not None or new_verification_due_date is not None:
+            now = utcnow_naive()
+            if device is None:
+                device = MeterDevice(
+                    apartment_id=apartment_id,
+                    meter_type=SINGLE_ELECTRICITY_METER,
+                    serial_number=clean_new_serial,
+                    verification_due_date=new_verification_due_date,
+                    updated_at=now,
+                )
+                s.add(device)
+            else:
+                if clean_new_serial is not None:
+                    device.serial_number = clean_new_serial
+                if new_verification_due_date is not None:
+                    device.verification_due_date = new_verification_due_date
+                device.updated_at = now
+
+        s.add(AuditLog(
+            user_telegram_id=actor_tg_id,
+            action="replace_meter",
+            details=(
+                f"{format_property_short(apt)} (id={apartment_id}), Электрический счётчик: "
+                f"{', '.join(audit_parts)}"
+            ),
+        ))
+        await s.flush()
+        for r in reps:
+            await s.refresh(r)
+        return reps
+
+
 async def upsert_meter_devices_atomic(
     apartment_id: int,
     items: list[dict],
@@ -423,9 +530,11 @@ async def upsert_meter_devices_atomic(
 
         enabled = set(get_apartment_enabled_meters(apt))
         updated = 0
+        has_any_elec = any(em in enabled for em in ELECTRICITY_METERS)
         for item in items:
             mt = item["meter_type"]
-            if mt not in ALL_METERS or mt not in enabled:
+            is_unified_elec = mt == SINGLE_ELECTRICITY_METER and has_any_elec
+            if mt not in ALL_METERS or (mt not in enabled and not is_unified_elec):
                 raise ValueError(f"Счётчик «{METER_PLAIN_LABELS.get(mt, mt)}» не подключён для этого объекта")
 
             serial = (item.get("serial_number") or "").strip() or None

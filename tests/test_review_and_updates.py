@@ -37,6 +37,7 @@ from webapp.schemas import (
     MeterDeviceItemBody,
     MeterDevicesUpdateBody,
     MeterReplacementBody,
+    MeterReplacementTariffEntry,
     TenantCreateBody,
     TenantUpdateBody,
     WaterReadingBody,
@@ -246,9 +247,10 @@ async def test_medium_01_tenant_cannot_see_tariffs_or_billing_money(temp_db):
     tenant = WebAppUser(telegram_id=301, role="tenant", family_id=fam.id, name="Жилец")
     detail = await apt_router.api_apartment_detail(apt.id, user=tenant)
     assert "tariffs" not in detail
-    assert "water_total" not in detail["billing"]
-    assert "grand_total" not in detail["billing"]
-    assert "cost" not in detail["billing"]["meters"]["cold_water"]
+    # Tenant Dashboard now mirrors owner Dashboard with ruble totals
+    assert "water_total" in detail["billing"]
+    assert "grand_total" in detail["billing"]
+    assert "cost" in detail["billing"]["meters"]["cold_water"]
 
     hist = await read_router.api_history(apt.id, year=None, month=None, user=tenant)
     assert "grand_total" not in hist["billing"]
@@ -460,8 +462,111 @@ async def test_people_section_tenants_edit_and_overdue_indicator(temp_db, monkey
     assert upd["phone"] == "+7-999-000-1122"
 
 
+@pytest.mark.asyncio
+async def test_minor_update_unified_electricity_device_partial_settings_and_batch_replace(temp_db, monkeypatch):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment(
+        "42",
+        fam.id,
+        property_type="house",
+        enabled_meters=["cold_water", "hot_water", "t1", "t2", "t3"],
+    )
+    await crud.get_or_create_user(201, name="Владелец", role="landlord", family_id=fam.id)
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # 1. Partial settings update preserves previously saved submission days
+    await apt_router.api_update_settings(
+        apt.id,
+        ApartmentSettingsBody(water_submission_day=20, electricity_submission_day=25),
+        user=admin,
+    )
+    await apt_router.api_update_settings(
+        apt.id,
+        ApartmentSettingsBody(tariffs={"t1": "6", "t2": "3", "t3": "4"}),
+        user=admin,
+    )
+    reloaded = await crud.get_apartment(apt.id)
+    assert reloaded.water_submission_day == 20
+    assert reloaded.electricity_submission_day == 25
+
+    # 2. T1/T2/T3 collapse into one physical electricity meter device ("t")
+    meters_resp = await apt_router.api_get_meter_devices(apt.id, user=admin)
+    dev_types = [d["meter_type"] for d in meters_resp["devices"]]
+    assert dev_types == ["cold_water", "hot_water", "t"]
+
+    # Save serial & verification date for unified electricity device ("t")
+    await apt_router.api_update_meter_devices(
+        apt.id,
+        MeterDevicesUpdateBody(
+            items=[
+                MeterDeviceItemBody(
+                    meter_type="t",
+                    serial_number="EL-777",
+                    verification_due_date="25/02/2027",
+                    notify_intervals=["3m"],
+                )
+            ]
+        ),
+        user=admin,
+    )
+    bot = DummyBot()
+    await scheduler.check_meter_verifications(bot, today=datetime.date(2026, 11, 25))
+    assert len(bot.sent) == 1
+    assert "Электрический счётчик" in bot.sent[0]["text"]
+    assert "EL-777" in bot.sent[0]["text"]
+
+    # 3. Multi-tariff electricity meter replacement preserves T1/T2/T3 residuals
+    await operations.update_initial_readings_atomic(apt.id, {"t1": 100, "t2": 200, "t3": 300}, 100)
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 11, 20))
+    monkeypatch.setattr(calculations, "local_today", lambda: datetime.date(2026, 11, 20))
+    monkeypatch.setattr(apt_router, "local_today", lambda: datetime.date(2026, 11, 20))
+    monkeypatch.setattr(read_router, "local_today", lambda: datetime.date(2026, 11, 20))
+
+    rep = await apt_router.api_replace_meter(
+        apt.id,
+        MeterReplacementBody(
+            meter_type="t",
+            tariff_entries=[
+                MeterReplacementTariffEntry(meter_type="t1", old_final_value=110, new_initial_value=0),
+                MeterReplacementTariffEntry(meter_type="t2", old_final_value=220, new_initial_value=0),
+                MeterReplacementTariffEntry(meter_type="t3", old_final_value=305, new_initial_value=0),
+            ],
+            new_serial_number="EL-888",
+        ),
+        user=admin,
+    )
+    assert rep["ok"] is True
+    bill = await calculations.calculate_billing(apt.id, year=2026, month=11)
+    assert bill.meters["t1"].consumption == 10
+    assert bill.meters["t2"].consumption == 20
+    assert bill.meters["t3"].consumption == 5
+    assert bill.electricity_consumption_total == 35
+
+
+
+@pytest.mark.asyncio
+async def test_medium_09_startup_catchup_runs_once_without_kwarg_collision(temp_db, tmp_path, monkeypatch):
+    bdir = tmp_path / "backups_catchup"
+    bdir.mkdir()
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite+aiosqlite:///{temp_db}")
+    monkeypatch.setattr(config, "BACKUP_DIR", bdir)
+
+    bot = DummyBot()
+    now_after_15 = datetime.datetime(2026, 11, 25, 16, 35, tzinfo=config.BOT_TZ)
+    executed1 = await scheduler.run_missed_jobs_on_startup(bot, now=now_after_15)
+    assert set(executed1) == {"daily_backup", "meter_reminders", "lease_expirations", "meter_verifications"}
+
+    # Second startup on the same day must not duplicate jobs
+    executed2 = await scheduler.run_missed_jobs_on_startup(bot, now=now_after_15)
+    assert executed2 == []
+
 def test_ui_strings_and_removed_photo_storage_notice():
-    app_js = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    import re as _re
+
+    base_dir = Path(__file__).resolve().parent.parent
+    app_js = (base_dir / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    style_css = (base_dir / "webapp" / "static" / "style.css").read_text(encoding="utf-8")
+
     assert "сохранено на сервере" not in app_js
     assert "Сохранить показания электроэнергии" in app_js
     assert "👤 Аренда" in app_js
@@ -469,9 +574,23 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert "🟡" in app_js
     assert "ХВС минус Полив" in app_js
     assert "ХВС − Полив" not in app_js
-    assert 'label: "Люди"' in app_js
+    assert 'ico: "👨‍👩‍👧‍👦", label: "Люди"' in app_js
+    assert 'ico: "🌆", label: "Недвижимость"' in app_js
     assert "Зажмите и перетащите объект или нажмите ⇅" in app_js
-    assert "Удалить только договор (доступ нанимателя к боту сохранится)" in app_js
+    assert r"Удалить только договор\n(доступ нанимателя к боту сохранится)" in app_js
     assert "Удалить договор и открепить нанимателей" in app_js
     assert "Уведомить о поверке или замене счётчика" in app_js
     assert "Замена счётчика" in app_js
+    assert "🔧 Управление счётчиками" in app_js
+    assert "💧 Водомер холодной воды" in app_js
+    assert "♨️ Водомер горячей воды" in app_js
+    assert "⚡ Электрический счётчик" in app_js
+    assert "🚰 Имеющиеся счётчики воды и газа" in app_js
+    assert "📅 Дни подачи показаний" in app_js
+    assert "💰 Тарифы" in app_js
+    assert 'class="del-x">❌</span>' in app_js
+    # No modal should have "Отмена" before primary action button
+    assert not _re.findall(r'\[\s*\{\s*label:\s*"Отмена"', app_js)
+    # Danger buttons are gray with red bold text
+    assert ".btn-danger { background: var(--bg2); color: var(--danger);" in style_css
+    assert "font-weight: 700;" in style_css

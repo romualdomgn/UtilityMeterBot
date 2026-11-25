@@ -205,7 +205,8 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
         if not dev.verification_due_date:
             continue
         enabled = set(get_apartment_enabled_meters(apt))
-        if dev.meter_type not in enabled:
+        is_unified_elec = dev.meter_type == "t" and any(em in enabled for em in ELECTRICITY_METERS)
+        if dev.meter_type not in enabled and not is_unified_elec:
             continue
         intervals = parse_notify_intervals(dev.notify_intervals)
         if not intervals:
@@ -222,7 +223,14 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
         if matched_phrase is None:
             continue
 
-        meter_name = h(METER_PLAIN_LABELS.get(dev.meter_type, dev.meter_type))
+        device_names = {
+            "cold_water": "Водомер холодной воды",
+            "hot_water": "Водомер горячей воды",
+            "irrigation": "Поливной водомер",
+            "t": "Электрический счётчик",
+            "gas": "Газовый счётчик",
+        }
+        meter_name = h(device_names.get(dev.meter_type, METER_PLAIN_LABELS.get(dev.meter_type, dev.meter_type)))
         prop_label = h(format_property_short(apt))
         serial_part = f" (№ {h(dev.serial_number)})" if dev.serial_number else ""
         due_str = fmt_date(dev.verification_due_date)
@@ -244,8 +252,8 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
                 logger.warning("Verification reminder failed for %s: %s", uid, e)
 
 
-async def _run_job_once_today(job_key: str, fn, *args, today: datetime.date | None = None, **kwargs) -> bool:
-    cur = today or local_today()
+async def _run_job_once_today(job_key: str, fn, *args, run_date: datetime.date | None = None, **kwargs) -> bool:
+    cur = run_date or local_today()
     if await crud.has_scheduler_run(job_key, cur):
         return False
     await fn(*args, **kwargs)
@@ -283,7 +291,7 @@ async def run_missed_jobs_on_startup(bot: Bot, now: datetime.datetime | None = N
     for job_key, hour, minute, fn, args, kwargs in schedule_plan:
         if (current.hour, current.minute) >= (hour, minute):
             try:
-                ran = await _run_job_once_today(job_key, fn, *args, today=today, **kwargs)
+                ran = await _run_job_once_today(job_key, fn, *args, run_date=today, **kwargs)
                 if ran:
                     executed.append(job_key)
             except Exception as e:

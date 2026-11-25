@@ -107,10 +107,17 @@ class MeterDevicesUpdateBody(BaseModel):
     items: list[MeterDeviceItemBody]
 
 
-class MeterReplacementBody(BaseModel):
+class MeterReplacementTariffEntry(BaseModel):
     meter_type: str
     old_final_value: StrictReadingInt
     new_initial_value: StrictReadingInt
+
+
+class MeterReplacementBody(BaseModel):
+    meter_type: str
+    old_final_value: StrictReadingInt | None = None
+    new_initial_value: StrictReadingInt | None = None
+    tariff_entries: list[MeterReplacementTariffEntry] | None = None
     new_serial_number: str | None = Field(default=None, max_length=100)
     new_verification_due_date: str | None = None
 
