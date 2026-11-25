@@ -1,12 +1,12 @@
-"""Pydantic schemas and shared serialization helpers for Web App API."""
+"""Pydantic schemas with strict SQLite integer bounds (MEDIUM-03) and shared serialization helpers."""
 
 from __future__ import annotations
 
 import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, Strict
 
 from database.models import (
     PROPERTY_ICONS,
@@ -16,11 +16,19 @@ from database.models import (
     get_apartment_enabled_meters,
     get_apartment_irrigation_mode,
     is_apartment_rented,
+    parse_notify_intervals,
 )
 from webapp.auth import WebAppUser
 
+MAX_READING_VALUE = 999_999_999_999
+MAX_SQLITE_INT64 = 9_223_372_036_854_775_807
+
+StrictReadingInt = Annotated[int, Strict(), Field(ge=0, le=MAX_READING_VALUE)]
+StrictTelegramId = Annotated[int, Strict(), Field(ge=1, le=MAX_SQLITE_INT64)]
+
 PropertyTypeLiteral = Literal["apartment", "house", "dacha"]
 IrrigationModeLiteral = Literal["after_cold", "parallel"]
+NotifyIntervalLiteral = Literal["6m", "3m", "1m", "1w"]
 
 
 class ProfileUpdateBody(BaseModel):
@@ -51,38 +59,60 @@ class ApartmentSettingsBody(BaseModel):
 
 
 class InitialReadingsBody(BaseModel):
-    cold_water: int | None = None
-    hot_water: int | None = None
-    irrigation: int | None = None
-    t: int | None = None
-    t1: int | None = None
-    t2: int | None = None
-    t3: int | None = None
-    gas: int | None = None
+    cold_water: StrictReadingInt | None = None
+    hot_water: StrictReadingInt | None = None
+    irrigation: StrictReadingInt | None = None
+    t: StrictReadingInt | None = None
+    t1: StrictReadingInt | None = None
+    t2: StrictReadingInt | None = None
+    t3: StrictReadingInt | None = None
+    gas: StrictReadingInt | None = None
 
 
 class WaterReadingBody(BaseModel):
-    cold_water: int | None = None
-    hot_water: int | None = None
-    irrigation: int | None = None
+    cold_water: StrictReadingInt | None = None
+    hot_water: StrictReadingInt | None = None
+    irrigation: StrictReadingInt | None = None
     force: bool = False
+    submission_id: str | None = Field(default=None, max_length=64)
 
 
 class ElectricityReadingBody(BaseModel):
-    t: int | None = None
-    t1: int | None = None
-    t2: int | None = None
-    t3: int | None = None
+    t: StrictReadingInt | None = None
+    t1: StrictReadingInt | None = None
+    t2: StrictReadingInt | None = None
+    t3: StrictReadingInt | None = None
     force: bool = False
+    submission_id: str | None = Field(default=None, max_length=64)
 
 
 class GasReadingBody(BaseModel):
-    gas: int
+    gas: StrictReadingInt
     force: bool = False
+    submission_id: str | None = Field(default=None, max_length=64)
 
 
 class ReadingCorrectionBody(BaseModel):
-    value: int
+    value: StrictReadingInt
+
+
+class MeterDeviceItemBody(BaseModel):
+    meter_type: str
+    serial_number: str | None = Field(default=None, max_length=100)
+    verification_due_date: str | None = None
+    notify_intervals: list[NotifyIntervalLiteral] = []
+
+
+class MeterDevicesUpdateBody(BaseModel):
+    items: list[MeterDeviceItemBody]
+
+
+class MeterReplacementBody(BaseModel):
+    meter_type: str
+    old_final_value: StrictReadingInt
+    new_initial_value: StrictReadingInt
+    new_serial_number: str | None = Field(default=None, max_length=100)
+    new_verification_due_date: str | None = None
 
 
 class ContractBody(BaseModel):
@@ -93,10 +123,15 @@ class ContractBody(BaseModel):
 
 
 class TenantCreateBody(BaseModel):
-    telegram_id: int
+    telegram_id: StrictTelegramId
     name: str
     phone: str | None = None
     force_no_contract: bool = False
+
+
+class TenantUpdateBody(BaseModel):
+    name: str
+    phone: str | None = None
 
 
 class FamilyBody(BaseModel):
@@ -104,7 +139,7 @@ class FamilyBody(BaseModel):
 
 
 class FamilyOwnerBody(BaseModel):
-    telegram_id: int
+    telegram_id: StrictTelegramId
     name: str
     phone: str | None = None
 
@@ -131,7 +166,24 @@ def parse_iso_date(raw: str | None) -> datetime.date | None:
     raise HTTPException(400, f"Неверный формат даты: {raw} (ожидается ДД/ММ/ГГГГ)")
 
 
-def serialize_apartment(apt, has_linked_tenants: bool = False) -> dict:
+def serialize_meter_device(meter_type: str, device) -> dict:
+    return {
+        "meter_type": meter_type,
+        "serial_number": device.serial_number if device else None,
+        "verification_due_date": (
+            device.verification_due_date.isoformat()
+            if (device and device.verification_due_date)
+            else None
+        ),
+        "notify_intervals": parse_notify_intervals(device.notify_intervals) if device else [],
+    }
+
+
+def serialize_apartment(
+    apt,
+    has_linked_tenants: bool = False,
+    has_overdue_meters: bool = False,
+) -> dict:
     ptype = getattr(apt, "property_type", None) or "apartment"
     return {
         "id": apt.id,
@@ -146,6 +198,7 @@ def serialize_apartment(apt, has_linked_tenants: bool = False) -> dict:
         "family_id": apt.family_id,
         "has_tenant": apt.has_tenant,
         "is_rented": is_apartment_rented(apt, has_linked_tenants=has_linked_tenants),
+        "has_overdue_meters": bool(has_overdue_meters),
         "agreement_no": apt.agreement_no,
         "agreement_date_start": apt.agreement_date_start.isoformat() if apt.agreement_date_start else None,
         "agreement_date_finish": apt.agreement_date_finish.isoformat() if apt.agreement_date_finish else None,

@@ -1,17 +1,14 @@
-"""Minimal Telegram chat handlers: Mini App launcher + direct meter photo forwarding."""
+"""Minimal Telegram chat handlers: Mini App launcher + direct meter photo forwarding (no server storage)."""
 
 from __future__ import annotations
 
-import datetime
 import logging
-import uuid
 from html import escape as h
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import MenuButtonWebApp, Message, WebAppInfo
 
-from config import BOT_TZ, PHOTOS_DIR
 from database import crud
 from database.models import format_property_short
 from services.access import get_accessible_apartments, resolve_user_access
@@ -81,24 +78,22 @@ async def on_direct_photo(message: Message) -> None:
     apt = apts[0]
     prop_label = format_property_short(apt)
     photo = message.photo[-1]
-    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
-    filepath = PHOTOS_DIR / f"apt{apt.id}_{tid}_{ts}_{uuid.uuid4().hex[:8]}.jpg"
-    await message.bot.download(photo, destination=filepath)
 
     sender_name = (user.name if user and user.name else message.from_user.full_name) or str(tid)
     sent = await forward_meter_photo_file(
         bot=message.bot,
         apt_id=apt.id,
-        filepath=filepath,
+        filepath=None,
         sender_tg_id=tid,
         sender_name=sender_name,
         comment=message.caption or "",
+        photo_file_id=photo.file_id,
     )
     await crud.add_audit_log(tid, "upload_photo_chat", f"{prop_label}, получателей: {sent}")
     if sent > 0:
         await message.answer(f"✅ Фото счётчика ({h(prop_label)}) отправлено владельцам ({sent}).", parse_mode="HTML")
     else:
         await message.answer(
-            f"⚠️ Фото сохранено ({h(prop_label)}), но получателей уведомлений не найдено.",
+            f"⚠️ Получателей уведомлений для {h(prop_label)} не найдено — фото не было доставлено.",
             parse_mode="HTML",
         )

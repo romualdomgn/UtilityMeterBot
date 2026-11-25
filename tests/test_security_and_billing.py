@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import config
 from database import crud, operations
 from database.models import Base
+from database.session import _run_sqlite_migrations, attach_sqlite_pragmas
 from services import access, backup, calculations, notifications, scheduler
 
 
@@ -21,8 +22,10 @@ from services import access, backup, calculations, notifications, scheduler
 async def temp_db(tmp_path, monkeypatch):
     db_file = tmp_path / "test.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
+    attach_sqlite_pragmas(engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_run_sqlite_migrations)
 
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(crud, "async_session_factory", factory)

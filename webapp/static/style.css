@@ -536,3 +536,89 @@ body.is-dragging-apt {
 input.int-mask {
   font-variant-numeric: tabular-nums;
 }
+
+.overdue-dot {
+  font-size: 9px;
+  line-height: 1;
+  vertical-align: middle;
+  margin-left: 2px;
+}
+
+.input-error {
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 1px var(--danger);
+}
+
+.inline-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.meter-device-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.meter-device-card h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.notify-chips {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.notify-chip {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 9px;
+  padding: 8px 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.notify-chip.active {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #2563eb;
+}
+
+.inline-link-btn {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.incomplete-banner {
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  margin-top: 8px;
+}
+
+.modal-actions-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

@@ -1,4 +1,4 @@
-"""Excel and PDF report generators with unique filenames and async disk writes."""
+"""Excel and PDF report generators with full off-loop rendering (MEDIUM-11) and completeness flags."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def _fmt_opt(val) -> str:
 
 
 def _safe_sheet_title(raw: str, used: set[str]) -> str:
-    cleaned = re.sub(r"[\\/*?:\[\]]", "_", raw).strip() or "Объект"
+    cleaned = re.sub(r"[\/*?:\[\]]", "_", raw).strip() or "Объект"
     base = cleaned[:31]
     if base not in used:
         used.add(base)
@@ -54,7 +54,35 @@ def _safe_sheet_title(raw: str, used: set[str]) -> str:
         idx += 1
 
 
-async def generate_excel_report(apartments: list) -> Path:
+async def _collect_export_snapshots(apartments: list, history_limit: int) -> list[dict]:
+    snapshots: list[dict] = []
+    for apt in apartments:
+        billing = await calculate_billing(apt.id)
+        total_count = await crud.get_readings_count(apt.id)
+        readings = await crud.get_all_readings(apt.id, limit=history_limit)
+        snapshots.append({
+            "short": format_property_short(apt),
+            "title": format_property_title(apt),
+            "agreement_no": apt.agreement_no or "—",
+            "agreement_start": fmt_date(apt.agreement_date_start),
+            "agreement_finish": fmt_date(apt.agreement_date_finish),
+            "billing": billing,
+            "total_count": total_count,
+            "readings": [
+                {
+                    "id": r.id,
+                    "date": r.reading_date.strftime("%d.%m.%Y"),
+                    "meter_type": r.meter_type,
+                    "value": r.value,
+                    "submitted_by": r.submitted_by,
+                }
+                for r in readings
+            ],
+        })
+    return snapshots
+
+
+def _build_excel_sync(snapshots: list[dict], filepath: Path) -> Path:
     wb = Workbook()
     first = True
     used_titles: set[str] = set()
@@ -62,22 +90,27 @@ async def generate_excel_report(apartments: list) -> Path:
     header_font = Font(color="FFFFFF", bold=True)
     bold_font = Font(bold=True)
 
-    for apt in apartments:
-        title = _safe_sheet_title(format_property_short(apt), used_titles)
+    for snap in snapshots:
+        title = _safe_sheet_title(snap["short"], used_titles)
         ws = wb.active if first else wb.create_sheet(title=title)
         ws.title = title
         first = False
 
         ws.append([
-            format_property_title(apt),
-            f"Договор: {apt.agreement_no or '—'}",
-            f"Срок: {fmt_date(apt.agreement_date_start)} — {fmt_date(apt.agreement_date_finish)}",
+            snap["title"],
+            f"Договор: {snap['agreement_no']}",
+            f"Срок: {snap['agreement_start']} — {snap['agreement_finish']}",
         ])
         ws["A1"].font = bold_font
         ws.append([])
 
-        billing = await calculate_billing(apt.id)
-        ws.append(["Текущий расчёт", billing.period_label])
+        billing = snap["billing"]
+        status_note = (
+            ""
+            if billing.is_complete
+            else f" (предварительный: {', '.join(billing.incomplete_reasons)})"
+        )
+        ws.append(["Текущий расчёт", f"{billing.period_label}{status_note}"])
         ws[f"A{ws.max_row}"].font = bold_font
         ws.append(["Счётчик", "Предыдущее", "Текущее", "Расход", "Ед.", "Тариф (₽)", "Сумма (₽)"])
         for cell in ws[ws.max_row]:
@@ -112,9 +145,9 @@ async def generate_excel_report(apartments: list) -> Path:
             sew = billing.sewerage
             has_gvs = "hot_water" in billing.meters
             sew_label = (
-                "Водоотведение (ХВС+ГВС−Полив)" if (is_irr_after_cold and has_gvs)
-                else "Водоотведение (ХВС−Полив)" if is_irr_after_cold
-                else "Водоотведение (ХВС+ГВС)"
+                "Водоотведение (ХВС + ГВС минус Полив)" if (is_irr_after_cold and has_gvs)
+                else "Водоотведение (ХВС минус Полив)" if is_irr_after_cold
+                else "Водоотведение (ХВС + ГВС)"
             )
             ws.append([
                 sew_label,
@@ -139,13 +172,15 @@ async def generate_excel_report(apartments: list) -> Path:
             ws.append(["Итого электричество", "", "", billing.electricity_consumption_total, "кВт·ч", "", billing.electricity_total])
         if any(m in billing.meters for m in GAS_METERS):
             ws.append(["Итого газ", "", "", billing.gas_consumption_total, "м³", "", billing.gas_total])
-        ws.append(["ВСЕГО К ОПЛАТЕ", "", "", "", "", "", billing.grand_total])
+
+        total_label = "ВСЕГО К ОПЛАТЕ" if billing.is_complete else "ВСЕГО К ОПЛАТЕ (предварительно)"
+        ws.append([total_label, "", "", "", "", "", billing.grand_total])
         ws[f"A{ws.max_row}"].font = bold_font
         ws[f"G{ws.max_row}"].font = bold_font
         ws.append([])
 
-        total_count = await crud.get_readings_count(apt.id)
-        readings = await crud.get_all_readings(apt.id, limit=EXCEL_HISTORY_LIMIT)
+        readings = snap["readings"]
+        total_count = snap["total_count"]
         hist_title = (
             f"История показаний (показаны последние {len(readings)} из {total_count})"
             if total_count > len(readings)
@@ -160,46 +195,45 @@ async def generate_excel_report(apartments: list) -> Path:
 
         for r in readings:
             ws.append([
-                r.id,
-                r.reading_date.strftime("%d.%m.%Y"),
-                METER_PLAIN_LABELS.get(r.meter_type, r.meter_type),
-                r.value,
-                METER_UNITS.get(r.meter_type, ""),
-                r.submitted_by,
+                r["id"],
+                r["date"],
+                METER_PLAIN_LABELS.get(r["meter_type"], r["meter_type"]),
+                r["value"],
+                METER_UNITS.get(r["meter_type"], ""),
+                r["submitted_by"],
             ])
 
         for col in ws.columns:
             max_len = max(len(str(c.value or "")) for c in col)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 34)
 
-    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
-    filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.xlsx"
-    await asyncio.to_thread(wb.save, filepath)
+    wb.save(filepath)
     return filepath
 
 
-async def generate_pdf_report(apartments: list) -> Path:
+def _build_pdf_sync(snapshots: list[dict], filepath: Path) -> Path:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=14)
     pdf.add_font("DejaVu", "", FONT_PATH)
     pdf.add_font("DejaVu", "B", FONT_BOLD_PATH)
 
-    for apt in apartments:
+    for snap in snapshots:
         pdf.add_page()
         pdf.set_font("DejaVu", "B", 14)
-        pdf.cell(0, 10, f"Отчёт — {format_property_title(apt)}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 10, f"Отчёт — {snap['title']}", new_x="LMARGIN", new_y="NEXT")
 
         pdf.set_font("DejaVu", "", 10)
         pdf.cell(
             0, 6,
-            f"Договор: {apt.agreement_no or '—'} | Период: {fmt_date(apt.agreement_date_start)} — {fmt_date(apt.agreement_date_finish)}",
+            f"Договор: {snap['agreement_no']} | Период: {snap['agreement_start']} — {snap['agreement_finish']}",
             new_x="LMARGIN", new_y="NEXT",
         )
         pdf.ln(3)
 
-        billing = await calculate_billing(apt.id)
+        billing = snap["billing"]
+        status_note = "" if billing.is_complete else " — предварительный расчёт"
         pdf.set_font("DejaVu", "B", 11)
-        pdf.cell(0, 8, f"Текущий расчёт ({billing.period_label})", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 8, f"Текущий расчёт ({billing.period_label}{status_note})", new_x="LMARGIN", new_y="NEXT")
 
         headers = ["Счётчик", "Пред.", "Тек.", "Расход", "Тариф", "Сумма (₽)"]
         widths = [32, 26, 26, 28, 36, 36]
@@ -260,15 +294,19 @@ async def generate_pdf_report(apartments: list) -> Path:
             totals_parts.append(f"Электричество: {fmt_num(billing.electricity_total)} ₽")
         if any(m in billing.meters for m in GAS_METERS):
             totals_parts.append(f"Газ: {fmt_num(billing.gas_total)} ₽")
-        totals_parts.append(f"ИТОГО: {fmt_num(billing.grand_total)} ₽")
+        total_suffix = "" if billing.is_complete else " (предв.)"
+        totals_parts.append(f"ИТОГО: {fmt_num(billing.grand_total)} ₽{total_suffix}")
 
         pdf.set_font("DejaVu", "B", 10)
         pdf.ln(2)
         pdf.cell(0, 7, "  |  ".join(totals_parts), new_x="LMARGIN", new_y="NEXT")
+        if not billing.is_complete:
+            pdf.set_font("DejaVu", "", 8)
+            pdf.cell(0, 5, f"Причина неполноты: {', '.join(billing.incomplete_reasons)}", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(4)
 
-        total_count = await crud.get_readings_count(apt.id)
-        readings = await crud.get_all_readings(apt.id, limit=PDF_HISTORY_LIMIT)
+        readings = snap["readings"]
+        total_count = snap["total_count"]
         hist_title = (
             f"Последние показания (показано {len(readings)} из {total_count})"
             if total_count > len(readings)
@@ -289,16 +327,28 @@ async def generate_pdf_report(apartments: list) -> Path:
             pdf.set_font("DejaVu", "", 9)
             for r in readings:
                 row = [
-                    r.reading_date.strftime("%d.%m.%Y"),
-                    METER_PLAIN_LABELS.get(r.meter_type, r.meter_type),
-                    f"{r.value} {METER_UNITS.get(r.meter_type, '')}",
-                    str(r.submitted_by),
+                    r["date"],
+                    METER_PLAIN_LABELS.get(r["meter_type"], r["meter_type"]),
+                    f"{r['value']} {METER_UNITS.get(r['meter_type'], '')}",
+                    str(r["submitted_by"]),
                 ]
                 for val, w in zip(row, r_widths):
                     pdf.cell(w, 6, val, border=1, align="C")
                 pdf.ln()
 
+    pdf.output(str(filepath))
+    return filepath
+
+
+async def generate_excel_report(apartments: list) -> Path:
+    snapshots = await _collect_export_snapshots(apartments, EXCEL_HISTORY_LIMIT)
+    ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
+    filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.xlsx"
+    return await asyncio.to_thread(_build_excel_sync, snapshots, filepath)
+
+
+async def generate_pdf_report(apartments: list) -> Path:
+    snapshots = await _collect_export_snapshots(apartments, PDF_HISTORY_LIMIT)
     ts = datetime.datetime.now(BOT_TZ).strftime("%Y%m%d_%H%M%S")
     filepath = EXPORT_DIR / f"utility_report_{ts}_{uuid.uuid4().hex[:8]}.pdf"
-    await asyncio.to_thread(pdf.output, str(filepath))
-    return filepath
+    return await asyncio.to_thread(_build_pdf_sync, snapshots, filepath)

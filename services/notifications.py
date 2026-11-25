@@ -1,11 +1,13 @@
-"""Telegram bot notification helpers with HTML escaping and delivery reporting."""
+"""Telegram bot notification helpers with HTML escaping, direct photo forwarding, and managed background tasks."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from html import escape as h
 from pathlib import Path
+from typing import Coroutine
 
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -19,8 +21,45 @@ from services.calculations import fmt_date, format_reading_notification
 logger = logging.getLogger(__name__)
 
 
+class BackgroundTaskManager:
+    """MEDIUM-08: tracked background task runner with error logging and graceful shutdown."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task] = set()
+
+    def spawn(self, coro: Coroutine, name: str = "bg_notification") -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        self._tasks.add(task)
+
+        def _done_cb(t: asyncio.Task) -> None:
+            self._tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning("Background task %s failed: %s", t.get_name(), exc)
+
+        task.add_done_callback(_done_cb)
+        return task
+
+    async def wait_all(self, timeout: float = 10.0) -> None:
+        if not self._tasks:
+            return
+        pending = list(self._tasks)
+        _, still_pending = await asyncio.wait(pending, timeout=timeout)
+        for t in still_pending:
+            t.cancel()
+
+
+async def dispatch_notification(request, coro: Coroutine, name: str = "notification") -> None:
+    mgr = getattr(getattr(getattr(request, "app", None), "state", None), "bg_tasks", None)
+    if isinstance(mgr, BackgroundTaskManager):
+        mgr.spawn(coro, name=name)
+    else:
+        await coro
+
+
 def get_webapp_version() -> str:
-    """Compute a short content hash of static Mini App assets for URL cache-busting."""
     static_dir = BASE_DIR / "webapp" / "static"
     hasher = hashlib.sha256()
     for name in ("index.html", "style.css", "app.js"):
@@ -33,7 +72,6 @@ def get_webapp_version() -> str:
 
 
 def build_webapp_url(tab: str | None = None) -> str:
-    """Build Mini App URL with asset version query param to bypass Telegram WebView cache."""
     ver = get_webapp_version()
     if tab:
         return f"{WEBAPP_URL}/?v={ver}&tab={tab}"
@@ -79,7 +117,6 @@ async def notify_new_readings(
 
 
 async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str) -> bool:
-    """Send welcome invite to tenant; return True if delivered."""
     agr_no = h(apt.agreement_no or "б/н")
     date_start = fmt_date(apt.agreement_date_start)
     date_finish = fmt_date(apt.agreement_date_finish)
@@ -124,15 +161,19 @@ async def notify_tenant_removed(
 async def forward_meter_photo_file(
     bot: Bot,
     apt_id: int,
-    filepath: Path,
+    filepath: Path | None,
     sender_tg_id: int,
     sender_name: str,
     comment: str = "",
+    photo_file_id: str | None = None,
 ) -> int:
     apt = await crud.get_apartment(apt_id)
     if not apt:
         return 0
     recipients = [r for r in await get_notification_recipients(apt_id) if r != sender_tg_id]
+    if not recipients:
+        return 0
+
     safe_comment = h(comment.strip()[:500])
     caption = (
         f"📷 Фото счётчиков — <b>{h(format_property_short(apt))}</b>\n"
@@ -144,9 +185,10 @@ async def forward_meter_photo_file(
     sent = 0
     for uid in recipients:
         try:
+            photo_payload = photo_file_id if photo_file_id else FSInputFile(filepath)
             await bot.send_photo(
                 chat_id=uid,
-                photo=FSInputFile(filepath),
+                photo=photo_payload,
                 caption=caption,
                 parse_mode="HTML",
             )

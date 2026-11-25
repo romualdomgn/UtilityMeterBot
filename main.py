@@ -15,6 +15,7 @@ from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from bot_handlers import router as bot_router
 from config import (
     ADMIN_TELEGRAM_ID,
+    DROP_PENDING_UPDATES,
     TELEGRAM_BOT_TOKEN,
     WEBAPP_HOST,
     WEBAPP_PORT,
@@ -22,8 +23,8 @@ from config import (
 )
 from database import crud
 from database.session import init_db
-from services.notifications import build_webapp_url
-from services.scheduler import setup_scheduler
+from services.notifications import BackgroundTaskManager, build_webapp_url
+from services.scheduler import run_missed_jobs_on_startup, setup_scheduler
 from webapp.api import create_web_app
 
 logging.basicConfig(
@@ -35,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 async def seed_admin() -> None:
-    """CRITICAL-02 & MEDIUM-07: sync only ADMIN_TELEGRAM_ID and revoke stale admins."""
     if not ADMIN_TELEGRAM_ID:
         logger.warning(
             "ADMIN_TELEGRAM_ID не задан (равен 0) — административные функции будут недоступны."
@@ -58,7 +58,6 @@ async def setup_bot_ui(bot: Bot) -> None:
     except Exception as e:
         logger.warning("Could not set default menu button: %s", e)
 
-    # Also refresh per-chat menu buttons so existing users immediately get the new ?v= URL
     chat_ids: set[int] = set()
     if ADMIN_TELEGRAM_ID:
         chat_ids.add(ADMIN_TELEGRAM_ID)
@@ -93,8 +92,10 @@ async def main() -> None:
     await setup_bot_ui(bot)
     scheduler = setup_scheduler(bot)
     scheduler.start()
+    await run_missed_jobs_on_startup(bot)
 
-    web_app = create_web_app(bot)
+    bg_tasks = BackgroundTaskManager()
+    web_app = create_web_app(bot, bg_tasks=bg_tasks)
     uvicorn_cfg = uvicorn.Config(
         web_app,
         host=WEBAPP_HOST,
@@ -103,7 +104,7 @@ async def main() -> None:
     )
     server = uvicorn.Server(uvicorn_cfg)
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
     logger.info("Utility Meter Web App + Bot started on %s:%s (%s)", WEBAPP_HOST, WEBAPP_PORT, WEBAPP_URL)
 
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
@@ -123,6 +124,7 @@ async def main() -> None:
             if not task.done():
                 task.cancel()
         await asyncio.gather(polling_task, server_task, return_exceptions=True)
+        await bg_tasks.wait_all(timeout=10.0)
         scheduler.shutdown(wait=False)
         await bot.session.close()
 

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import config
 from database import crud, operations
 from database.models import Base, get_apartment_enabled_meters
-from database.session import _run_sqlite_migrations
+from database.session import _run_sqlite_migrations, attach_sqlite_pragmas
 from services import calculations, scheduler
 from webapp.auth import WebAppUser, validate_init_data
 from webapp.routers import apartments as apt_router
@@ -55,6 +55,7 @@ def make_request(bot: DummyBot | None = None):
 async def temp_db(tmp_path, monkeypatch):
     db_file = tmp_path / "test_features.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
+    attach_sqlite_pragmas(engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_run_sqlite_migrations)
@@ -108,6 +109,7 @@ def test_validate_init_data_valid_and_invalid(monkeypatch):
 async def test_sqlite_migration_adds_new_columns_to_legacy_table(tmp_path):
     db_file = tmp_path / "legacy.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
+    attach_sqlite_pragmas(engine)
     async with engine.begin() as conn:
         await conn.execute(text(
             "CREATE TABLE apartments ("
@@ -191,6 +193,7 @@ async def test_property_types_custom_meters_gas_and_partial_readings(temp_db):
 @pytest.mark.asyncio
 async def test_gas_reminder_and_enabled_meters_in_scheduler(temp_db):
     fam = await crud.create_family("F")
+    await crud.get_or_create_user(201, name="Владелец", role="landlord", family_id=fam.id)
     apt = await crud.create_apartment("Уч. 5", fam.id, property_type="dacha", enabled_meters=["t1", "gas"])
     await crud.update_apartment(apt.id, gas_submission_day=25, water_submission_day=25)
 
@@ -525,7 +528,9 @@ async def test_single_tariff_electricity_mutual_exclusion_billing_and_scheduler(
         user=admin,
     )
 
-    # Scheduler reminds about single-tariff electricity meter
+    # Scheduler reminds landlord about single-tariff electricity meter
+    apt_obj = await crud.get_apartment(apt_id)
+    await crud.get_or_create_user(202, name="Владелец", role="landlord", family_id=apt_obj.family_id)
     await scheduler.check_meter_reminders(bot, today=datetime.date(2026, 11, 24))
     assert any("электрического счётчика" in msg["text"] for msg in bot.sent)
 
@@ -734,7 +739,7 @@ async def test_house_irrigation_excluded_from_sewerage_and_rented_status_logic(t
     assert det_contract["apartment"]["is_rented"] is True
 
     # Removing contract leaves property unrented (no tenant and no contract)
-    await ten_router.api_delete_contract(apt_id, user=admin)
+    await ten_router.api_delete_contract(apt_id, request=req, unlink_tenants=False, user=admin)
     det_free = await apt_router.api_apartment_detail(apt_id, user=admin)
     assert det_free["apartment"]["is_rented"] is False
 
@@ -825,7 +830,7 @@ async def test_irrigation_after_cold_vs_parallel_billing_and_ui(temp_db):
     assert bill_after.grand_total == 1900
 
     # Clamp sewerage to 0 if irrigation exceeds ХВС
-    await read_router.api_submit_water(apt_id, WaterReadingBody(irrigation=95), req, user=admin)
+    await read_router.api_submit_water(apt_id, WaterReadingBody(irrigation=95, force=True), req, user=admin)
     bill_clamped = await calculations.calculate_billing(apt_id)
     assert bill_clamped.sewerage_consumption_total == 0
     assert bill_clamped.sewerage_total == 0

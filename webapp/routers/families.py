@@ -1,4 +1,4 @@
-"""Family groups and co-owners management endpoints."""
+"""People (family groups, co-owners including admin, and family tenants) endpoints."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import config
 from database import crud, operations
+from database.models import format_property_short
 from services.access import is_admin, user_can_manage_family
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import FamilyBody, FamilyOwnerBody, FamilyOwnerUpdateBody, require_role
@@ -23,7 +24,9 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
         fams = [fam] if fam else []
 
     items = []
+    family_ids: list[int] = []
     for f in fams:
+        family_ids.append(f.id)
         owners = await crud.get_family_owners(f.id)
         apts = await crud.get_apartments_by_family(f.id)
         items.append({
@@ -31,11 +34,43 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
             "name": f.name,
             "apartments_count": len(apts),
             "owners": [
-                {"telegram_id": o.telegram_id, "name": o.name, "phone": o.phone}
+                {
+                    "telegram_id": o.telegram_id,
+                    "name": o.name,
+                    "phone": o.phone,
+                    "is_admin": bool(config.ADMIN_TELEGRAM_ID and o.telegram_id == config.ADMIN_TELEGRAM_ID),
+                }
                 for o in owners
             ],
         })
-    return {"can_create": is_admin(user.telegram_id), "families": items}
+
+    tenant_pairs = await crud.get_tenants_for_families(family_ids)
+    tenants_map: dict[int, dict] = {}
+    for t_user, apt in tenant_pairs:
+        entry = tenants_map.get(t_user.telegram_id)
+        if entry is None:
+            entry = {
+                "telegram_id": t_user.telegram_id,
+                "name": t_user.name,
+                "phone": t_user.phone,
+                "family_id": t_user.family_id,
+                "apartments": [],
+            }
+            tenants_map[t_user.telegram_id] = entry
+        entry["apartments"].append({
+            "id": apt.id,
+            "display_name": format_property_short(apt),
+            "agreement_no": apt.agreement_no,
+            "agreement_date_finish": (
+                apt.agreement_date_finish.isoformat() if apt.agreement_date_finish else None
+            ),
+        })
+
+    return {
+        "can_create": is_admin(user.telegram_id),
+        "families": items,
+        "tenants": list(tenants_map.values()),
+    }
 
 
 @router.post("/api/families")
@@ -44,8 +79,7 @@ async def api_create_family(body: FamilyBody, user: WebAppUser = Depends(get_cur
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Название семьи не может быть пустым")
-    fam = await crud.create_family(name)
-    await crud.add_audit_log(user.telegram_id, "create_family", f"Семья '{name}' (id={fam.id})")
+    fam = await operations.create_family_atomic(name, user.telegram_id)
     return {"ok": True, "id": fam.id}
 
 
@@ -58,8 +92,10 @@ async def api_rename_family(
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Название не может быть пустым")
-    await crud.rename_family(family_id, name)
-    await crud.add_audit_log(user.telegram_id, "rename_family", f"Семья id={family_id} → '{name}'")
+    try:
+        await operations.rename_family_atomic(family_id, name, user.telegram_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True}
 
 
@@ -81,27 +117,24 @@ async def api_add_family_owner(
         raise HTTPException(403, "Нет доступа")
     if body.telegram_id <= 0:
         raise HTTPException(400, "Telegram ID должен быть положительным числом")
-    if body.telegram_id == config.ADMIN_TELEGRAM_ID:
-        raise HTTPException(400, "Администратор уже имеет доступ ко всем семьям")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Имя не может быть пустым")
+    if len(name) > 120:
+        raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
 
-    existing = await crud.get_user_by_telegram_id(body.telegram_id)
-    if existing:
-        raise HTTPException(400, f"Пользователь ID {body.telegram_id} уже зарегистрирован ({existing.role})")
-
-    await crud.get_or_create_user(
-        telegram_id=body.telegram_id,
-        name=name,
-        phone=(body.phone or "").strip() or None,
-        role="landlord",
-        family_id=family_id,
-    )
-    await crud.add_audit_log(
-        user.telegram_id, "add_family_owner",
-        f"Владелец {name} (ID: {body.telegram_id}) добавлен в семью id={family_id}",
-    )
+    try:
+        await operations.add_family_owner_atomic(
+            family_id=family_id,
+            telegram_id=body.telegram_id,
+            name=name,
+            phone=(body.phone or "").strip() or None,
+            actor_tg_id=user.telegram_id,
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except operations.ConflictError as e:
+        raise HTTPException(409, str(e))
     return {"ok": True}
 
 
@@ -123,21 +156,18 @@ async def api_update_family_owner(
     update_phone = "phone" in body.model_fields_set
     phone_val = (body.phone or "").strip() or None if update_phone else None
 
-    updated = await crud.update_family_owner(
-        family_id=family_id,
-        owner_tg_id=owner_tg_id,
-        name=name,
-        phone=phone_val,
-        update_phone=update_phone,
-    )
-    if not updated:
-        raise HTTPException(404, "Член семьи не найден")
+    try:
+        updated = await operations.update_family_owner_atomic(
+            family_id=family_id,
+            owner_tg_id=owner_tg_id,
+            name=name,
+            phone=phone_val,
+            update_phone=update_phone,
+            actor_tg_id=user.telegram_id,
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
 
-    await crud.add_audit_log(
-        user.telegram_id,
-        "update_family_owner",
-        f"Владелец ID={owner_tg_id} (семья id={family_id}) обновлён: имя='{name}'",
-    )
     return {"ok": True, "name": updated.name, "phone": updated.phone}
 
 

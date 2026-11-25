@@ -42,6 +42,14 @@ IRRIGATION_MODE_AFTER_COLD = "after_cold"
 IRRIGATION_MODE_PARALLEL = "parallel"
 IRRIGATION_MODES = (IRRIGATION_MODE_AFTER_COLD, IRRIGATION_MODE_PARALLEL)
 
+VERIFICATION_NOTIFY_INTERVALS = ("6m", "3m", "1m", "1w")
+VERIFICATION_INTERVAL_LABELS = {
+    "6m": "Полгода",
+    "3m": "3 месяца",
+    "1m": "Месяц",
+    "1w": "Неделя",
+}
+
 PROPERTY_TYPES = {
     "apartment": "Квартира",
     "house": "Дом",
@@ -109,6 +117,22 @@ def serialize_enabled_meters(meters: Iterable[str]) -> str:
     chosen = set(meters)
     ordered = [m for m in ALL_METERS if m in chosen]
     return ",".join(ordered)
+
+
+def serialize_notify_intervals(intervals: Iterable[str] | None) -> str | None:
+    """Serialize verification reminder intervals in canonical order."""
+    if not intervals:
+        return None
+    chosen = set(intervals)
+    ordered = [iv for iv in VERIFICATION_NOTIFY_INTERVALS if iv in chosen]
+    return ",".join(ordered) or None
+
+
+def parse_notify_intervals(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    chosen = {part.strip() for part in raw.split(",") if part.strip()}
+    return [iv for iv in VERIFICATION_NOTIFY_INTERVALS if iv in chosen]
 
 
 def get_apartment_enabled_meters(apt) -> list[str]:
@@ -184,6 +208,9 @@ class Family(Base):
         back_populates="family", cascade="all, delete-orphan"
     )
     users: Mapped[list["User"]] = relationship(back_populates="family")
+    owner_links: Mapped[list["FamilyOwner"]] = relationship(
+        back_populates="family", cascade="all, delete-orphan"
+    )
 
 
 class User(Base):
@@ -206,6 +233,32 @@ class User(Base):
     apartment_links: Mapped[list["ApartmentUser"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    family_owner_links: Mapped[list["FamilyOwner"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class FamilyOwner(Base):
+    """Explicit owner membership in a family (allows attaching admin to any family)."""
+
+    __tablename__ = "family_owners"
+    __table_args__ = (
+        UniqueConstraint("family_id", "user_id", name="uq_family_owner"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    family_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("families.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+    family: Mapped[Family] = relationship(back_populates="owner_links")
+    user: Mapped[User] = relationship(back_populates="family_owner_links")
 
 
 class Apartment(Base):
@@ -244,6 +297,12 @@ class Apartment(Base):
         back_populates="apartment", cascade="all, delete-orphan"
     )
     readings: Mapped[list["MeterReading"]] = relationship(
+        back_populates="apartment", cascade="all, delete-orphan"
+    )
+    meter_devices: Mapped[list["MeterDevice"]] = relationship(
+        back_populates="apartment", cascade="all, delete-orphan"
+    )
+    meter_replacements: Mapped[list["MeterReplacement"]] = relationship(
         back_populates="apartment", cascade="all, delete-orphan"
     )
 
@@ -316,11 +375,92 @@ class MeterReading(Base):
     value: Mapped[int] = mapped_column(Integer, nullable=False)
     submitted_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reading_date: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
+    is_replacement_init: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
     )
 
     apartment: Mapped[Apartment] = relationship(back_populates="readings")
+
+
+class MeterDevice(Base):
+    """Meter metadata: serial number, verification due date, and reminder intervals."""
+
+    __tablename__ = "meter_devices"
+    __table_args__ = (
+        UniqueConstraint("apartment_id", "meter_type", name="uq_meter_device_apt_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("apartments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    meter_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    serial_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    verification_due_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    notify_intervals: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow_naive, onupdate=utcnow_naive, nullable=False
+    )
+
+    apartment: Mapped[Apartment] = relationship(back_populates="meter_devices")
+
+
+class MeterReplacement(Base):
+    """History of physical meter replacements to preserve mid-month consumption continuity."""
+
+    __tablename__ = "meter_replacements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("apartments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    meter_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    replacement_date: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
+    old_final_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_initial_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    init_reading_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    old_serial_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    new_serial_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    replaced_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+    apartment: Mapped[Apartment] = relationship(back_populates="meter_replacements")
+
+
+class MeterSubmission(Base):
+    """Idempotency ledger for meter reading submissions (HIGH-07)."""
+
+    __tablename__ = "meter_submissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    submission_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    apartment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("apartments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    submitted_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+
+class SchedulerRun(Base):
+    """Daily execution markers for scheduled jobs to prevent missed or duplicate runs (MEDIUM-09)."""
+
+    __tablename__ = "scheduler_runs"
+    __table_args__ = (
+        UniqueConstraint("job_key", "run_date", name="uq_scheduler_run_job_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    run_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    completed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
 
 
 class AuditLog(Base):

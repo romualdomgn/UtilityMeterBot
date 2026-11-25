@@ -44,8 +44,11 @@ def validate_init_data(init_data: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid auth_date")
 
-    if time.time() - auth_date > config.INIT_DATA_MAX_AGE_SECONDS:
+    now = time.time()
+    if now - auth_date > config.INIT_DATA_MAX_AGE_SECONDS:
         raise HTTPException(status_code=401, detail="initData expired")
+    if auth_date - now > config.INIT_DATA_MAX_FUTURE_SKEW_SECONDS:
+        raise HTTPException(status_code=401, detail="Invalid auth_date (future timestamp)")
 
     return fields
 

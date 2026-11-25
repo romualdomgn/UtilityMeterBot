@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from services.notifications import BackgroundTaskManager
 from webapp.routers import admin, apartments, families, readings, tenants
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -24,7 +25,6 @@ def _asset_hash(filename: str) -> str:
 
 
 def render_index_html() -> str:
-    """Inject content hashes into /style.css and /app.js to bypass Cloudflare/WebView cache."""
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     css_v = _asset_hash("style.css")
     js_v = _asset_hash("app.js")
@@ -33,9 +33,10 @@ def render_index_html() -> str:
     return html
 
 
-def create_web_app(bot) -> FastAPI:
+def create_web_app(bot, bg_tasks: BackgroundTaskManager | None = None) -> FastAPI:
     app = FastAPI(title="Utility Meter Web App")
     app.state.bot = bot
+    app.state.bg_tasks = bg_tasks or BackgroundTaskManager()
 
     @app.middleware("http")
     async def disable_static_cache(request: Request, call_next):
