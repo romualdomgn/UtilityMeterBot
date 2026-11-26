@@ -1,4 +1,4 @@
-"""Minimal Telegram chat handlers: Mini App launcher + direct meter photo forwarding (no server storage)."""
+"""Minimal Telegram chat handlers: Mini App launcher, About info, and direct meter photo forwarding."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from html import escape as h
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
-from aiogram.types import MenuButtonWebApp, Message, WebAppInfo
+from aiogram.types import CallbackQuery, LinkPreviewOptions, MenuButtonWebApp, Message, WebAppInfo
 
+import config
 from database import crud
 from database.models import format_property_short
 from services.access import get_accessible_apartments, resolve_user_access
@@ -22,6 +23,39 @@ ROLE_TITLES = {
     "landlord": "Владелец",
     "tenant": "Наниматель",
 }
+
+
+def build_about_text(
+    repository: str | None = None,
+    tg_username: str | None = None,
+) -> str:
+    """Format 'About app' message with clickable repository and Telegram creator links."""
+    repo_raw = (config.REPOSITORY if repository is None else repository).strip()
+    if repo_raw:
+        repo_href = repo_raw if repo_raw.startswith(("http://", "https://")) else f"https://{repo_raw}"
+        repo_html = f'<a href="{h(repo_href, quote=True)}">{h(repo_raw)}</a>'
+    else:
+        repo_html = "не указан"
+
+    tg_raw = (config.TG_USERNAME if tg_username is None else tg_username).strip()
+    if tg_raw:
+        handle = tg_raw
+        for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+            if handle.lower().startswith(prefix):
+                handle = handle[len(prefix):]
+        handle = handle.strip().lstrip("@").strip("/")
+        if handle:
+            tg_html = f'<a href="https://t.me/{h(handle, quote=True)}">@{h(handle)}</a>'
+        else:
+            tg_html = h(tg_raw)
+    else:
+        tg_html = "не указан"
+
+    return (
+        f"Данный бот это приложение с открытым исходным кодом. "
+        f"Репозиторий находится по адресу {repo_html}.\n"
+        f"Предложения по улучшению дизайна и юзабилити (UX/UI) направлять создателю и администратору бота {tg_html}"
+    )
 
 
 @router.message(CommandStart())
@@ -49,9 +83,20 @@ async def cmd_start(message: Message) -> None:
         f"Ваша роль: <b>{role_label}</b>\n"
         f"Нажмите кнопку ниже, чтобы открыть панель управления.\n\n"
         f"<i>В этот чат будут приходить напоминания, уведомления, фото счётчиков и выгрузки (Excel/PDF/бэкапы).</i>",
-        reply_markup=webapp_open_kb("📱 Открыть Mini App"),
+        reply_markup=webapp_open_kb("📱 Открыть Mini App", include_about=True),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "about_app")
+async def on_about_app(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            build_about_text(),
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
 
 
 @router.message(F.photo)

@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+import config
 from config import local_today
 from database import crud, operations
 from database.models import (
@@ -132,6 +133,10 @@ async def api_me(user: WebAppUser = Depends(get_current_user)):
             "family_id": user.family_id,
         },
         "apartments": serialized,
+        "app_info": {
+            "repository": config.REPOSITORY,
+            "tg_username": config.TG_USERNAME,
+        },
     }
 
 

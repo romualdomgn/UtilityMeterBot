@@ -97,6 +97,7 @@ async def submit_meter_group_atomic(
     reading_date: datetime.date,
     action: str,
     force: bool = False,
+    allow_decrease: bool = False,
     submission_id: str | None = None,
     dedup_window_seconds: int = 10,
 ) -> SubmissionOutcome:
@@ -154,7 +155,7 @@ async def submit_meter_group_atomic(
             mt for mt, val in meters.items()
             if prev_meters[mt] is not None and val < prev_meters[mt]
         ]
-        if decreased:
+        if decreased and not allow_decrease:
             return SubmissionOutcome(
                 status="rejected_decrease",
                 prev_meters=prev_meters,
@@ -227,10 +228,11 @@ async def submit_meter_group_atomic(
 
         prop_label = format_property_short(apt)
         parts = ", ".join(f"{METER_PLAIN_LABELS.get(mt, mt)}={val}" for mt, val in meters.items())
+        suffix = " (корректировка)" if (decreased and allow_decrease) else ""
         s.add(AuditLog(
             user_telegram_id=submitted_by,
             action=action,
-            details=f"{prop_label} (id={apartment_id}): {parts}",
+            details=f"{prop_label} (id={apartment_id}): {parts}{suffix}",
         ))
         return SubmissionOutcome(
             status="saved",

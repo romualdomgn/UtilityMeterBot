@@ -64,6 +64,7 @@ async def _save_meter_group(
     submission_id: str | None,
     action: str,
     user: WebAppUser,
+    allow_decrease: bool = False,
 ) -> dict:
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа к объекту недвижимости")
@@ -71,6 +72,9 @@ async def _save_meter_group(
         raise HTTPException(400, "Укажите хотя бы одно показание счётчика")
     if any(v < 0 for v in meters.values()):
         raise HTTPException(400, "Показания должны быть неотрицательными целыми числами")
+
+    can_force_decrease = user.role in ("admin", "landlord")
+    effective_allow_decrease = bool(allow_decrease and can_force_decrease)
 
     try:
         outcome = await operations.submit_meter_group_atomic(
@@ -80,6 +84,7 @@ async def _save_meter_group(
             reading_date=local_today(),
             action=action,
             force=force,
+            allow_decrease=effective_allow_decrease,
             submission_id=submission_id,
         )
     except operations.ConflictError as e:
@@ -90,22 +95,24 @@ async def _save_meter_group(
         raise HTTPException(400, str(e))
 
     if outcome.status == "rejected_decrease":
-        if user.role == "tenant":
+        if not can_force_decrease:
             warning = (
                 "Вы ввели значение меньше, чем уже зафиксировано. "
                 "Если счётчик был заменён или ранее допущена ошибка, обратитесь к владельцу объекта."
             )
         else:
             warning = (
-                "Вы ввели значение меньше, чем уже зафиксировано. "
-                "Если заменён счётчик, то перейдите в раздел «Недвижимость» -> Настройки "
-                "и в разделе «Управление счётчиками» найдите кнопку «Замена счётчика»."
+                "Вы ввели значение меньше, чем уже зафиксировано.\n"
+                "Если это корректировка ошибочно введённого значения, то нажмите «Сохранить».\n"
+                "Если заменён счётчик, то перейдите в раздел «Недвижимость» -> «Настройки» "
+                "и в разделе «Управление счётчиками» нажмите «Замена счётчика»."
             )
         return {
             "ok": False,
             "rejected_decrease": True,
             "decreased": outcome.decreased,
-            "can_open_meters": user.role in ("admin", "landlord"),
+            "can_open_meters": can_force_decrease,
+            "can_force_decrease": can_force_decrease,
             "warning": warning,
         }
 
@@ -165,7 +172,8 @@ async def api_submit_water(
     if not meters:
         raise HTTPException(400, "Укажите показание хотя бы одного счётчика воды")
     return await _save_meter_group(
-        request, apt_id, meters, body.force, body.submission_id, "submit_water", user
+        request, apt_id, meters, body.force, body.submission_id, "submit_water", user,
+        allow_decrease=body.allow_decrease,
     )
 
 
@@ -184,7 +192,8 @@ async def api_submit_electricity(
     if not meters:
         raise HTTPException(400, "Укажите показание хотя бы одного тарифа электричества")
     return await _save_meter_group(
-        request, apt_id, meters, body.force, body.submission_id, "submit_electricity", user
+        request, apt_id, meters, body.force, body.submission_id, "submit_electricity", user,
+        allow_decrease=body.allow_decrease,
     )
 
 
@@ -197,7 +206,8 @@ async def api_submit_gas(
 ):
     meters = {"gas": body.gas}
     return await _save_meter_group(
-        request, apt_id, meters, body.force, body.submission_id, "submit_gas", user
+        request, apt_id, meters, body.force, body.submission_id, "submit_gas", user,
+        allow_decrease=body.allow_decrease,
     )
 
 

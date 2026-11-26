@@ -41,6 +41,8 @@ INIT_DATA_MAX_AGE_SECONDS: int = int(os.getenv("INIT_DATA_MAX_AGE_SECONDS", str(
 INIT_DATA_MAX_FUTURE_SKEW_SECONDS: int = int(os.getenv("INIT_DATA_MAX_FUTURE_SKEW_SECONDS", "300"))
 ADMIN_TELEGRAM_ID: int = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
 DROP_PENDING_UPDATES: bool = _env_bool("DROP_PENDING_UPDATES", default=False)
+REPOSITORY: str = (os.getenv("REPOSITORY") or "").strip()
+TG_USERNAME: str = (os.getenv("TgUserName") or os.getenv("TG_USERNAME") or "").strip()
 
 # ── Database ──────────────────────────────────────────────────────────
 DATABASE_URL: str = os.getenv(

@@ -229,9 +229,14 @@ body {
   pointer-events: none;
 }
 
-.subtabs { display: flex; background: var(--bg2); border-radius: 11px; padding: 3px; gap: 4px; margin-bottom: 12px; }
+.subtabs { display: flex; align-items: stretch; background: var(--bg2); border-radius: 11px; padding: 3px; gap: 4px; margin-bottom: 12px; }
 .subtab {
   flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.2;
   border: none;
   background: transparent;
   color: var(--hint);
@@ -608,6 +613,7 @@ input.int-mask {
   font-weight: 600;
   cursor: pointer;
   text-decoration: underline;
+  text-align: center;
 }
 
 .incomplete-banner {
@@ -663,3 +669,51 @@ input.int-mask {
   margin-left: 8px;
   flex-shrink: 0;
 }
+
+.rent-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 8px;
+}
+
+.rent-check input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.rent-sub-options {
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  margin-top: 6px;
+}
+
+.rent-sub-panel {
+  padding: 4px 0 10px;
+}
+
+.guide-text p {
+  margin: 0 0 8px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+.guide-text p:last-child { margin-bottom: 0; }
+.guide-text ul {
+  margin: 6px 0 8px;
+  padding-left: 18px;
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+.guide-text li { margin-bottom: 4px; }

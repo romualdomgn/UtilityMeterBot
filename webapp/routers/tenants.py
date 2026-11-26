@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import calendar
+import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import config
@@ -23,6 +26,24 @@ from webapp.schemas import (
 )
 
 router = APIRouter()
+
+LONG_TERM_CONTRACT_WARNING = (
+    "Срок договора больше года! Если срок договора превышает 12 месяцев, "
+    "возникающее обременение права собственности (факт долгосрочного найма) нужно зарегистрировать в Росреестре! "
+    "Безопасный срок договора найма не более 11 месяцев с дальнейшим продлением проживания по новому договору!"
+)
+
+
+def is_contract_over_one_year(
+    date_start: datetime.date | None,
+    date_finish: datetime.date | None,
+) -> bool:
+    """Return True if the period between start and finish strictly exceeds 1 calendar year."""
+    if not date_start or not date_finish:
+        return False
+    max_day = calendar.monthrange(date_start.year + 1, date_start.month)[1]
+    one_year_later = datetime.date(date_start.year + 1, date_start.month, min(date_start.day, max_day))
+    return date_finish > one_year_later
 
 
 @router.put("/api/apartments/{apt_id}/contract")
@@ -50,7 +71,10 @@ async def api_update_contract(
         await operations.update_contract_atomic(apt_id, updates, user.telegram_id)
     except LookupError as e:
         raise HTTPException(404, str(e))
-    return {"ok": True}
+    resp: dict = {"ok": True}
+    if is_contract_over_one_year(date_start, date_finish):
+        resp["long_term_warning"] = LONG_TERM_CONTRACT_WARNING
+    return resp
 
 
 @router.delete("/api/apartments/{apt_id}/contract")

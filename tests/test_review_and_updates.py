@@ -22,7 +22,8 @@ from sqlalchemy import text
 
 import config
 from database import crud, operations
-from services import access, backup, calculations, scheduler
+import bot_handlers
+from services import access, backup, calculations, notifications, scheduler
 from webapp.auth import WebAppUser, validate_init_data
 from webapp.routers import admin as admin_router
 from webapp.routers import apartments as apt_router
@@ -32,6 +33,7 @@ from webapp.routers import tenants as ten_router
 from webapp.schemas import (
     ApartmentCreateBody,
     ApartmentSettingsBody,
+    ContractBody,
     FamilyBody,
     FamilyOwnerBody,
     MeterDeviceItemBody,
@@ -155,14 +157,49 @@ async def test_high_07_and_medium_02_idempotency_repeat_and_decrease(temp_db):
     assert r_rep_ok["ok"] is True and r_rep_ok["deduplicated"] is False
     assert await crud.get_readings_count(apt.id) == 2
 
-    # Decreasing value is rejected with replacement guidance
+    # Decreasing value without allow_decrease shows replacement + correction options for admin/landlord
     r_dec = await read_router.api_submit_water(
         apt.id, WaterReadingBody(cold_water=125, force=True, submission_id="sub-abc-3"), req, user=admin
     )
     assert r_dec["ok"] is False
     assert r_dec["rejected_decrease"] is True
     assert r_dec["can_open_meters"] is True
-    assert "Замена счётчика" in r_dec["warning"]
+    assert r_dec["can_force_decrease"] is True
+    assert r_dec["warning"] == (
+        "Вы ввели значение меньше, чем уже зафиксировано.\n"
+        "Если это корректировка ошибочно введённого значения, то нажмите «Сохранить».\n"
+        "Если заменён счётчик, то перейдите в раздел «Недвижимость» -> «Настройки» "
+        "и в разделе «Управление счётчиками» нажмите «Замена счётчика»."
+    )
+
+    # Confirming correction with allow_decrease=True saves the lower value for admin/landlord
+    r_corr = await read_router.api_submit_water(
+        apt.id,
+        WaterReadingBody(cold_water=125, force=True, allow_decrease=True, submission_id="sub-abc-3"),
+        req,
+        user=admin,
+    )
+    assert r_corr["ok"] is True and r_corr["deduplicated"] is False
+    latest_cw = await crud.get_latest_reading(apt.id, "cold_water")
+    assert latest_cw is not None and latest_cw.value == 125
+    logs = await crud.get_audit_logs(limit=5)
+    assert any("(корректировка)" in (l.details or "") for l in logs)
+
+    # Tenant CANNOT save a decreased reading even if crafting allow_decrease=True
+    u_t, _ = await crud.get_or_create_user(399, name="Жилец", role="tenant", family_id=fam.id)
+    await crud.link_user_to_apartment(apt.id, u_t.id, role="tenant")
+    tenant = WebAppUser(telegram_id=399, role="tenant", family_id=fam.id, name="Жилец")
+    r_ten_dec = await read_router.api_submit_water(
+        apt.id,
+        WaterReadingBody(cold_water=110, force=True, allow_decrease=True, submission_id="sub-ten-1"),
+        req,
+        user=tenant,
+    )
+    assert r_ten_dec["ok"] is False
+    assert r_ten_dec["rejected_decrease"] is True
+    assert r_ten_dec["can_open_meters"] is False
+    assert r_ten_dec["can_force_decrease"] is False
+    assert (await crud.get_latest_reading(apt.id, "cold_water")).value == 125
 
 
 @pytest.mark.asyncio
@@ -338,7 +375,7 @@ async def test_meter_verification_reminders_and_lease_expiration_text(temp_db):
                 MeterDeviceItemBody(
                     meter_type="cold_water",
                     serial_number="CW-001",
-                    verification_due_date="25/05/2027",
+                    verification_due_date="25.05.2027",
                     notify_intervals=["6m", "3m", "1m", "1w"],
                 )
             ]
@@ -502,7 +539,7 @@ async def test_minor_update_unified_electricity_device_partial_settings_and_batc
                 MeterDeviceItemBody(
                     meter_type="t",
                     serial_number="EL-777",
-                    verification_due_date="25/02/2027",
+                    verification_due_date="25.02.2027",
                     notify_intervals=["3m"],
                 )
             ]
@@ -560,6 +597,73 @@ async def test_medium_09_startup_catchup_runs_once_without_kwarg_collision(temp_
     executed2 = await scheduler.run_missed_jobs_on_startup(bot, now=now_after_15)
     assert executed2 == []
 
+
+@pytest.mark.asyncio
+async def test_contract_over_one_year_warning(temp_db):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("101", fam.id)
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # 11 months -> no warning
+    r11 = await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(agreement_no="1", agreement_date_start="01.01.2026", agreement_date_finish="01.12.2026"),
+        user=admin,
+    )
+    assert r11["ok"] is True
+    assert "long_term_warning" not in r11
+
+    # Exactly 1 year (12 months) -> no warning
+    r12 = await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(agreement_no="2", agreement_date_start="01.01.2026", agreement_date_finish="01.01.2027"),
+        user=admin,
+    )
+    assert r12["ok"] is True
+    assert "long_term_warning" not in r12
+
+    # More than 1 year -> warning returned with Rosreestr notice
+    r13 = await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(agreement_no="3", agreement_date_start="01.01.2026", agreement_date_finish="02.01.2027"),
+        user=admin,
+    )
+    assert r13["ok"] is True
+    assert "long_term_warning" in r13
+    assert "Росреестре" in r13["long_term_warning"]
+    assert "не более 11 месяцев" in r13["long_term_warning"]
+
+    # Leap-year boundary: 29/02/2024 -> 28/02/2025 is 1 year (no warning), 01/03/2025 is > 1 year
+    assert ten_router.is_contract_over_one_year(datetime.date(2024, 2, 29), datetime.date(2025, 2, 28)) is False
+    assert ten_router.is_contract_over_one_year(datetime.date(2024, 2, 29), datetime.date(2025, 3, 1)) is True
+
+
+def test_about_app_keyboard_and_clickable_links():
+    kb = notifications.webapp_open_kb("📱 Открыть Mini App", include_about=True)
+    assert len(kb.inline_keyboard) == 2
+    assert kb.inline_keyboard[0][0].text == "📱 Открыть Mini App"
+    assert kb.inline_keyboard[1][0].text == "ℹ️ О приложении"
+    assert kb.inline_keyboard[1][0].callback_data == "about_app"
+
+    text = bot_handlers.build_about_text(
+        repository="https://github.com/roman/utility-meter-bot",
+        tg_username="@roman_dev",
+    )
+    assert '<a href="https://github.com/roman/utility-meter-bot">https://github.com/roman/utility-meter-bot</a>' in text
+    assert '<a href="https://t.me/roman_dev">@roman_dev</a>' in text
+    assert "открытым исходным кодом" in text
+    assert "UX/UI" in text
+
+
+@pytest.mark.asyncio
+async def test_api_me_exposes_app_info_from_config(temp_db, monkeypatch):
+    monkeypatch.setattr(config, "REPOSITORY", "https://github.com/example/umb")
+    monkeypatch.setattr(config, "TG_USERNAME", "@example_admin")
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    me = await apt_router.api_me(user=admin)
+    assert me["app_info"]["repository"] == "https://github.com/example/umb"
+    assert me["app_info"]["tg_username"] == "@example_admin"
+
 def test_ui_strings_and_removed_photo_storage_notice():
     import re as _re
 
@@ -594,3 +698,45 @@ def test_ui_strings_and_removed_photo_storage_notice():
     # Danger buttons are gray with red bold text
     assert ".btn-danger { background: var(--bg2); color: var(--danger);" in style_css
     assert "font-weight: 700;" in style_css
+    assert "can_force_decrease" in app_js
+    assert "allow_decrease" in app_js
+    assert '<div class="mt-8 center"><button type="button" class="inline-link-btn" id="jump-to-meters-btn">' in app_js
+    assert "LONG_TERM_CONTRACT_WARNING" in app_js
+    assert "isContractOverOneYear" in app_js
+    assert "Росреестре" in app_js
+    assert "📏 Начальные<br>показания" in app_js
+    assert "Объект сдаётся в аренду" in app_js
+    assert 'id="c-rented"' in app_js
+    assert 'id="c-has-contract"' in app_js
+    assert 'id="rent-options-wrap"' in app_js
+    assert 'id="rent-tenant-section"' in app_js
+    assert 'id="rent-contract-section"' in app_js
+    assert "align-items: center;" in style_css
+    assert "ДД.ММ.ГГГГ" in app_js
+    assert "ДД/ММ/ГГГГ" not in app_js
+    assert "25.11.2026" in app_js
+    assert "25/11/2026" not in app_js
+    schemas_py = (base_dir / "webapp" / "schemas.py").read_text(encoding="utf-8")
+    assert "ДД.ММ.ГГГГ" in schemas_py
+    assert "ДД/ММ/ГГГГ" not in schemas_py
+    # Dirty-state save buttons across modals (disabled initially and re-disabled on revert)
+    assert 'id: "modal-save-meters"' in app_js
+    assert "updateMetersDirty" in app_js
+    assert 'id: "modal-replace-meter"' in app_js
+    assert 'id: "modal-add-tenant"' in app_js
+    assert 'id: "modal-add-owner"' in app_js
+    assert 'id: "modal-create-fam"' in app_js
+    assert 'id="btn-open-property-settings"' in app_js
+    assert "🏠 Настройки объекта недвижимости" in app_js
+    assert "function openPropertySettingsModal(" in app_js
+    assert 'id: "modal-save-property-basic"' in app_js
+    assert 'id="btn-admin-about"' in app_js
+    assert 'id="btn-admin-help"' in app_js
+    assert "📖 Как пользоваться приложением" in app_js
+    assert "APP_GUIDE_TOPICS" in app_js
+    assert "function openAboutAppModal(" in app_js
+    assert "function openAppGuideModal(" in app_js
+    assert "Выгрузка базы данных" in app_js
+    assert "Быстрая выгрузка в чат" not in app_js
+    assert "📊 Excel ${esc(fullLabel)}" in app_js
+    assert "📄 PDF ${esc(fullLabel)}" in app_js

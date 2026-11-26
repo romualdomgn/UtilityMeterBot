@@ -468,5 +468,7 @@ def format_reading_notification(
     unit = METER_UNITS.get(meter_type, "")
     if prev_val is None:
         return f"{label}: <b>{fmt_num(new_val)}</b> {unit} (начальное показание не задано)"
-    diff = max(0, new_val - prev_val)
+    if new_val < prev_val:
+        return f"{label}: {fmt_num(prev_val)} → <b>{fmt_num(new_val)}</b> {unit} (корректировка)"
+    diff = new_val - prev_val
     return f"{label}: {fmt_num(prev_val)} → <b>{fmt_num(new_val)}</b> {unit} (расход: {fmt_num(diff)} {unit})"

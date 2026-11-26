@@ -78,11 +78,18 @@ def build_webapp_url(tab: str | None = None) -> str:
     return f"{WEBAPP_URL}/?v={ver}"
 
 
-def webapp_open_kb(label: str = "📱 Открыть панель счётчиков", tab: str | None = None) -> InlineKeyboardMarkup:
+def webapp_open_kb(
+    label: str = "📱 Открыть панель счётчиков",
+    tab: str | None = None,
+    include_about: bool = False,
+) -> InlineKeyboardMarkup:
     url = build_webapp_url(tab=tab)
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=label, web_app=WebAppInfo(url=url))],
-    ])
+    ]
+    if include_about:
+        rows.append([InlineKeyboardButton(text="ℹ️ О приложении", callback_data="about_app")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def notify_new_readings(

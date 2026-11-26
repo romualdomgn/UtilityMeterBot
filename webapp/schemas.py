@@ -74,6 +74,7 @@ class WaterReadingBody(BaseModel):
     hot_water: StrictReadingInt | None = None
     irrigation: StrictReadingInt | None = None
     force: bool = False
+    allow_decrease: bool = False
     submission_id: str | None = Field(default=None, max_length=64)
 
 
@@ -83,12 +84,14 @@ class ElectricityReadingBody(BaseModel):
     t2: StrictReadingInt | None = None
     t3: StrictReadingInt | None = None
     force: bool = False
+    allow_decrease: bool = False
     submission_id: str | None = Field(default=None, max_length=64)
 
 
 class GasReadingBody(BaseModel):
     gas: StrictReadingInt
     force: bool = False
+    allow_decrease: bool = False
     submission_id: str | None = Field(default=None, max_length=64)
 
 
@@ -165,12 +168,12 @@ def parse_iso_date(raw: str | None) -> datetime.date | None:
     if not raw or not raw.strip():
         return None
     raw = raw.strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y"):
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             return datetime.datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
-    raise HTTPException(400, f"Неверный формат даты: {raw} (ожидается ДД/ММ/ГГГГ)")
+    raise HTTPException(400, f"Неверный формат даты: {raw} (ожидается ДД.ММ.ГГГГ)")
 
 
 def serialize_meter_device(meter_type: str, device) -> dict:

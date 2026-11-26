@@ -17,6 +17,7 @@ const state = {
   tabRenderSeq: 0,
   reorderMode: false,
   modalBusy: false,
+  appInfo: { repository: "", tg_username: "" },
 };
 
 const ROLE_RU = { admin: "Администратор", landlord: "Владелец", tenant: "Наниматель", revoked: "Отозван" };
@@ -224,27 +225,27 @@ function fmtDate(iso) {
 function isoToDisplayDate(iso) {
   if (!iso) return "";
   const m = String(iso).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso);
 }
 
 function formatDateMask(raw) {
   const trimmed = String(raw || "").trim();
   const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (isoMatch) {
-    return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`;
+    return `${isoMatch[3]}.${isoMatch[2]}.${isoMatch[1]}`;
   }
   const digits = trimmed.replace(/\D/g, "").slice(0, 8);
   if (digits.length <= 2) return digits;
-  if (digits.length <= 4) return `${digits.slice(0, 2)}/${digits.slice(2)}`;
-  return `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4, 8)}`;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}.${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}.${digits.slice(2, 4)}.${digits.slice(4, 8)}`;
 }
 
 function parseDisplayDate(raw) {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return { ok: true, iso: null, display: null };
-  const m = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const m = trimmed.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (!m) {
-    return { ok: false, error: "Укажите дату в формате ДД/ММ/ГГГГ (например, 25/11/2026)" };
+    return { ok: false, error: "Укажите дату в формате ДД.ММ.ГГГГ (например, 25.11.2026)" };
   }
   const day = Number(m[1]);
   const month = Number(m[2]);
@@ -259,8 +260,26 @@ function parseDisplayDate(raw) {
   return {
     ok: true,
     iso: `${m[3]}-${m[2]}-${m[1]}`,
-    display: `${m[1]}/${m[2]}/${m[3]}`,
+    display: `${m[1]}.${m[2]}.${m[3]}`,
   };
+}
+
+const LONG_TERM_CONTRACT_WARNING =
+  "Срок договора больше года! Если срок договора превышает 12 месяцев, " +
+  "возникающее обременение права собственности (факт долгосрочного найма) нужно зарегистрировать в Росреестре! " +
+  "Безопасный срок договора найма не более 11 месяцев с дальнейшим продлением проживания по новому договору!";
+
+function isContractOverOneYear(startIso, endIso) {
+  if (!startIso || !endIso) return false;
+  const [sy, sm, sd] = startIso.split("-").map(Number);
+  const [ey, em, ed] = endIso.split("-").map(Number);
+  const maxDay = new Date(sy + 1, sm, 0).getDate();
+  const limitYear = sy + 1;
+  const limitMonth = sm;
+  const limitDay = Math.min(sd, maxDay);
+  if (ey !== limitYear) return ey > limitYear;
+  if (em !== limitMonth) return em > limitMonth;
+  return ed > limitDay;
 }
 
 function attachDateField(textId, nativeId) {
@@ -292,7 +311,7 @@ function attachDateField(textId, nativeId) {
 function dateFieldHtml(textId, nativeId, isoVal, ariaLabel) {
   return `
     <div class="date-input-wrap">
-      <input type="text" inputmode="numeric" id="${textId}" class="date-mask" maxlength="10" placeholder="ДД/ММ/ГГГГ" value="${esc(isoToDisplayDate(isoVal))}" />
+      <input type="text" inputmode="numeric" id="${textId}" class="date-mask" maxlength="10" placeholder="ДД.ММ.ГГГГ" value="${esc(isoToDisplayDate(isoVal))}" />
       <span class="date-picker-trigger" title="Выбрать в календаре">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
         <input type="date" id="${nativeId}" class="date-native-overlay" tabindex="-1" aria-label="${esc(ariaLabel)}" value="${esc(isoVal || "")}" />
@@ -443,6 +462,15 @@ function wireTelegramLinks(container) {
       if (url && tg?.openTelegramLink) {
         e.preventDefault();
         tg.openTelegramLink(url);
+      }
+    });
+  });
+  container.querySelectorAll(".ext-link").forEach(link => {
+    link.addEventListener("click", (e) => {
+      const url = link.dataset.extLink || link.getAttribute("href");
+      if (url && tg?.openLink) {
+        e.preventDefault();
+        tg.openLink(url);
       }
     });
   });
@@ -638,6 +666,9 @@ async function loadBootstrap(applyUrlTab = false) {
     const me = await api("/api/me");
     state.user = me.user;
     state.apartments = me.apartments;
+    if (me.app_info) {
+      state.appInfo = me.app_info;
+    }
     if (!state.selectedAptId || !state.apartments.some(a => a.id === state.selectedAptId)) {
       state.selectedAptId = state.apartments[0]?.id || null;
     }
@@ -1092,15 +1123,14 @@ async function doExport(format, aptId) {
 }
 
 function renderExportCardHtml(apt) {
-  const shortLabel = apt ? propShort(apt) : "";
+  const fullLabel = apt ? propTitle(apt) : "";
   return `
     <div class="card">
-      <h3>📤 Быстрая выгрузка в чат</h3>
+      <h3>📤 Выгрузка базы данных</h3>
       ${apt ? `
-        <div class="small muted">Текущий объект: ${esc(shortLabel)}</div>
         <div class="grid-2 mt-8">
-          <button class="btn btn-secondary" id="exp-xlsx-one">📊 Excel (этот объект)</button>
-          <button class="btn btn-secondary" id="exp-pdf-one">📄 PDF (этот объект)</button>
+          <button class="btn btn-secondary" id="exp-xlsx-one">📊 Excel ${esc(fullLabel)}</button>
+          <button class="btn btn-secondary" id="exp-pdf-one">📄 PDF ${esc(fullLabel)}</button>
         </div>` : ""}
       <div class="grid-2 mt-8">
         <button class="btn btn-secondary" id="exp-xlsx-all">📦 Excel (все объекты)</button>
@@ -1328,11 +1358,15 @@ function renderSubmit(root) {
   };
 }
 
-async function submitMeterGroup(aptId, groupName, groupMeters, force, submissionId) {
+async function submitMeterGroup(aptId, groupName, groupMeters, force, submissionId, allowDecrease = false) {
   if (aptId !== state.selectedAptId) {
     return showToast("Выбран другой объект. Обновите форму.", "error");
   }
-  const payload = { force, submission_id: submissionId || genSubmissionId() };
+  const payload = {
+    force,
+    allow_decrease: Boolean(allowDecrease),
+    submission_id: submissionId || genSubmissionId(),
+  };
   let count = 0;
   for (const m of groupMeters) {
     const el = document.getElementById(`in-${m.id}`);
@@ -1353,12 +1387,28 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
 
     if (res.rejected_decrease) {
       if (btn) btn.disabled = false;
+      const warningHtml = String(res.warning || "")
+        .split("\n")
+        .filter(Boolean)
+        .map(line => `<p>${esc(line)}</p>`)
+        .join("");
       const linkHtml = res.can_open_meters
-        ? `<div class="mt-8"><button type="button" class="inline-link-btn" id="jump-to-meters-btn">🔧 Перейти к управлению счётчиками</button></div>`
+        ? `<div class="mt-8 center"><button type="button" class="inline-link-btn" id="jump-to-meters-btn">🔧 Перейти к управлению счётчиками</button></div>`
         : "";
-      openModal("⚠️ Значение меньше зафиксированного", `<p>${esc(res.warning)}</p>${linkHtml}`, [
-        { label: "Понятно", cls: "btn-secondary" },
-      ]);
+      const buttons = res.can_force_decrease
+        ? [
+            {
+              label: "Сохранить",
+              onClick: () => {
+                submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id, true);
+              },
+            },
+            { label: "Отмена", cls: "btn-secondary" },
+          ]
+        : [
+            { label: "Понятно", cls: "btn-secondary" },
+          ];
+      openModal("⚠️ Значение меньше зафиксированного", `${warningHtml}${linkHtml}`, buttons);
       document.getElementById("jump-to-meters-btn")?.addEventListener("click", async () => {
         closeModal(true);
         state.activeTab = "apartments";
@@ -1685,7 +1735,7 @@ async function openMetersModal(aptId) {
           <input type="text" id="md-ser-${mt}" maxlength="100" placeholder="Например: 12345678" value="${esc(dev.serial_number || "")}" />
         </div>
         <div class="field">
-          <label>Срок поверки (ДД/ММ/ГГГГ)</label>
+          <label>Срок поверки (ДД.ММ.ГГГГ)</label>
           ${dateFieldHtml(`md-due-${mt}`, `md-due-nat-${mt}`, dev.verification_due_date || "", `Срок поверки ${label}`)}
         </div>
         <div class="field" style="margin-bottom:0">
@@ -1709,9 +1759,20 @@ async function openMetersModal(aptId) {
     <div class="mt-8">${cardsHtml}</div>
   `;
 
+  const readMetersSnap = () => JSON.stringify(
+    physicalDevices.map(mt => ({
+      mt,
+      serial: (document.getElementById(`md-ser-${mt}`)?.value || "").trim(),
+      due: (document.getElementById(`md-due-${mt}`)?.value || "").trim(),
+      intervals: VERIFY_INTERVALS.map(v => v.id).filter(iv => selectedIntervals[mt].has(iv)),
+    }))
+  );
+
   openModal(`🔧 Управление счётчиками — ${propShort(apt)}`, bodyHtml, [
     {
+      id: "modal-save-meters",
       label: "💾 Сохранить",
+      disabled: true,
       onClick: async () => {
         const items = [];
         for (const mt of physicalDevices) {
@@ -1727,7 +1788,7 @@ async function openMetersModal(aptId) {
             meter_type: mt,
             serial_number: serial,
             verification_due_date: parsedDue.display,
-            notify_intervals: Array.from(selectedIntervals[mt]),
+            notify_intervals: VERIFY_INTERVALS.map(v => v.id).filter(iv => selectedIntervals[mt].has(iv)),
           });
         }
         try {
@@ -1745,6 +1806,18 @@ async function openMetersModal(aptId) {
 
   physicalDevices.forEach(mt => attachDateField(`md-due-${mt}`, `md-due-nat-${mt}`));
 
+  const initialMetersSnap = readMetersSnap();
+  const saveMetersBtn = document.getElementById("modal-save-meters");
+  const updateMetersDirty = () => {
+    if (saveMetersBtn) saveMetersBtn.disabled = readMetersSnap() === initialMetersSnap;
+  };
+
+  physicalDevices.forEach(mt => {
+    document.getElementById(`md-ser-${mt}`)?.addEventListener("input", updateMetersDirty);
+    document.getElementById(`md-due-${mt}`)?.addEventListener("input", updateMetersDirty);
+    document.getElementById(`md-due-${mt}`)?.addEventListener("change", updateMetersDirty);
+  });
+
   document.querySelectorAll(".notify-chip").forEach(btn => {
     btn.addEventListener("click", () => {
       haptic("light");
@@ -1757,6 +1830,7 @@ async function openMetersModal(aptId) {
         selectedIntervals[mt].add(iv);
         btn.classList.add("active");
       }
+      updateMetersDirty();
     });
   });
 
@@ -1832,12 +1906,14 @@ function openReplaceMeterModal(aptId) {
       <input type="text" id="rep-new-serial" maxlength="100" placeholder="Например: 87654321" />
     </div>
     <div class="field">
-      <label>Новый срок поверки (необязательно, ДД/ММ/ГГГГ)</label>
+      <label>Новый срок поверки (необязательно, ДД.ММ.ГГГГ)</label>
       ${dateFieldHtml("rep-new-due", "rep-new-due-nat", "", "Срок поверки нового счётчика")}
     </div>
   `, [
     {
+      id: "modal-replace-meter",
       label: "✅ Выполнить замену",
+      disabled: true,
       onClick: async () => {
         const devMt = document.getElementById("rep-meter-type").value;
         const dueParsed = parseDisplayDate(document.getElementById("rep-new-due").value);
@@ -1906,11 +1982,129 @@ function openReplaceMeterModal(aptId) {
   ]);
 
   attachDateField("rep-new-due", "rep-new-due-nat");
+  const replaceBtn = document.getElementById("modal-replace-meter");
+  const updateReplaceReady = () => {
+    if (!replaceBtn) return;
+    const devMt = document.getElementById("rep-meter-type")?.value;
+    const isMultiElec = devMt === "t" && multiElecEnabled.length > 0;
+    let ready = true;
+    if (isMultiElec) {
+      for (const mt of multiElecEnabled) {
+        const oldP = parseIntSpaces(document.getElementById(`rep-old-${mt}`)?.value);
+        const newP = parseIntSpaces(document.getElementById(`rep-new-${mt}`)?.value);
+        if (oldP.empty || !oldP.ok || newP.empty || !newP.ok) {
+          ready = false;
+          break;
+        }
+      }
+    } else {
+      const oldP = parseIntSpaces(document.getElementById("rep-old-final")?.value);
+      const newP = parseIntSpaces(document.getElementById("rep-new-init")?.value);
+      if (oldP.empty || !oldP.ok || newP.empty || !newP.ok) {
+        ready = false;
+      }
+    }
+    replaceBtn.disabled = !ready;
+  };
+  const wireReplaceInputs = () => {
+    document.querySelectorAll("#rep-values-wrap .int-mask").forEach(el => {
+      attachIntMask(el);
+      el.addEventListener("input", updateReplaceReady);
+    });
+    updateReplaceReady();
+  };
+  wireReplaceInputs();
   document.getElementById("rep-meter-type")?.addEventListener("change", (e) => {
     const wrap = document.getElementById("rep-values-wrap");
     if (!wrap) return;
     wrap.innerHTML = renderValueFields(e.target.value);
-    wrap.querySelectorAll(".int-mask").forEach(attachIntMask);
+    wireReplaceInputs();
+  });
+}
+
+function openPropertySettingsModal(aptId) {
+  const apt = state.aptDetail?.apartment;
+  if (!apt || apt.id !== aptId) return;
+  const enabled = getEnabledMeters(apt);
+  let editPropType = apt.property_type || "apartment";
+  const curMeta = getPropertyMeta(editPropType);
+
+  const bodyHtml = `
+    <div class="field">
+      <label>Тип недвижимости</label>
+      <div class="type-picker" id="edit-type-picker">
+        ${PROPERTY_TYPES.map(t => `
+          <button type="button" class="type-btn ${t.id === editPropType ? "active" : ""}" data-edit-ptype="${t.id}">
+            ${t.icon} ${t.label}
+          </button>
+        `).join("")}
+      </div>
+    </div>
+    <div class="field" style="margin-bottom:0">
+      <label id="edit-prop-num-label">${curMeta.numLabel}</label>
+      <input type="text" id="s-number" maxlength="50" value="${esc(apt.number)}" placeholder="${curMeta.placeholder}" />
+    </div>
+  `;
+
+  const initBasicSnap = JSON.stringify({
+    number: String(apt.number || "").trim(),
+    property_type: editPropType,
+  });
+
+  openModal(`🏠 Настройки объекта недвижимости`, bodyHtml, [
+    {
+      id: "modal-save-property-basic",
+      label: "💾 Сохранить",
+      disabled: true,
+      onClick: async () => {
+        const number = (document.getElementById("s-number")?.value || "").trim();
+        if (!number) {
+          showToast("Укажите номер или название объекта", "error");
+          return false;
+        }
+        const body = { number, property_type: editPropType };
+        if (editPropType !== "house" && enabled.includes("irrigation")) {
+          const filtered = enabled.filter(m => m !== "irrigation");
+          body.enabled_meters = filtered.length ? filtered : ["cold_water"];
+          body.irrigation_mode = "parallel";
+        }
+        try {
+          await api(`/api/apartments/${aptId}/settings`, { method: "PUT", body });
+          showToast("✅ Настройки объекта сохранены");
+          const me = await api("/api/me");
+          state.apartments = me.apartments;
+          renderAptSelector();
+          await loadApartmentDetail(aptId);
+          await renderTab();
+        } catch (err) {
+          showToast("❌ " + err.message, "error");
+          return false;
+        }
+      },
+    },
+    { label: "Отмена", cls: "btn-secondary" },
+  ]);
+
+  const saveBtn = document.getElementById("modal-save-property-basic");
+  const updateBasicDirty = () => {
+    if (!saveBtn) return;
+    const curNum = (document.getElementById("s-number")?.value || "").trim();
+    const curSnap = JSON.stringify({ number: curNum, property_type: editPropType });
+    saveBtn.disabled = !curNum || curSnap === initBasicSnap;
+  };
+
+  document.getElementById("s-number")?.addEventListener("input", updateBasicDirty);
+
+  document.querySelectorAll("#edit-type-picker .type-btn").forEach(btn => {
+    btn.onclick = () => {
+      haptic("light");
+      editPropType = btn.dataset.editPtype;
+      document.querySelectorAll("#edit-type-picker .type-btn").forEach(b => b.classList.toggle("active", b === btn));
+      const meta = getPropertyMeta(editPropType);
+      document.getElementById("edit-prop-num-label").textContent = meta.numLabel;
+      document.getElementById("s-number").placeholder = meta.placeholder;
+      updateBasicDirty();
+    };
   });
 }
 
@@ -2071,7 +2265,9 @@ function openSubmissionDaysModal(aptId) {
     if (saveBtn) saveBtn.disabled = readSnap() === initialSnap;
   };
   ["m-wday", "m-eday", "m-gday"].forEach(id => {
-    document.getElementById(id)?.addEventListener("input", updateDirty);
+    const el = document.getElementById(id);
+    el?.addEventListener("input", updateDirty);
+    el?.addEventListener("change", updateDirty);
   });
 }
 
@@ -2774,22 +2970,11 @@ function renderApartments(root) {
     if (state.manageSubtab === "settings") {
       const curMeta = getPropertyMeta(apt.property_type);
       bodyHtml = `
-        <div class="field">
-          <label>Тип недвижимости</label>
-          <div class="type-picker" id="edit-type-picker">
-            ${PROPERTY_TYPES.map(t => `
-              <button type="button" class="type-btn ${t.id === apt.property_type ? "active" : ""}" data-edit-ptype="${t.id}">
-                ${t.icon} ${t.label}
-              </button>
-            `).join("")}
-          </div>
-        </div>
-        <div class="field">
-          <label id="edit-prop-num-label">${curMeta.numLabel}</label>
-          <input type="text" id="s-number" maxlength="50" value="${esc(apt.number)}" placeholder="${curMeta.placeholder}" />
-        </div>
-        <button class="btn" id="btn-save-basic" disabled>💾 Сохранить</button>
-        <div class="settings-menu-stack">
+        <div class="settings-menu-stack" style="margin-top:0">
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-property-settings">
+            <span>🏠 Настройки объекта недвижимости</span>
+            <span class="settings-menu-arrow">›</span>
+          </button>
           <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-enabled-meters">
             <span id="lbl-open-enabled-meters">🚰 Имеющиеся счётчики воды и газа ${curMeta.inLocative}</span>
             <span class="settings-menu-arrow">›</span>
@@ -2824,30 +3009,52 @@ function renderApartments(root) {
         </div>
         <button class="btn" id="btn-save-initial" disabled>💾 Сохранить начальные показания</button>`;
     } else {
+      const initialRented = isPropertyRented(apt) || tenants.length > 0;
+      const initialHasTenantSection = Boolean(apt.has_tenant || tenants.length > 0);
+      const initialHasContract = hasContract(apt);
       bodyHtml = `
-        <div class="field"><label><input type="checkbox" id="c-has" ${apt.has_tenant ? "checked" : ""} style="width:auto;margin-right:6px" /> Наниматель проживает</label></div>
-        <div class="field"><label>🔢 Номер договора</label><input type="text" id="c-no" value="${esc(apt.agreement_no || "")}" /></div>
-        <div class="grid-2">
-          <div class="field">
-            <label>📅 Дата начала</label>
-            ${dateFieldHtml("c-start", "c-start-native", apt.agreement_date_start || "", "Выбрать дату начала")}
+        <label class="rent-check">
+          <input type="checkbox" id="c-rented" ${initialRented ? "checked" : ""} />
+          <span>Объект сдаётся в аренду</span>
+        </label>
+        <div id="rent-options-wrap" class="rent-sub-options ${initialRented ? "" : "hidden"}">
+          <label class="rent-check">
+            <input type="checkbox" id="c-has" ${initialHasTenantSection ? "checked" : ""} />
+            <span>Наниматель проживает</span>
+          </label>
+          <div id="rent-tenant-section" class="rent-sub-panel ${initialHasTenantSection ? "" : "hidden"}">
+            ${tenants.length ? tenants.map(t => `
+              <div class="table-row">
+                <div><div class="bold">${esc(t.name || "—")}</div><div class="small muted">ID: ${t.telegram_id}${t.phone ? " · " + esc(t.phone) : ""}</div></div>
+                <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-btn" data-tid="${t.telegram_id}" title="Удалить"><span class="del-x">❌</span></button>
+              </div>`).join("") : `<p class="small muted">Нанимателей пока нет.</p>`}
+            <button class="btn btn-secondary mt-8" id="btn-add-tenant">➕ Добавить нанимателя</button>
           </div>
-          <div class="field">
-            <label>📅 Дата окончания</label>
-            ${dateFieldHtml("c-end", "c-end-native", apt.agreement_date_finish || "", "Выбрать дату окончания")}
+
+          <label class="rent-check">
+            <input type="checkbox" id="c-has-contract" ${initialHasContract ? "checked" : ""} />
+            <span>Договор найма</span>
+          </label>
+          <div id="rent-contract-section" class="rent-sub-panel ${initialHasContract ? "" : "hidden"}">
+            <div class="field"><label>🔢 Номер договора</label><input type="text" id="c-no" value="${esc(apt.agreement_no || "")}" /></div>
+            <div class="grid-2">
+              <div class="field">
+                <label>📅 Дата начала</label>
+                ${dateFieldHtml("c-start", "c-start-native", apt.agreement_date_start || "", "Выбрать дату начала")}
+              </div>
+              <div class="field">
+                <label>📅 Дата окончания</label>
+                ${dateFieldHtml("c-end", "c-end-native", apt.agreement_date_finish || "", "Выбрать дату окончания")}
+              </div>
+            </div>
+            <div class="grid-2">
+              <button class="btn" id="btn-save-contract" disabled>💾 Сохранить договор</button>
+              <button class="btn btn-danger" id="btn-del-contract">🗑 Удалить договор</button>
+            </div>
           </div>
-        </div>
-        <div class="grid-2">
-          <button class="btn" id="btn-save-contract" disabled>💾 Сохранить договор</button>
-          <button class="btn btn-danger" id="btn-del-contract">🗑 Удалить договор</button>
-        </div>
-        <h3 class="mt-12">👤 Наниматели</h3>
-        ${tenants.length ? tenants.map(t => `
-          <div class="table-row">
-            <div><div class="bold">${esc(t.name || "—")}</div><div class="small muted">ID: ${t.telegram_id}${t.phone ? " · " + esc(t.phone) : ""}</div></div>
-            <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-btn" data-tid="${t.telegram_id}" title="Удалить"><span class="del-x">❌</span></button>
-          </div>`).join("") : `<p class="small muted">Нанимателей пока нет.</p>`}
-        <button class="btn btn-secondary mt-8" id="btn-add-tenant">➕ Добавить нанимателя</button>`;
+
+          <button class="btn mt-8 hidden" id="btn-save-rent-status">💾 Сохранить</button>
+        </div>`;
     }
   }
 
@@ -2872,9 +3079,9 @@ function renderApartments(root) {
       <div class="card">
         <h3>${esc(propIcon(apt))} ${esc(propTitle(apt))}</h3>
         <div class="subtabs">
-          <button class="subtab ${state.manageSubtab === "settings" ? "active" : ""}" data-m="settings">⚙️ Настройки</button>
-          <button class="subtab ${state.manageSubtab === "initial" ? "active" : ""}" data-m="initial">📏 Начальные</button>
-          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract">📋 Аренда${isPropertyRented(apt) ? " ✅" : ""}</button>
+          <button class="subtab ${state.manageSubtab === "settings" ? "active" : ""}" data-m="settings"><span>⚙️ Настройки</span></button>
+          <button class="subtab ${state.manageSubtab === "initial" ? "active" : ""}" data-m="initial"><span>📏 Начальные<br>показания</span></button>
+          <button class="subtab ${state.manageSubtab === "contract" ? "active" : ""}" data-m="contract"><span>📋 Аренда${isPropertyRented(apt) ? " ✅" : ""}</span></button>
         </div>
         ${bodyHtml}
       </div>` : ""}
@@ -2918,61 +3125,11 @@ function renderApartments(root) {
   if (!apt) return;
 
   if (state.manageSubtab === "settings") {
-    let editPropType = apt.property_type || "apartment";
-    const saveBasicBtn = document.getElementById("btn-save-basic");
-    const initBasicSnap = JSON.stringify({
-      number: String(apt.number || "").trim(),
-      property_type: editPropType,
+    document.getElementById("btn-open-property-settings")?.addEventListener("click", () => {
+      openPropertySettingsModal(apt.id);
     });
-    const updateBasicDirty = () => {
-      if (!saveBasicBtn) return;
-      const curNum = (document.getElementById("s-number")?.value || "").trim();
-      const curSnap = JSON.stringify({ number: curNum, property_type: editPropType });
-      saveBasicBtn.disabled = !curNum || curSnap === initBasicSnap;
-    };
-
-    document.getElementById("s-number")?.addEventListener("input", updateBasicDirty);
-
-    document.querySelectorAll("#edit-type-picker .type-btn").forEach(btn => {
-      btn.onclick = () => {
-        editPropType = btn.dataset.editPtype;
-        document.querySelectorAll("#edit-type-picker .type-btn").forEach(b => b.classList.toggle("active", b === btn));
-        const meta = getPropertyMeta(editPropType);
-        document.getElementById("edit-prop-num-label").textContent = meta.numLabel;
-        document.getElementById("s-number").placeholder = meta.placeholder;
-        const lbl = document.getElementById("lbl-open-enabled-meters");
-        if (lbl) lbl.textContent = `🚰 Имеющиеся счётчики воды и газа ${meta.inLocative}`;
-        updateBasicDirty();
-      };
-    });
-
-    saveBasicBtn?.addEventListener("click", async () => {
-      if (saveBasicBtn.disabled) return;
-      const number = document.getElementById("s-number").value.trim();
-      if (!number) return showToast("Укажите номер или название объекта", "error");
-      const body = { number, property_type: editPropType };
-      if (editPropType !== "house" && enabled.includes("irrigation")) {
-        const filtered = enabled.filter(m => m !== "irrigation");
-        body.enabled_meters = filtered.length ? filtered : ["cold_water"];
-        body.irrigation_mode = "parallel";
-      }
-      saveBasicBtn.disabled = true;
-      try {
-        await api(`/api/apartments/${apt.id}/settings`, { method: "PUT", body });
-        showToast("✅ Настройки объекта сохранены");
-        const me = await api("/api/me");
-        state.apartments = me.apartments;
-        renderAptSelector();
-        await loadApartmentDetail(apt.id);
-        renderApartments(root);
-      } catch (err) {
-        showToast("❌ " + err.message, "error");
-        updateBasicDirty();
-      }
-    });
-
     document.getElementById("btn-open-enabled-meters")?.addEventListener("click", () => {
-      openEnabledMetersModal(apt.id, editPropType);
+      openEnabledMetersModal(apt.id, apt.property_type || "apartment");
     });
     document.getElementById("btn-meters-manage")?.addEventListener("click", () => openMetersModal(apt.id));
     document.getElementById("btn-open-days")?.addEventListener("click", () => openSubmissionDaysModal(apt.id));
@@ -3026,7 +3183,9 @@ function renderApartments(root) {
       const snap = {};
       for (const m of METER_META) {
         const el = document.getElementById(`i-${m.id}`);
-        if (el) snap[m.id] = el.value.trim();
+        if (!el) continue;
+        const p = parseIntSpaces(el.value);
+        snap[m.id] = p.ok ? p.digits : el.value.trim();
       }
       return JSON.stringify(snap);
     };
@@ -3090,65 +3249,18 @@ function renderApartments(root) {
   attachDateField("c-start", "c-start-native");
   attachDateField("c-end", "c-end-native");
 
-  const saveContractBtn = document.getElementById("btn-save-contract");
-  if (saveContractBtn) {
-    const getContractSnapshot = () => JSON.stringify({
-      has_tenant: Boolean(document.getElementById("c-has")?.checked),
-      agreement_no: (document.getElementById("c-no")?.value || "").trim(),
-      start: (document.getElementById("c-start")?.value || "").trim(),
-      end: (document.getElementById("c-end")?.value || "").trim(),
-    });
-    const initialContractSnap = getContractSnapshot();
-    const updateContractDirty = () => {
-      saveContractBtn.disabled = getContractSnapshot() === initialContractSnap;
-    };
-    document.getElementById("c-has")?.addEventListener("change", updateContractDirty);
-    document.getElementById("c-no")?.addEventListener("input", updateContractDirty);
-    document.getElementById("c-start")?.addEventListener("input", updateContractDirty);
-    document.getElementById("c-end")?.addEventListener("input", updateContractDirty);
+  const runDeleteContract = async (unlinkTenants) => {
+    try {
+      await api(`/api/apartments/${apt.id}/contract?unlink_tenants=${unlinkTenants ? "true" : "false"}`, {
+        method: "DELETE",
+      });
+      showToast(unlinkTenants ? "✅ Договор удалён, наниматели откреплены" : "✅ Договор удалён");
+      await loadApartmentDetail(apt.id);
+      renderApartments(root);
+    } catch (err) { showToast("❌ " + err.message, "error"); return false; }
+  };
 
-    saveContractBtn.addEventListener("click", async () => {
-      if (saveContractBtn.disabled) return;
-      const startDate = parseDisplayDate(document.getElementById("c-start").value);
-      if (!startDate.ok) return showToast(`❌ Дата начала: ${startDate.error}`, "error");
-      const endDate = parseDisplayDate(document.getElementById("c-end").value);
-      if (!endDate.ok) return showToast(`❌ Дата окончания: ${endDate.error}`, "error");
-      if (startDate.iso && endDate.iso && startDate.iso > endDate.iso) {
-        return showToast("❌ Дата начала договора не может быть позже даты окончания", "error");
-      }
-      saveContractBtn.disabled = true;
-      try {
-        await api(`/api/apartments/${apt.id}/contract`, {
-          method: "PUT",
-          body: {
-            has_tenant: document.getElementById("c-has").checked,
-            agreement_no: document.getElementById("c-no").value.trim() || null,
-            agreement_date_start: startDate.display,
-            agreement_date_finish: endDate.display,
-          },
-        });
-        showToast("✅ Договор сохранён");
-        await loadApartmentDetail(apt.id);
-        renderApartments(root);
-      } catch (err) {
-        showToast("❌ " + err.message, "error");
-        updateContractDirty();
-      }
-    });
-  }
-
-  document.getElementById("btn-del-contract")?.addEventListener("click", () => {
-    const runDeleteContract = async (unlinkTenants) => {
-      try {
-        await api(`/api/apartments/${apt.id}/contract?unlink_tenants=${unlinkTenants ? "true" : "false"}`, {
-          method: "DELETE",
-        });
-        showToast(unlinkTenants ? "✅ Договор удалён, наниматели откреплены" : "✅ Договор удалён");
-        await loadApartmentDetail(apt.id);
-        renderApartments(root);
-      } catch (err) { showToast("❌ " + err.message, "error"); return false; }
-    };
-
+  const openDeleteContractConfirm = () => {
     if (tenants.length > 0) {
       openModal("🗑 Удалить договор?", `
         <p>К объекту «${esc(propShort(apt))}» привязаны наниматели (${tenants.length} чел.).</p>
@@ -3172,7 +3284,197 @@ function renderApartments(root) {
         { label: "Отмена", cls: "btn-secondary" },
       ]);
     }
+  };
+
+  const cRented = document.getElementById("c-rented");
+  const cHas = document.getElementById("c-has");
+  const cHasContract = document.getElementById("c-has-contract");
+  const rentOptionsWrap = document.getElementById("rent-options-wrap");
+  const rentTenantSection = document.getElementById("rent-tenant-section");
+  const rentContractSection = document.getElementById("rent-contract-section");
+  const saveRentStatusBtn = document.getElementById("btn-save-rent-status");
+  const saveContractBtn = document.getElementById("btn-save-contract");
+
+  let updateContractDirty = () => {};
+  const syncRentStatusSaveBtn = () => {
+    if (!saveRentStatusBtn || !cHas || !cHasContract) return;
+    const statusDirty = Boolean(cHas.checked) !== Boolean(apt.has_tenant);
+    const showBtn = Boolean(cRented?.checked) && !cHasContract.checked && statusDirty;
+    saveRentStatusBtn.classList.toggle("hidden", !showBtn);
+    saveRentStatusBtn.disabled = !showBtn;
+    updateContractDirty();
+  };
+
+  if (cRented) {
+    const persistedRented = isPropertyRented(apt) || tenants.length > 0;
+    cRented.addEventListener("change", async () => {
+      haptic("light");
+      if (cRented.checked) {
+        rentOptionsWrap?.classList.remove("hidden");
+        syncRentStatusSaveBtn();
+        return;
+      }
+      if (!persistedRented) {
+        if (cHas) cHas.checked = false;
+        if (cHasContract) cHasContract.checked = false;
+        rentTenantSection?.classList.add("hidden");
+        rentContractSection?.classList.add("hidden");
+        rentOptionsWrap?.classList.add("hidden");
+        syncRentStatusSaveBtn();
+        return;
+      }
+      // Persisted rental exists in DB: confirm before clearing
+      if (hasContract(apt) || tenants.length > 0) {
+        cRented.checked = true;
+        const parts = [];
+        if (hasContract(apt)) parts.push("данные договора найма");
+        if (tenants.length > 0) parts.push(`привязанные наниматели (${tenants.length} чел.)`);
+        openModal("Снять объект с аренды?", `
+          <p>Для объекта «${esc(propShort(apt))}» будут удалены: ${esc(parts.join(" и "))}.</p>
+          ${tenants.length > 0 ? '<p class="small muted">Наниматели будут откреплены и получат уведомление в Telegram.</p>' : ""}
+        `, [
+          {
+            label: "Снять с аренды",
+            cls: "btn-danger",
+            onClick: () => runDeleteContract(true),
+          },
+          { label: "Отмена", cls: "btn-secondary" },
+        ]);
+        return;
+      }
+      // Only apt.has_tenant flag is set in DB (no contract, no tenants)
+      try {
+        await api(`/api/apartments/${apt.id}/contract`, {
+          method: "PUT",
+          body: {
+            has_tenant: false,
+            agreement_no: null,
+            agreement_date_start: null,
+            agreement_date_finish: null,
+          },
+        });
+        showToast("✅ Объект снят с аренды");
+        await loadApartmentDetail(apt.id);
+        renderApartments(root);
+      } catch (err) {
+        cRented.checked = true;
+        showToast("❌ " + err.message, "error");
+      }
+    });
+  }
+
+  if (cHas) {
+    cHas.addEventListener("change", () => {
+      haptic("light");
+      rentTenantSection?.classList.toggle("hidden", !cHas.checked);
+      syncRentStatusSaveBtn();
+    });
+  }
+
+  if (cHasContract) {
+    cHasContract.addEventListener("change", () => {
+      haptic("light");
+      if (cHasContract.checked) {
+        rentContractSection?.classList.remove("hidden");
+        syncRentStatusSaveBtn();
+        return;
+      }
+      if (hasContract(apt)) {
+        cHasContract.checked = true;
+        openDeleteContractConfirm();
+        return;
+      }
+      rentContractSection?.classList.add("hidden");
+      syncRentStatusSaveBtn();
+    });
+  }
+
+  saveRentStatusBtn?.addEventListener("click", async () => {
+    saveRentStatusBtn.disabled = true;
+    try {
+      await api(`/api/apartments/${apt.id}/contract`, {
+        method: "PUT",
+        body: {
+          has_tenant: Boolean(cHas?.checked),
+          agreement_no: apt.agreement_no || null,
+          agreement_date_start: apt.agreement_date_start ? isoToDisplayDate(apt.agreement_date_start) : null,
+          agreement_date_finish: apt.agreement_date_finish ? isoToDisplayDate(apt.agreement_date_finish) : null,
+        },
+      });
+      showToast("✅ Статус аренды сохранён");
+      await loadApartmentDetail(apt.id);
+      renderApartments(root);
+    } catch (err) {
+      showToast("❌ " + err.message, "error");
+      saveRentStatusBtn.disabled = false;
+    }
   });
+
+  if (saveContractBtn) {
+    const getContractSnapshot = () => JSON.stringify({
+      has_tenant: Boolean(document.getElementById("c-has")?.checked),
+      agreement_no: (document.getElementById("c-no")?.value || "").trim(),
+      start: (document.getElementById("c-start")?.value || "").trim(),
+      end: (document.getElementById("c-end")?.value || "").trim(),
+    });
+    const initialContractSnap = getContractSnapshot();
+    updateContractDirty = () => {
+      saveContractBtn.disabled = getContractSnapshot() === initialContractSnap;
+    };
+    document.getElementById("c-has")?.addEventListener("change", updateContractDirty);
+    document.getElementById("c-no")?.addEventListener("input", updateContractDirty);
+    document.getElementById("c-start")?.addEventListener("input", updateContractDirty);
+    document.getElementById("c-start")?.addEventListener("change", updateContractDirty);
+    document.getElementById("c-end")?.addEventListener("input", updateContractDirty);
+    document.getElementById("c-end")?.addEventListener("change", updateContractDirty);
+
+    const performSaveContract = async (startDate, endDate) => {
+      saveContractBtn.disabled = true;
+      try {
+        await api(`/api/apartments/${apt.id}/contract`, {
+          method: "PUT",
+          body: {
+            has_tenant: Boolean(document.getElementById("c-has")?.checked),
+            agreement_no: document.getElementById("c-no").value.trim() || null,
+            agreement_date_start: startDate.display,
+            agreement_date_finish: endDate.display,
+          },
+        });
+        showToast("✅ Договор сохранён");
+        await loadApartmentDetail(apt.id);
+        renderApartments(root);
+        return true;
+      } catch (err) {
+        showToast("❌ " + err.message, "error");
+        updateContractDirty();
+        return false;
+      }
+    };
+
+    saveContractBtn.addEventListener("click", async () => {
+      if (saveContractBtn.disabled) return;
+      const startDate = parseDisplayDate(document.getElementById("c-start").value);
+      if (!startDate.ok) return showToast(`❌ Дата начала: ${startDate.error}`, "error");
+      const endDate = parseDisplayDate(document.getElementById("c-end").value);
+      if (!endDate.ok) return showToast(`❌ Дата окончания: ${endDate.error}`, "error");
+      if (startDate.iso && endDate.iso && startDate.iso > endDate.iso) {
+        return showToast("❌ Дата начала договора не может быть позже даты окончания", "error");
+      }
+      if (startDate.iso && endDate.iso && isContractOverOneYear(startDate.iso, endDate.iso)) {
+        openModal("⚠️ Срок договора больше года!", `<p>${esc(LONG_TERM_CONTRACT_WARNING)}</p>`, [
+          {
+            label: "💾 Сохранить",
+            onClick: () => performSaveContract(startDate, endDate),
+          },
+          { label: "Отмена", cls: "btn-secondary" },
+        ]);
+        return;
+      }
+      await performSaveContract(startDate, endDate);
+    });
+  }
+
+  document.getElementById("btn-del-contract")?.addEventListener("click", openDeleteContractConfirm);
 
   document.getElementById("btn-add-tenant")?.addEventListener("click", () => {
     openAddTenantModal(apt.id);
@@ -3223,7 +3525,9 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
     <p class="small muted">Бот сможет отправить приглашение только если наниматель ранее уже нажимал /start.</p>
   `, [
     {
+      id: "modal-add-tenant",
       label: "Добавить",
+      disabled: true,
       onClick: async () => {
         const targetAptId = defaultAptId || Number(document.getElementById("nt-apt-id")?.value);
         if (!targetAptId) { showToast("Выберите объект недвижимости", "error"); return false; }
@@ -3243,6 +3547,16 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
     },
     { label: "Отмена", cls: "btn-secondary" },
   ]);
+
+  const addTenBtn = document.getElementById("modal-add-tenant");
+  const updateAddTenReady = () => {
+    if (!addTenBtn) return;
+    const tgId = Number(document.getElementById("nt-id")?.value);
+    const name = (document.getElementById("nt-name")?.value || "").trim();
+    addTenBtn.disabled = !(Number.isSafeInteger(tgId) && tgId > 0 && name.length > 0);
+  };
+  document.getElementById("nt-id")?.addEventListener("input", updateAddTenReady);
+  document.getElementById("nt-name")?.addEventListener("input", updateAddTenReady);
 }
 
 async function submitAddTenant(aptId, payload, onSuccess = null) {
@@ -3348,7 +3662,9 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   document.getElementById("btn-new-fam")?.addEventListener("click", () => {
     openModal("➕ Новая семья", `<div class="field"><label>Название</label><input type="text" id="nf-name" placeholder="Например: Семья Ивановых" /></div>`, [
       {
+        id: "modal-create-fam",
         label: "Создать",
+        disabled: true,
         onClick: async () => {
           const name = document.getElementById("nf-name").value.trim();
           if (!name) { showToast("Введите название семьи", "error"); return false; }
@@ -3361,6 +3677,11 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
       },
       { label: "Отмена", cls: "btn-secondary" },
     ]);
+    const nfInput = document.getElementById("nf-name");
+    const createFamBtn = document.getElementById("modal-create-fam");
+    nfInput?.addEventListener("input", () => {
+      if (createFamBtn) createFamBtn.disabled = !nfInput.value.trim();
+    });
   });
 
   root.querySelectorAll(".ren-fam-btn").forEach(btn => {
@@ -3404,7 +3725,9 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
         <div class="field"><label>Телефон (необязательно)</label><input type="tel" inputmode="tel" id="no-phone" class="phone-mask" placeholder="+7-___-___-____" /></div>
       `, [
         {
+          id: "modal-add-owner",
           label: "Добавить",
+          disabled: true,
           onClick: async () => {
             const tgId = Number(document.getElementById("no-id").value);
             const name = document.getElementById("no-name").value.trim();
@@ -3424,6 +3747,15 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
         },
         { label: "Отмена", cls: "btn-secondary" },
       ]);
+      const addOwnerBtn = document.getElementById("modal-add-owner");
+      const updateAddOwnerReady = () => {
+        if (!addOwnerBtn) return;
+        const tgId = Number(document.getElementById("no-id")?.value);
+        const name = (document.getElementById("no-name")?.value || "").trim();
+        addOwnerBtn.disabled = !(Number.isSafeInteger(tgId) && tgId > 0 && name.length > 0);
+      };
+      document.getElementById("no-id")?.addEventListener("input", updateAddOwnerReady);
+      document.getElementById("no-name")?.addEventListener("input", updateAddOwnerReady);
     };
   });
 
@@ -3619,6 +3951,179 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   });
 }
 
+// ── About App & User Guide Modals (О приложении / Как пользоваться) ───
+const APP_GUIDE_TOPICS = [
+  {
+    id: "dashboard",
+    title: "📊 Обзор и расчёт начислений",
+    html: `
+      <div class="guide-text">
+        <p>На вкладке <b>«📊 Обзор»</b> отображается расчёт за текущий календарный месяц по выбранному объекту: расход, действующие тарифы и итоговая сумма в рублях.</p>
+        <ul>
+          <li><b>Переключение объектов:</b> используйте кнопки-чипы вверху или выпадающий список в шапке.</li>
+          <li><b>Жёлтый значок 🟡:</b> появляется на объекте, если хотя бы один подключённый счётчик не сдан после установленного дня подачи.</li>
+          <li><b>Водоотведение и полив:</b> для квартир водоотведение считается как ХВС + ГВС; для дома с поливом после ХВС — как ХВС (+ ГВС) минус Полив, а при параллельном подключении полив считается по отдельному тарифу.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "submit",
+    title: "💧 Подача и корректировка показаний",
+    html: `
+      <div class="guide-text">
+        <p>На вкладке <b>«💧 Подать»</b> показания вводятся по группам (Водомеры, Электричество, Газ) — можно подавать как все счётчики сразу, так и по отдельности.</p>
+        <ul>
+          <li><b>Предрасчёт:</b> при вводе сразу виден расход за месяц и ориентировочная стоимость.</li>
+          <li><b>Повторная подача в том же месяце:</b> при увеличении значения бот запросит подтверждение, чтобы исключить случайные дубли.</li>
+          <li><b>Значение меньше зафиксированного:</b> нанимателю ввод блокируется; владелец и администратор могут либо подтвердить корректировку ошибочного ввода кнопкой «Сохранить», либо сразу перейти к оформлению замены счётчика.</li>
+          <li><b>Исправление в истории:</b> владелец и администратор могут отредактировать любую сохранённую запись в разделе «📜 История» (кнопка ✏️).</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "property",
+    title: "🌆 Настройка недвижимости и тарифов",
+    html: `
+      <div class="guide-text">
+        <p>В разделе <b>«🌆 Недвижимость»</b> можно добавлять квартиры, дома и дачи, менять их порядок перетаскиванием (или кнопкой ⇅) и настраивать каждый объект:</p>
+        <ul>
+          <li><b>🏠 Настройки объекта недвижимости:</b> смена типа недвижимости и адреса/номера.</li>
+          <li><b>🚰 Имеющиеся счётчики:</b> выбор подключённых счётчиков воды, газа, полива и режима электричества (один тариф Т или Т1/Т2/Т3).</li>
+          <li><b>📏 Начальные показания:</b> базовые значения счётчиков, от которых ведётся первый расчёт.</li>
+          <li><b>📅 Дни подачи показаний:</b> числа месяца (1–31), когда бот в 15:00 напомнит о подаче показаний.</li>
+          <li><b>💰 Тарифы:</b> действующие ставки с сохранением истории изменений для корректного перерасчёта прошлых месяцев.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "meters",
+    title: "🔧 Поверка и замена счётчиков",
+    html: `
+      <div class="guide-text">
+        <p>Откройте <b>«🌆 Недвижимость → ⚙️ Настройки → 🔧 Управление счётчиками»</b>:</p>
+        <ul>
+          <li><b>Номера и поверка:</b> укажите серийный номер (необязательно), дату следующей поверки (ДД.ММ.ГГГГ) и выберите сроки уведомлений (Полгода, 3 месяца, Месяц, Неделя). В 15:00 бот пришлёт напоминание владельцам объекта.</li>
+          <li><b>🔄 Замена счётчика:</b> выберите заменяемый прибор (для Т1/Т2/Т3 — единый «⚡ Электрический счётчик»), введите конечное показание старого и начальное показание нового прибора. Бот учтёт остаток по старому счётчику и продолжит расчёт по новому без потери расхода.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "rent",
+    title: "📋 Аренда и договоры найма",
+    html: `
+      <div class="guide-text">
+        <p>В разделе <b>«🌆 Недвижимость → 📋 Аренда»</b> отметьте чек-бокс <b>«Объект сдаётся в аренду»</b>, после чего станут доступны блоки:</p>
+        <ul>
+          <li><b>Наниматель проживает:</b> добавление и удаление нанимателей по Telegram ID (узнать ID можно в @userinfobot).</li>
+          <li><b>Договор найма:</b> номер, дата начала и окончания (ДД.ММ.ГГГГ). Если срок превышает 12 месяцев, бот предупредит о требованиях регистрации в Росреестре.</li>
+          <li><b>Уведомления и доступ:</b> за 7 дней и в день окончания договора в 15:00 владельцу приходит напоминание; после окончания срока доступ нанимателя автоматически закрывается. При удалении договора можно выбрать: оставить доступ нанимателю или открепить его.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "people",
+    title: "👨‍👩‍👧‍👦 Люди, семьи и уведомления",
+    html: `
+      <div class="guide-text">
+        <p>Раздел <b>«👨‍👩‍👧‍👦 Люди»</b> объединяет управление семьями (владельцами) и списком всех ваших нанимателей:</p>
+        <ul>
+          <li><b>Изоляция семей:</b> каждая семья видит и управляет только своими объектами недвижимости.</li>
+          <li><b>Адресные уведомления:</b> сообщения о показаниях, фото, договорах и поверке приходят только владельцам конкретной семьи. Администратор может добавить свой Telegram ID как владельца в нужную семью, чтобы получать уведомления только по выбранным объектам.</li>
+          <li><b>Наниматели:</b> редактирование имени и телефона, просмотр привязанных объектов и сроков договоров, добавление новых нанимателей.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "export",
+    title: "📷 Фото, выгрузки и бэкапы",
+    html: `
+      <div class="guide-text">
+        <p>Дополнительные инструменты контроля и сохранности данных:</p>
+        <ul>
+          <li><b>📷 Фото счётчиков:</b> отправляются через вкладку «Фото» или напрямую в чат бота и пересылаются владельцам объекта в Telegram без хранения файлов на сервере.</li>
+          <li><b>📤 Выгрузка базы данных:</b> формирование отчётов в Excel и PDF по выбранному объекту или сразу по всем объектам с отправкой файла в чат.</li>
+          <li><b>💾 Резервные копии БД:</b> создаются автоматически в 03:00 (только если база изменилась за сутки, хранятся до 60 дней) и вручную кнопкой «💾 Бэкап БД в чат».</li>
+        </ul>
+      </div>`,
+  },
+];
+
+function buildAboutAppHtml() {
+  const repoRaw = String(state.appInfo?.repository || "").trim();
+  let repoHtml = "не указан";
+  if (repoRaw) {
+    const repoHref = /^https?:\/\//i.test(repoRaw) ? repoRaw : `https://${repoRaw}`;
+    repoHtml = `<a href="${esc(repoHref)}" target="_blank" rel="noopener" class="tg-link ext-link" data-ext-link="${esc(repoHref)}">${esc(repoRaw)}</a>`;
+  }
+
+  const tgRaw = String(state.appInfo?.tg_username || "").trim();
+  let tgHtml = "не указан";
+  if (tgRaw) {
+    let handle = tgRaw.replace(/^https?:\/\/t\.me\//i, "").replace(/^t\.me\//i, "").replace(/^@+/, "").replace(/\/+$/, "").trim();
+    if (handle) {
+      const tgUrl = `https://t.me/${handle}`;
+      tgHtml = `<a href="${esc(tgUrl)}" target="_blank" rel="noopener" class="tg-link" data-tg-link="${esc(tgUrl)}">@${esc(handle)}</a>`;
+    } else {
+      tgHtml = esc(tgRaw);
+    }
+  }
+
+  return `
+    <div class="guide-text">
+      <p>Данный бот это приложение с открытым исходным кодом. Репозиторий находится по адресу ${repoHtml}.</p>
+      <p>Предложения по улучшению дизайна и юзабилити (UX/UI) направлять создателю и администратору бота ${tgHtml}</p>
+    </div>`;
+}
+
+function openAboutAppModal() {
+  openModal("ℹ️ О приложении", buildAboutAppHtml(), [
+    { label: "Закрыть", cls: "btn-secondary" },
+  ]);
+}
+
+function openGuideTopicModal(topicId) {
+  const topic = APP_GUIDE_TOPICS.find(t => t.id === topicId);
+  if (!topic) return;
+  openModal(topic.title, topic.html, [
+    {
+      label: "← К списку разделов",
+      cls: "btn-secondary",
+      onClick: () => {
+        closeModal(true);
+        openAppGuideModal();
+        return false;
+      },
+    },
+    { label: "Закрыть", cls: "btn-secondary" },
+  ]);
+}
+
+function openAppGuideModal() {
+  const bodyHtml = `
+    <p class="small muted">Выберите раздел, чтобы посмотреть инструкцию по работе с функцией:</p>
+    <div class="settings-menu-stack">
+      ${APP_GUIDE_TOPICS.map(t => `
+        <button type="button" class="btn btn-secondary settings-menu-btn guide-topic-btn" data-guide-id="${t.id}">
+          <span>${esc(t.title)}</span>
+          <span class="settings-menu-arrow">›</span>
+        </button>
+      `).join("")}
+    </div>`;
+
+  openModal("📖 Как пользоваться приложением", bodyHtml, [
+    { label: "Закрыть", cls: "btn-secondary" },
+  ]);
+
+  document.querySelectorAll(".guide-topic-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      haptic("light");
+      const id = btn.dataset.guideId;
+      closeModal(true);
+      openGuideTopicModal(id);
+    });
+  });
+}
+
 // ── Management / Admin (Управление, MEDIUM-12 race-protected) ─────────
 async function renderAdmin(root, renderSeq = state.tabRenderSeq) {
   const [usersRes, auditRes] = await Promise.all([api("/api/admin/users"), api("/api/admin/audit")]);
@@ -3627,6 +4132,18 @@ async function renderAdmin(root, renderSeq = state.tabRenderSeq) {
   const apt = state.aptDetail?.apartment || null;
 
   root.innerHTML = `
+    <div class="card">
+      <div class="settings-menu-stack" style="margin-top:0">
+        <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-admin-about">
+          <span>ℹ️ О приложении</span>
+          <span class="settings-menu-arrow">›</span>
+        </button>
+        <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-admin-help">
+          <span>📖 Как пользоваться приложением</span>
+          <span class="settings-menu-arrow">›</span>
+        </button>
+      </div>
+    </div>
     <div class="card">
       <h2>🔧 Управление</h2>
       <div class="grid-2 mt-8">
@@ -3652,6 +4169,14 @@ async function renderAdmin(root, renderSeq = state.tabRenderSeq) {
     </div>
   `;
 
+  document.getElementById("btn-admin-about")?.addEventListener("click", () => {
+    haptic("light");
+    openAboutAppModal();
+  });
+  document.getElementById("btn-admin-help")?.addEventListener("click", () => {
+    haptic("light");
+    openAppGuideModal();
+  });
   document.getElementById("btn-backup").onclick = async () => {
     try {
       showToast("Создаю бэкап...");
