@@ -158,6 +158,29 @@ async def get_all_users() -> list[User]:
         return list(res.scalars().all())
 
 
+async def get_family_scoped_users(family_id: int) -> list[User]:
+    """Return users belonging to a family (owners, linked tenants, and attached FamilyOwner)."""
+    async with UnitOfWork() as s:
+        owner_subq = select(FamilyOwner.user_id).where(FamilyOwner.family_id == family_id)
+        tenant_subq = (
+            select(ApartmentUser.user_id)
+            .join(Apartment, Apartment.id == ApartmentUser.apartment_id)
+            .where(Apartment.family_id == family_id)
+        )
+        res = await s.execute(
+            select(User)
+            .where(
+                or_(
+                    User.family_id == family_id,
+                    User.id.in_(owner_subq),
+                    User.id.in_(tenant_subq),
+                )
+            )
+            .order_by(User.role, User.id)
+        )
+        return list(res.scalars().all())
+
+
 async def get_or_create_user(
     telegram_id: int,
     name: str | None = None,
@@ -736,5 +759,18 @@ async def get_audit_logs(limit: int = 50) -> list[AuditLog]:
     async with UnitOfWork() as s:
         res = await s.execute(
             select(AuditLog).order_by(desc(AuditLog.created_at), desc(AuditLog.id)).limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def get_family_audit_logs(family_id: int, limit: int = 50) -> list[AuditLog]:
+    """Return audit log entries performed strictly by users whose primary family_id matches."""
+    async with UnitOfWork() as s:
+        tg_subq = select(User.telegram_id).where(User.family_id == family_id)
+        res = await s.execute(
+            select(AuditLog)
+            .where(AuditLog.user_telegram_id.in_(tg_subq))
+            .order_by(desc(AuditLog.created_at), desc(AuditLog.id))
+            .limit(limit)
         )
         return list(res.scalars().all())

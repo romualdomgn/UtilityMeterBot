@@ -800,15 +800,6 @@ function getNavItems() {
       { id: "photo", ico: "📷", label: "Фото" },
     ];
   }
-  if (r === "landlord") {
-    return [
-      { id: "dashboard", ico: "📊", label: "Обзор" },
-      { id: "submit", ico: "💧", label: "Подать" },
-      { id: "apartments", ico: "🌆", label: "Недвижимость" },
-      { id: "history", ico: "📜", label: "История" },
-      { id: "families", ico: "👨‍👩‍👧‍👦", label: "Люди" },
-    ];
-  }
   return [
     { id: "dashboard", ico: "📊", label: "Обзор" },
     { id: "submit", ico: "💧", label: "Подать" },
@@ -2971,8 +2962,8 @@ function renderApartments(root) {
       const curMeta = getPropertyMeta(apt.property_type);
       bodyHtml = `
         <div class="settings-menu-stack" style="margin-top:0">
-          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-property-settings">
-            <span>🏠 Настройки объекта недвижимости</span>
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-tariffs">
+            <span>💰 Тарифы</span>
             <span class="settings-menu-arrow">›</span>
           </button>
           <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-enabled-meters">
@@ -2987,8 +2978,8 @@ function renderApartments(root) {
             <span>📅 Дни подачи показаний</span>
             <span class="settings-menu-arrow">›</span>
           </button>
-          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-tariffs">
-            <span>💰 Тарифы</span>
+          <button type="button" class="btn btn-secondary settings-menu-btn" id="btn-open-property-settings">
+            <span>🏠 Настройки объекта недвижимости</span>
             <span class="settings-menu-arrow">›</span>
           </button>
         </div>
@@ -3049,7 +3040,7 @@ function renderApartments(root) {
             </div>
             <div class="grid-2">
               <button class="btn" id="btn-save-contract" disabled>💾 Сохранить договор</button>
-              <button class="btn btn-danger" id="btn-del-contract">🗑 Удалить договор</button>
+              <button class="btn btn-danger" id="btn-del-contract" ${initialHasContract ? "" : "disabled"}>🗑 Удалить договор</button>
             </div>
           </div>
 
@@ -3085,12 +3076,7 @@ function renderApartments(root) {
         </div>
         ${bodyHtml}
       </div>` : ""}
-    ${state.user.role === "landlord" && apt ? renderExportCardHtml(apt) : ""}
   `;
-
-  if (state.user.role === "landlord" && apt) {
-    bindExportButtons(apt);
-  }
 
   document.getElementById("btn-toggle-reorder")?.addEventListener("click", () => {
     haptic("light");
@@ -3474,7 +3460,10 @@ function renderApartments(root) {
     });
   }
 
-  document.getElementById("btn-del-contract")?.addEventListener("click", openDeleteContractConfirm);
+  document.getElementById("btn-del-contract")?.addEventListener("click", () => {
+    if (!hasContract(apt)) return;
+    openDeleteContractConfirm();
+  });
 
   document.getElementById("btn-add-tenant")?.addEventListener("click", () => {
     openAddTenantModal(apt.id);
@@ -4180,8 +4169,12 @@ async function renderAdmin(root, renderSeq = state.tabRenderSeq) {
   document.getElementById("btn-backup").onclick = async () => {
     try {
       showToast("Создаю бэкап...");
-      await api("/api/admin/backup", { method: "POST" });
-      showToast("✅ Бэкап отправлен в чат бота!");
+      const res = await api("/api/admin/backup", { method: "POST" });
+      showToast(
+        res.scope === "family"
+          ? "✅ Бэкап данных вашей семьи отправлен в чат бота!"
+          : "✅ Бэкап отправлен в чат бота!"
+      );
     } catch (err) { showToast("❌ " + err.message, "error"); }
   };
   document.getElementById("btn-go-hist").onclick = () => { state.activeTab = "history"; renderTab(); };

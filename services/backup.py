@@ -165,3 +165,117 @@ async def cleanup_old_photos(retention_days: int = config.PHOTO_RETENTION_DAYS) 
     if removed:
         logger.info("Cleaned up %d meter photo(s) older than %d days", removed, retention_days)
     return removed
+
+
+def _create_family_backup_sync(family_id: int) -> Path:
+    """Create a self-contained SQLite backup containing ONLY records for the specified family."""
+    db_path = _resolve_db_path()
+    out_dir = config.EXPORT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now(config.BOT_TZ).strftime("%Y%m%d_%H%M%S")
+    unique_suffix = uuid.uuid4().hex[:6]
+    out_path = out_dir / f"utility_meter_family_{family_id}_backup_{timestamp}_{unique_suffix}.db"
+    tmp_path = out_dir / f".{out_path.name}.tmp"
+
+    src = sqlite3.connect(str(db_path))
+    dst = sqlite3.connect(str(tmp_path))
+    try:
+        with dst:
+            src.backup(dst, pages=100, sleep=0.01)
+    except Exception:
+        dst.close()
+        src.close()
+        tmp_path.unlink(missing_ok=True)
+        raise
+    else:
+        src.close()
+
+    try:
+        existing_tables = {
+            row[0]
+            for row in dst.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        dst.execute("PRAGMA foreign_keys=OFF")
+
+        if "scheduler_runs" in existing_tables:
+            dst.execute("DELETE FROM scheduler_runs")
+
+        if "audit_logs" in existing_tables and "users" in existing_tables:
+            dst.execute(
+                "DELETE FROM audit_logs WHERE user_telegram_id NOT IN "
+                "(SELECT telegram_id FROM users WHERE family_id = ?)",
+                (family_id,),
+            )
+
+        apt_scoped_tables = (
+            "meter_submissions",
+            "meter_replacements",
+            "meter_devices",
+            "meter_readings",
+            "initial_readings",
+            "tariffs",
+            "apartment_users",
+        )
+        if "apartments" in existing_tables:
+            for tbl in apt_scoped_tables:
+                if tbl in existing_tables:
+                    dst.execute(
+                        f'DELETE FROM "{tbl}" WHERE apartment_id NOT IN '
+                        "(SELECT id FROM apartments WHERE family_id = ?)",
+                        (family_id,),
+                    )
+
+        if "family_owners" in existing_tables:
+            dst.execute("DELETE FROM family_owners WHERE family_id != ?", (family_id,))
+
+        if "users" in existing_tables:
+            union_parts = ["SELECT id FROM users WHERE family_id = ?"]
+            params: list[int] = [family_id]
+            if "family_owners" in existing_tables:
+                union_parts.append("SELECT user_id FROM family_owners WHERE family_id = ?")
+                params.append(family_id)
+            if "apartment_users" in existing_tables and "apartments" in existing_tables:
+                union_parts.append(
+                    "SELECT au.user_id FROM apartment_users au "
+                    "JOIN apartments a ON a.id = au.apartment_id "
+                    "WHERE a.family_id = ?"
+                )
+                params.append(family_id)
+            dst.execute(
+                f"DELETE FROM users WHERE id NOT IN ({' UNION '.join(union_parts)})",
+                tuple(params),
+            )
+
+        if "apartments" in existing_tables:
+            dst.execute("DELETE FROM apartments WHERE family_id != ?", (family_id,))
+
+        if "families" in existing_tables:
+            dst.execute("DELETE FROM families WHERE id != ?", (family_id,))
+
+        dst.commit()
+
+        dst.execute("PRAGMA foreign_keys=ON")
+        fk_errors = dst.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_errors:
+            raise RuntimeError(f"Family backup FK integrity check failed: {fk_errors[:5]}")
+
+        # Purge all freed pages so zero bytes from other families remain in the .db binary
+        dst.isolation_level = None
+        dst.execute("PRAGMA journal_mode=DELETE")
+        dst.execute("VACUUM")
+    except Exception:
+        dst.close()
+        tmp_path.unlink(missing_ok=True)
+        raise
+    else:
+        dst.close()
+
+    tmp_path.replace(out_path)
+    return out_path
+
+
+async def create_family_backup(family_id: int) -> Path:
+    """Create a family-scoped SQLite backup file in EXPORT_DIR (caller deletes after sending)."""
+    async with _get_backup_lock():
+        return await asyncio.to_thread(_create_family_backup_sync, family_id)

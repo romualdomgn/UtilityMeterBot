@@ -50,12 +50,16 @@ class DummyBot:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.photos: list[dict] = []
+        self.documents: list[dict] = []
 
     async def send_message(self, **kwargs) -> None:
         self.sent.append(kwargs)
 
     async def send_photo(self, **kwargs) -> None:
         self.photos.append(kwargs)
+
+    async def send_document(self, **kwargs) -> None:
+        self.documents.append(kwargs)
 
 
 class DummyUploadFile:
@@ -664,6 +668,90 @@ async def test_api_me_exposes_app_info_from_config(temp_db, monkeypatch):
     assert me["app_info"]["repository"] == "https://github.com/example/umb"
     assert me["app_info"]["tg_username"] == "@example_admin"
 
+
+@pytest.mark.asyncio
+async def test_landlord_management_and_family_scoped_backup_isolation(temp_db, tmp_path, monkeypatch):
+    import sqlite3 as _sqlite3
+
+    exp_dir = tmp_path / "exports"
+    exp_dir.mkdir()
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite+aiosqlite:///{temp_db}")
+    monkeypatch.setattr(config, "EXPORT_DIR", exp_dir)
+
+    fam_a = await crud.create_family("Семья Альфа")
+    fam_b = await crud.create_family("Семья Бета СЕКРЕТ")
+    apt_a = await crud.create_apartment("101", fam_a.id, enabled_meters=["cold_water"])
+    apt_b = await crud.create_apartment("999_SECRET_APT", fam_b.id, enabled_meters=["cold_water"])
+
+    await crud.get_or_create_user(201, name="Владелец А", role="landlord", family_id=fam_a.id)
+    await crud.get_or_create_user(202, name="Владелец Б СЕКРЕТ", role="landlord", family_id=fam_b.id)
+    u_ta, _ = await crud.get_or_create_user(301, name="Жилец А", role="tenant", family_id=fam_a.id)
+    u_tb, _ = await crud.get_or_create_user(302, name="Жилец Б СЕКРЕТ", role="tenant", family_id=fam_b.id)
+    await crud.link_user_to_apartment(apt_a.id, u_ta.id, role="tenant")
+    await crud.link_user_to_apartment(apt_b.id, u_tb.id, role="tenant")
+
+    await operations.save_meter_group_readings(
+        apt_a.id, {"cold_water": 111}, 201, datetime.date(2026, 11, 20), "submit_water", "Alpha reading"
+    )
+    await operations.save_meter_group_readings(
+        apt_b.id, {"cold_water": 999}, 202, datetime.date(2026, 11, 20), "submit_water", "Beta SECRET reading"
+    )
+
+    landlord_a = WebAppUser(telegram_id=201, role="landlord", family_id=fam_a.id, name="Владелец А")
+    tenant_a = WebAppUser(telegram_id=301, role="tenant", family_id=fam_a.id, name="Жилец А")
+
+    # Tenant is still blocked from all /api/admin/* endpoints
+    with pytest.raises(HTTPException) as exc_tu:
+        await admin_router.api_admin_users(user=tenant_a)
+    assert exc_tu.value.status_code == 403
+    with pytest.raises(HTTPException) as exc_tb:
+        await admin_router.api_admin_backup(make_request(), user=tenant_a)
+    assert exc_tb.value.status_code == 403
+
+    # Landlord sees ONLY their family's users and audit logs
+    users_res = await admin_router.api_admin_users(user=landlord_a)
+    user_ids = {u["telegram_id"] for u in users_res["users"]}
+    assert user_ids == {201, 301}
+
+    audit_res = await admin_router.api_admin_audit(user=landlord_a)
+    assert all(l["user_telegram_id"] in {201, 301} for l in audit_res["logs"])
+    assert not any("Beta SECRET" in (l["details"] or "") for l in audit_res["logs"])
+
+    # Family backup SQLite file contains ONLY Family A data and ZERO bytes from Family B
+    fam_db_path = await backup.create_family_backup(fam_a.id)
+    try:
+        assert fam_db_path.exists()
+        raw_bytes = fam_db_path.read_bytes()
+        assert b"999_SECRET_APT" not in raw_bytes
+        assert b"Beta SECRET" not in raw_bytes
+
+        conn = _sqlite3.connect(str(fam_db_path))
+        try:
+            fams = conn.execute("SELECT id, name FROM families").fetchall()
+            apts = conn.execute("SELECT id, number FROM apartments").fetchall()
+            users = conn.execute("SELECT telegram_id FROM users").fetchall()
+            readings = conn.execute("SELECT value FROM meter_readings").fetchall()
+            fk_issues = conn.execute("PRAGMA foreign_key_check").fetchall()
+        finally:
+            conn.close()
+
+        assert fams == [(fam_a.id, "Семья Альфа")]
+        assert apts == [(apt_a.id, "101")]
+        assert {r[0] for r in users} == {201, 301}
+        assert [r[0] for r in readings] == [111]
+        assert fk_issues == []
+    finally:
+        fam_db_path.unlink(missing_ok=True)
+
+    # Endpoint sends family backup and cleans up temp file afterwards
+    bot = DummyBot()
+    req = make_request(bot)
+    res = await admin_router.api_admin_backup(req, user=landlord_a)
+    assert res["ok"] is True
+    assert res["scope"] == "family"
+    assert len(bot.documents) == 1
+    assert list(exp_dir.glob("*.db")) == []
+
 def test_ui_strings_and_removed_photo_storage_notice():
     import re as _re
 
@@ -740,3 +828,9 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert "Быстрая выгрузка в чат" not in app_js
     assert "📊 Excel ${esc(fullLabel)}" in app_js
     assert "📄 PDF ${esc(fullLabel)}" in app_js
+    # Tariffs button appears before Property Settings button in Settings tab
+    assert app_js.index('id="btn-open-tariffs"') < app_js.index('id="btn-open-property-settings"')
+    # Delete contract button is disabled when no saved contract exists
+    assert 'id="btn-del-contract" ${initialHasContract ? "" : "disabled"}' in app_js
+    # Landlord shares admin bottom nav (no separate History tab; Management tab present)
+    assert 'if (r === "landlord")' not in app_js
