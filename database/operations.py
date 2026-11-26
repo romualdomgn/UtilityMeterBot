@@ -1107,6 +1107,10 @@ async def delete_contract_atomic(
         apt.agreement_no = None
         apt.agreement_date_start = None
         apt.agreement_date_finish = None
+        apt.rent_payment_day = None
+        apt.rent_reminder_enabled = False
+        apt.rent_reminder_mode = None
+        apt.rent_reminder_days_after = None
         prop_label = format_property_short(apt)
         affected_tenants: list[tuple[int, bool]] = []
 

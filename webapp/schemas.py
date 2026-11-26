@@ -29,6 +29,7 @@ StrictTelegramId = Annotated[int, Strict(), Field(ge=1, le=MAX_SQLITE_INT64)]
 PropertyTypeLiteral = Literal["apartment", "house", "dacha"]
 IrrigationModeLiteral = Literal["after_cold", "parallel"]
 NotifyIntervalLiteral = Literal["6m", "3m", "1m", "1w"]
+RentReminderModeLiteral = Literal["day_before", "on_day", "after_days"]
 
 
 class ProfileUpdateBody(BaseModel):
@@ -130,6 +131,10 @@ class ContractBody(BaseModel):
     agreement_no: str | None = None
     agreement_date_start: str | None = None
     agreement_date_finish: str | None = None
+    rent_payment_day: int | None = None
+    rent_reminder_enabled: bool | None = None
+    rent_reminder_mode: RentReminderModeLiteral | None = None
+    rent_reminder_days_after: int | None = None
 
 
 class TenantCreateBody(BaseModel):
@@ -212,6 +217,10 @@ def serialize_apartment(
         "agreement_no": apt.agreement_no,
         "agreement_date_start": apt.agreement_date_start.isoformat() if apt.agreement_date_start else None,
         "agreement_date_finish": apt.agreement_date_finish.isoformat() if apt.agreement_date_finish else None,
+        "rent_payment_day": getattr(apt, "rent_payment_day", None),
+        "rent_reminder_enabled": bool(getattr(apt, "rent_reminder_enabled", False)),
+        "rent_reminder_mode": getattr(apt, "rent_reminder_mode", None),
+        "rent_reminder_days_after": getattr(apt, "rent_reminder_days_after", None),
         "water_submission_day": apt.water_submission_day,
         "electricity_submission_day": apt.electricity_submission_day,
         "gas_submission_day": getattr(apt, "gas_submission_day", None),

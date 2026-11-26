@@ -18,7 +18,11 @@ from database.models import (
     ELECTRICITY_METERS,
     GAS_METERS,
     METER_PLAIN_LABELS,
+    RENT_REMINDER_AFTER_DAYS,
+    RENT_REMINDER_DAY_BEFORE,
+    RENT_REMINDER_ON_DAY,
     WATER_SUBMISSION_METERS,
+    format_property_genitive,
     format_property_short,
     get_apartment_enabled_meters,
     parse_notify_intervals,
@@ -252,6 +256,100 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
                 logger.warning("Verification reminder failed for %s: %s", uid, e)
 
 
+def effective_payment_date(configured_day: int, year: int, month: int) -> datetime.date:
+    """Resolve monthly payment date clamping 29/30/31 to the last day of short months."""
+    return datetime.date(year, month, min(configured_day, calendar.monthrange(year, month)[1]))
+
+
+def match_rent_payment_reminder(
+    configured_day: int | None,
+    mode: str | None,
+    days_after: int | None,
+    cur: datetime.date,
+) -> datetime.date | None:
+    """Return the matched monthly payment date if a reminder should be sent on `cur`, else None."""
+    if not configured_day or not (1 <= configured_day <= 31) or not mode:
+        return None
+    if mode == RENT_REMINDER_DAY_BEFORE:
+        tomorrow = cur + datetime.timedelta(days=1)
+        pay_dt = effective_payment_date(configured_day, tomorrow.year, tomorrow.month)
+        return pay_dt if pay_dt == tomorrow else None
+    if mode == RENT_REMINDER_ON_DAY:
+        pay_dt = effective_payment_date(configured_day, cur.year, cur.month)
+        return pay_dt if pay_dt == cur else None
+    if mode == RENT_REMINDER_AFTER_DAYS:
+        if not days_after or not (1 <= days_after <= 20):
+            return None
+        candidate = cur - datetime.timedelta(days=days_after)
+        pay_dt = effective_payment_date(configured_day, candidate.year, candidate.month)
+        return pay_dt if pay_dt == candidate else None
+    return None
+
+
+async def check_rent_payment_reminders(bot: Bot, today: datetime.date | None = None) -> None:
+    """Send monthly rent payment reminders at 15:00 (BOT_TZ)."""
+    cur = today or local_today()
+    async with crud.UnitOfWork() as s:
+        result = await s.execute(
+            select(Apartment).where(
+                Apartment.rent_reminder_enabled.is_(True),
+                Apartment.rent_payment_day.isnot(None),
+            )
+        )
+        apartments = result.scalars().all()
+
+    for apt in apartments:
+        if not is_lease_active_for_apartment(apt):
+            continue
+        pay_dt = match_rent_payment_reminder(
+            apt.rent_payment_day,
+            apt.rent_reminder_mode,
+            apt.rent_reminder_days_after,
+            cur,
+        )
+        if pay_dt is None:
+            continue
+
+        tenants = [t for t in await crud.get_apartment_tenants(apt.id) if not t.is_blocked]
+        recipients: list[int] = [t.telegram_id for t in tenants]
+
+        for uid in await get_notification_recipients(apt.id):
+            if uid not in recipients:
+                recipients.append(uid)
+
+        if not recipients:
+            continue
+
+        prop_gen = h(format_property_genitive(apt))
+        pay_str = fmt_date(pay_dt)
+
+        if apt.rent_reminder_mode == RENT_REMINDER_DAY_BEFORE:
+            msg_text = (
+                f"💳 <b>Напоминание об оплате найма</b>\n"
+                f"Завтра (<b>{pay_str}</b>) наступает дата ежемесячного платежа "
+                f"за наём <b>{prop_gen}</b>. Пожалуйста, не забудьте произвести оплату."
+            )
+        elif apt.rent_reminder_mode == RENT_REMINDER_ON_DAY:
+            msg_text = (
+                f"💳 <b>Напоминание об оплате найма</b>\n"
+                f"Сегодня (<b>{pay_str}</b>) наступает дата ежемесячного платежа "
+                f"за наём <b>{prop_gen}</b>. Пожалуйста, произведите оплату."
+            )
+        else:
+            msg_text = (
+                f"⚠️ <b>Напоминание об оплате найма</b>\n"
+                f"Напоминаем о необходимости произвести ежемесячную плату "
+                f"за наём <b>{prop_gen}</b> (дата ежемесячного платежа: <b>{pay_str}</b>, "
+                f"прошло дней: <b>{apt.rent_reminder_days_after}</b>)."
+            )
+
+        for uid in recipients:
+            try:
+                await bot.send_message(chat_id=uid, text=msg_text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning("Rent payment reminder failed for %s: %s", uid, e)
+
+
 async def _run_job_once_today(job_key: str, fn, *args, run_date: datetime.date | None = None, **kwargs) -> bool:
     cur = run_date or local_today()
     if await crud.has_scheduler_run(job_key, cur):
@@ -273,6 +371,10 @@ async def run_daily_meter_verifications(bot: Bot) -> None:
     await _run_job_once_today("meter_verifications", check_meter_verifications, bot)
 
 
+async def run_daily_rent_payment_reminders(bot: Bot) -> None:
+    await _run_job_once_today("rent_payment_reminders", check_rent_payment_reminders, bot)
+
+
 async def run_daily_backup() -> None:
     await _run_job_once_today("daily_backup", create_backup, skip_if_unchanged=True)
 
@@ -287,6 +389,7 @@ async def run_missed_jobs_on_startup(bot: Bot, now: datetime.datetime | None = N
         ("meter_reminders", 15, 0, check_meter_reminders, (bot,), {"today": today}),
         ("lease_expirations", 15, 0, check_lease_expirations, (bot,), {"today": today}),
         ("meter_verifications", 15, 0, check_meter_verifications, (bot,), {"today": today}),
+        ("rent_payment_reminders", 15, 0, check_rent_payment_reminders, (bot,), {"today": today}),
     )
     for job_key, hour, minute, fn, args, kwargs in schedule_plan:
         if (current.hour, current.minute) >= (hour, minute):
@@ -317,6 +420,11 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         run_daily_meter_verifications,
         trigger="cron", hour=15, minute=0, misfire_grace_time=3600,
         kwargs={"bot": bot}, id="meter_verifications", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_daily_rent_payment_reminders,
+        trigger="cron", hour=15, minute=0, misfire_grace_time=3600,
+        kwargs={"bot": bot}, id="rent_payment_reminders", replace_existing=True,
     )
     scheduler.add_job(
         run_daily_backup,

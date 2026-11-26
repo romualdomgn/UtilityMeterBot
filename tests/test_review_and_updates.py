@@ -595,7 +595,7 @@ async def test_medium_09_startup_catchup_runs_once_without_kwarg_collision(temp_
     bot = DummyBot()
     now_after_15 = datetime.datetime(2026, 11, 25, 16, 35, tzinfo=config.BOT_TZ)
     executed1 = await scheduler.run_missed_jobs_on_startup(bot, now=now_after_15)
-    assert set(executed1) == {"daily_backup", "meter_reminders", "lease_expirations", "meter_verifications"}
+    assert set(executed1) == {"daily_backup", "meter_reminders", "lease_expirations", "meter_verifications", "rent_payment_reminders"}
 
     # Second startup on the same day must not duplicate jobs
     executed2 = await scheduler.run_missed_jobs_on_startup(bot, now=now_after_15)
@@ -752,6 +752,120 @@ async def test_landlord_management_and_family_scoped_backup_isolation(temp_db, t
     assert len(bot.documents) == 1
     assert list(exp_dir.glob("*.db")) == []
 
+
+@pytest.mark.asyncio
+async def test_rent_payment_day_and_reminders_validation_and_scheduler(temp_db, monkeypatch):
+    fam = await crud.create_family("Семья")
+    apt = await crud.create_apartment("371", fam.id)
+    await crud.get_or_create_user(201, name="Владелец", role="landlord", family_id=fam.id)
+    u_t, _ = await crud.get_or_create_user(301, name="Наниматель", role="tenant", family_id=fam.id)
+    await crud.link_user_to_apartment(apt.id, u_t.id, role="tenant")
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # Validation: enabling reminder without payment day -> 400
+    with pytest.raises(HTTPException) as exc_noday:
+        await ten_router.api_update_contract(
+            apt.id,
+            ContractBody(
+                agreement_no="10",
+                rent_payment_day=None,
+                rent_reminder_enabled=True,
+                rent_reminder_mode="on_day",
+            ),
+            user=admin,
+        )
+    assert exc_noday.value.status_code == 400
+
+    # Validation: after_days out of 1..20 -> 400
+    with pytest.raises(HTTPException) as exc_rng:
+        await ten_router.api_update_contract(
+            apt.id,
+            ContractBody(
+                agreement_no="10",
+                rent_payment_day=10,
+                rent_reminder_enabled=True,
+                rent_reminder_mode="after_days",
+                rent_reminder_days_after=25,
+            ),
+            user=admin,
+        )
+    assert exc_rng.value.status_code == 400
+
+    # 1) Mode: day_before (payment day = 1, check on Nov 30 -> reminds tenant & landlord about Dec 1)
+    await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(
+            agreement_no="10",
+            agreement_date_start="01.11.2026",
+            agreement_date_finish="01.10.2027",
+            rent_payment_day=1,
+            rent_reminder_enabled=True,
+            rent_reminder_mode="day_before",
+        ),
+        user=admin,
+    )
+    bot1 = DummyBot()
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 11, 30))
+    await scheduler.check_rent_payment_reminders(bot1, today=datetime.date(2026, 11, 30))
+    assert {m["chat_id"] for m in bot1.sent} == {301, 201}
+    assert "01.12.2026" in bot1.sent[0]["text"]
+    assert "Квартиры №371" in bot1.sent[0]["text"]
+
+    # 2) Mode: on_day (payment day = 31, short month Feb 2026 -> fires on Feb 28 for tenant & landlord)
+    await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(
+            agreement_no="10",
+            agreement_date_start="01.01.2026",
+            agreement_date_finish="01.12.2026",
+            rent_payment_day=31,
+            rent_reminder_enabled=True,
+            rent_reminder_mode="on_day",
+        ),
+        user=admin,
+    )
+    bot2 = DummyBot()
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 2, 28))
+    await scheduler.check_rent_payment_reminders(bot2, today=datetime.date(2026, 2, 28))
+    assert {m["chat_id"] for m in bot2.sent} == {301, 201}
+    assert "28.02.2026" in bot2.sent[0]["text"]
+
+    # 3) Mode: after_days (payment day = 28, after 5 days -> fires on Dec 3 for BOTH tenant AND landlord)
+    await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(
+            agreement_no="10",
+            agreement_date_start="01.11.2026",
+            agreement_date_finish="01.10.2027",
+            rent_payment_day=28,
+            rent_reminder_enabled=True,
+            rent_reminder_mode="after_days",
+            rent_reminder_days_after=5,
+        ),
+        user=admin,
+    )
+    bot3 = DummyBot()
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 12, 3))
+    await scheduler.check_rent_payment_reminders(bot3, today=datetime.date(2026, 12, 3))
+    assert {m["chat_id"] for m in bot3.sent} == {301, 201}
+    assert "ежемесячную плату за наём" in bot3.sent[0]["text"]
+    assert "Квартиры №371" in bot3.sent[0]["text"]
+    assert "28.11.2026" in bot3.sent[0]["text"]
+
+    # Does NOT fire on non-matching day
+    bot4 = DummyBot()
+    await scheduler.check_rent_payment_reminders(bot4, today=datetime.date(2026, 12, 2))
+    assert bot4.sent == []
+
+    # Deleting contract resets payment day and reminder settings
+    await ten_router.api_delete_contract(apt.id, request=make_request(), unlink_tenants=False, user=admin)
+    reloaded = await crud.get_apartment(apt.id)
+    assert reloaded.rent_payment_day is None
+    assert reloaded.rent_reminder_enabled is False
+    assert reloaded.rent_reminder_mode is None
+    assert reloaded.rent_reminder_days_after is None
+
 def test_ui_strings_and_removed_photo_storage_notice():
     import re as _re
 
@@ -834,3 +948,11 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert 'id="btn-del-contract" ${initialHasContract ? "" : "disabled"}' in app_js
     # Landlord shares admin bottom nav (no separate History tab; Management tab present)
     assert 'if (r === "landlord")' not in app_js
+    # Rent payment day & reminder controls
+    assert 'id="c-pay-day"' in app_js
+    assert 'id="c-pay-rem-en"' in app_js
+    assert "Напоминание нанимателю об оплате" in app_js
+    assert "Напомнить за день" in app_js
+    assert "Напомнить в день оплаты" in app_js
+    assert "Установить день напоминания об оплате" in app_js
+    assert 'id="c-pay-after-days"' in app_js

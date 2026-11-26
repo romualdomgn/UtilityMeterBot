@@ -207,8 +207,18 @@ function hasContract(apt) {
   return Boolean(
     String(apt.agreement_no || "").trim() ||
     apt.agreement_date_start ||
-    apt.agreement_date_finish
+    apt.agreement_date_finish ||
+    apt.rent_payment_day
   );
+}
+
+function fmtDaysRu(n) {
+  const mod100 = n % 100;
+  const mod10 = n % 10;
+  if (mod100 >= 11 && mod100 <= 14) return `${n} дней`;
+  if (mod10 === 1) return `${n} день`;
+  if (mod10 >= 2 && mod10 <= 4) return `${n} дня`;
+  return `${n} дней`;
 }
 
 function isPropertyRented(apt) {
@@ -3038,7 +3048,29 @@ function renderApartments(root) {
                 ${dateFieldHtml("c-end", "c-end-native", apt.agreement_date_finish || "", "Выбрать дату окончания")}
               </div>
             </div>
-            <div class="grid-2">
+            <div class="field">
+              <label>💳 Дата ежемесячного платежа (число месяца, опционально)</label>
+              <input type="number" min="1" max="31" id="c-pay-day" placeholder="Число от 1 до 31" value="${apt.rent_payment_day ?? ""}" />
+            </div>
+            <label class="rent-check">
+              <input type="checkbox" id="c-pay-rem-en" ${apt.rent_reminder_enabled ? "checked" : ""} />
+              <span>Напоминание нанимателю об оплате</span>
+            </label>
+            <div id="rent-pay-reminder-wrap" class="${apt.rent_reminder_enabled ? "" : "hidden"}">
+              <div class="rent-reminder-options" id="c-pay-rem-modes">
+                <button type="button" class="type-btn rent-reminder-mode-btn ${apt.rent_reminder_mode === "day_before" ? "active" : ""}" data-pay-mode="day_before">Напомнить за день</button>
+                <button type="button" class="type-btn rent-reminder-mode-btn ${apt.rent_reminder_mode === "on_day" ? "active" : ""}" data-pay-mode="on_day">Напомнить в день оплаты</button>
+                <button type="button" class="type-btn rent-reminder-mode-btn ${apt.rent_reminder_mode === "after_days" ? "active" : ""}" data-pay-mode="after_days">Установить день напоминания об оплате</button>
+              </div>
+              <div id="rent-pay-after-wrap" class="wheel-select-wrap ${apt.rent_reminder_mode === "after_days" ? "" : "hidden"}">
+                <label for="c-pay-after-days">Спустя сколько дней после даты платежа напомнить</label>
+                <select id="c-pay-after-days" class="wheel-select">
+                  ${Array.from({ length: 20 }, (_, i) => i + 1).map(d => `<option value="${d}" ${(apt.rent_reminder_days_after || 1) === d ? "selected" : ""}>${fmtDaysRu(d)}</option>`).join("")}
+                </select>
+                <div class="small muted mt-8">Уведомление придёт нанимателю и владельцу объекта в 15:00.</div>
+              </div>
+            </div>
+            <div class="grid-2 mt-8">
               <button class="btn" id="btn-save-contract" disabled>💾 Сохранить договор</button>
               <button class="btn btn-danger" id="btn-del-contract" ${initialHasContract ? "" : "disabled"}>🗑 Удалить договор</button>
             </div>
@@ -3397,24 +3429,70 @@ function renderApartments(root) {
   });
 
   if (saveContractBtn) {
-    const getContractSnapshot = () => JSON.stringify({
-      has_tenant: Boolean(document.getElementById("c-has")?.checked),
-      agreement_no: (document.getElementById("c-no")?.value || "").trim(),
-      start: (document.getElementById("c-start")?.value || "").trim(),
-      end: (document.getElementById("c-end")?.value || "").trim(),
-    });
+    const cPayDay = document.getElementById("c-pay-day");
+    const cPayRemEn = document.getElementById("c-pay-rem-en");
+    const payRemWrap = document.getElementById("rent-pay-reminder-wrap");
+    const payAfterWrap = document.getElementById("rent-pay-after-wrap");
+    const cPayAfterDays = document.getElementById("c-pay-after-days");
+    let chosenPayMode = apt.rent_reminder_mode || null;
+
+    const syncPayModeUi = () => {
+      const enabledRem = Boolean(cPayRemEn?.checked);
+      payRemWrap?.classList.toggle("hidden", !enabledRem);
+      document.querySelectorAll("#c-pay-rem-modes [data-pay-mode]").forEach(btn => {
+        btn.classList.toggle("active", enabledRem && btn.dataset.payMode === chosenPayMode);
+      });
+      payAfterWrap?.classList.toggle("hidden", !enabledRem || chosenPayMode !== "after_days");
+    };
+
+    const getContractSnapshot = () => {
+      const remEn = Boolean(cPayRemEn?.checked);
+      return JSON.stringify({
+        has_tenant: Boolean(document.getElementById("c-has")?.checked),
+        agreement_no: (document.getElementById("c-no")?.value || "").trim(),
+        start: (document.getElementById("c-start")?.value || "").trim(),
+        end: (document.getElementById("c-end")?.value || "").trim(),
+        pay_day: (cPayDay?.value || "").trim(),
+        rem_en: remEn,
+        rem_mode: remEn ? (chosenPayMode || "") : "",
+        rem_after: remEn && chosenPayMode === "after_days" ? String(cPayAfterDays?.value || "") : "",
+      });
+    };
+
     const initialContractSnap = getContractSnapshot();
     updateContractDirty = () => {
       saveContractBtn.disabled = getContractSnapshot() === initialContractSnap;
     };
+
     document.getElementById("c-has")?.addEventListener("change", updateContractDirty);
     document.getElementById("c-no")?.addEventListener("input", updateContractDirty);
     document.getElementById("c-start")?.addEventListener("input", updateContractDirty);
     document.getElementById("c-start")?.addEventListener("change", updateContractDirty);
     document.getElementById("c-end")?.addEventListener("input", updateContractDirty);
     document.getElementById("c-end")?.addEventListener("change", updateContractDirty);
+    cPayDay?.addEventListener("input", updateContractDirty);
+    cPayDay?.addEventListener("change", updateContractDirty);
+    cPayAfterDays?.addEventListener("change", updateContractDirty);
 
-    const performSaveContract = async (startDate, endDate) => {
+    cPayRemEn?.addEventListener("change", () => {
+      haptic("light");
+      if (cPayRemEn.checked && !chosenPayMode) {
+        chosenPayMode = "day_before";
+      }
+      syncPayModeUi();
+      updateContractDirty();
+    });
+
+    document.querySelectorAll("#c-pay-rem-modes [data-pay-mode]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        haptic("light");
+        chosenPayMode = btn.dataset.payMode;
+        syncPayModeUi();
+        updateContractDirty();
+      });
+    });
+
+    const performSaveContract = async (startDate, endDate, paymentPayload) => {
       saveContractBtn.disabled = true;
       try {
         await api(`/api/apartments/${apt.id}/contract`, {
@@ -3424,6 +3502,7 @@ function renderApartments(root) {
             agreement_no: document.getElementById("c-no").value.trim() || null,
             agreement_date_start: startDate.display,
             agreement_date_finish: endDate.display,
+            ...paymentPayload,
           },
         });
         showToast("✅ Договор сохранён");
@@ -3446,17 +3525,55 @@ function renderApartments(root) {
       if (startDate.iso && endDate.iso && startDate.iso > endDate.iso) {
         return showToast("❌ Дата начала договора не может быть позже даты окончания", "error");
       }
+
+      const rawPayDay = (cPayDay?.value || "").trim();
+      let payDay = null;
+      if (rawPayDay !== "") {
+        const parsedDay = Number(rawPayDay);
+        if (!Number.isInteger(parsedDay) || parsedDay < 1 || parsedDay > 31) {
+          return showToast("❌ Дата ежемесячного платежа должна быть числом от 1 до 31", "error");
+        }
+        payDay = parsedDay;
+      }
+
+      const remEnabled = Boolean(cPayRemEn?.checked);
+      let remMode = null;
+      let remDaysAfter = null;
+      if (remEnabled) {
+        if (payDay === null) {
+          return showToast("❌ Укажите дату ежемесячного платежа, чтобы включить напоминание об оплате", "error");
+        }
+        if (!chosenPayMode) {
+          return showToast("❌ Выберите вариант напоминания об оплате", "error");
+        }
+        remMode = chosenPayMode;
+        if (remMode === "after_days") {
+          const dVal = Number(cPayAfterDays?.value || 0);
+          if (!Number.isInteger(dVal) || dVal < 1 || dVal > 20) {
+            return showToast("❌ Выберите количество дней после даты оплаты (от 1 до 20)", "error");
+          }
+          remDaysAfter = dVal;
+        }
+      }
+
+      const paymentPayload = {
+        rent_payment_day: payDay,
+        rent_reminder_enabled: remEnabled,
+        rent_reminder_mode: remMode,
+        rent_reminder_days_after: remDaysAfter,
+      };
+
       if (startDate.iso && endDate.iso && isContractOverOneYear(startDate.iso, endDate.iso)) {
         openModal("⚠️ Срок договора больше года!", `<p>${esc(LONG_TERM_CONTRACT_WARNING)}</p>`, [
           {
             label: "💾 Сохранить",
-            onClick: () => performSaveContract(startDate, endDate),
+            onClick: () => performSaveContract(startDate, endDate, paymentPayload),
           },
           { label: "Отмена", cls: "btn-secondary" },
         ]);
         return;
       }
-      await performSaveContract(startDate, endDate);
+      await performSaveContract(startDate, endDate, paymentPayload);
     });
   }
 
@@ -4004,7 +4121,7 @@ const APP_GUIDE_TOPICS = [
         <p>В разделе <b>«🌆 Недвижимость → 📋 Аренда»</b> отметьте чек-бокс <b>«Объект сдаётся в аренду»</b>, после чего станут доступны блоки:</p>
         <ul>
           <li><b>Наниматель проживает:</b> добавление и удаление нанимателей по Telegram ID (узнать ID можно в @userinfobot).</li>
-          <li><b>Договор найма:</b> номер, дата начала и окончания (ДД.ММ.ГГГГ). Если срок превышает 12 месяцев, бот предупредит о требованиях регистрации в Росреестре.</li>
+          <li><b>Договор найма и оплата:</b> номер, дата начала и окончания (ДД.ММ.ГГГГ), а также опциональная дата ежемесячного платежа (1–31) и напоминания об оплате (нанимателю и владельцу в 15:00) — за день, в день оплаты или спустя 1–20 дней после даты платежа. Если срок договора превышает 12 месяцев, бот предупредит о регистрации в Росреестре.</li>
           <li><b>Уведомления и доступ:</b> за 7 дней и в день окончания договора в 15:00 владельцу приходит напоминание; после окончания срока доступ нанимателя автоматически закрывается. При удалении договора можно выбрать: оставить доступ нанимателю или открепить его.</li>
         </ul>
       </div>`,

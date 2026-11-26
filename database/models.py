@@ -42,6 +42,15 @@ IRRIGATION_MODE_AFTER_COLD = "after_cold"
 IRRIGATION_MODE_PARALLEL = "parallel"
 IRRIGATION_MODES = (IRRIGATION_MODE_AFTER_COLD, IRRIGATION_MODE_PARALLEL)
 
+RENT_REMINDER_DAY_BEFORE = "day_before"
+RENT_REMINDER_ON_DAY = "on_day"
+RENT_REMINDER_AFTER_DAYS = "after_days"
+RENT_REMINDER_MODES = (
+    RENT_REMINDER_DAY_BEFORE,
+    RENT_REMINDER_ON_DAY,
+    RENT_REMINDER_AFTER_DAYS,
+)
+
 VERIFICATION_NOTIFY_INTERVALS = ("6m", "3m", "1m", "1w")
 VERIFICATION_INTERVAL_LABELS = {
     "6m": "Полгода",
@@ -173,12 +182,26 @@ def format_property_title(apt) -> str:
     return f"{label} {number}".strip()
 
 
+def format_property_genitive(apt) -> str:
+    """Genitive property title for Russian phrases, e.g. 'Квартиры №371', 'Дома 12', 'Дачи уч. 5'."""
+    ptype = getattr(apt, "property_type", None) or "apartment"
+    number = str(getattr(apt, "number", "") or "").strip()
+    if ptype == "apartment":
+        return f"Квартиры №{number}"
+    if ptype == "house":
+        return f"Дома {number}".strip()
+    if ptype == "dacha":
+        return f"Дачи {number}".strip()
+    return f"Квартиры №{number}"
+
+
 def has_apartment_contract(apt) -> bool:
-    """Return True if any lease contract field is populated."""
+    """Return True if any lease contract or monthly payment field is populated."""
     return bool(
         (getattr(apt, "agreement_no", None) or "").strip()
         or getattr(apt, "agreement_date_start", None)
         or getattr(apt, "agreement_date_finish", None)
+        or getattr(apt, "rent_payment_day", None)
     )
 
 
@@ -278,6 +301,10 @@ class Apartment(Base):
     agreement_no: Mapped[str | None] = mapped_column(String(100), nullable=True)
     agreement_date_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     agreement_date_finish: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    rent_payment_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rent_reminder_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    rent_reminder_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    rent_reminder_days_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
     water_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     electricity_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gas_submission_day: Mapped[int | None] = mapped_column(Integer, nullable=True)

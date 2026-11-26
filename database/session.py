@@ -39,6 +39,10 @@ APARTMENT_MIGRATIONS = (
     ("gas_submission_day", "ALTER TABLE apartments ADD COLUMN gas_submission_day INTEGER"),
     ("sort_order", "ALTER TABLE apartments ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"),
     ("irrigation_mode", "ALTER TABLE apartments ADD COLUMN irrigation_mode VARCHAR(20) NOT NULL DEFAULT 'parallel'"),
+    ("rent_payment_day", "ALTER TABLE apartments ADD COLUMN rent_payment_day INTEGER"),
+    ("rent_reminder_enabled", "ALTER TABLE apartments ADD COLUMN rent_reminder_enabled BOOLEAN NOT NULL DEFAULT 0"),
+    ("rent_reminder_mode", "ALTER TABLE apartments ADD COLUMN rent_reminder_mode VARCHAR(20)"),
+    ("rent_reminder_days_after", "ALTER TABLE apartments ADD COLUMN rent_reminder_days_after INTEGER"),
 )
 
 METER_READING_MIGRATIONS = (

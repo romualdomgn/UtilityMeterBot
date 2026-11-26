@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import config
 from database import operations
-from database.models import format_property_short
+from database.models import (
+    RENT_REMINDER_AFTER_DAYS,
+    RENT_REMINDER_MODES,
+    format_property_short,
+)
 from services.access import is_admin, user_can_access_apartment
 from services.notifications import (
     dispatch_notification,
@@ -59,13 +63,48 @@ async def api_update_contract(
     if date_start and date_finish and date_start > date_finish:
         raise HTTPException(400, "Дата начала договора не может быть позже даты окончания")
 
-    updates = {
+    updates: dict = {
         "agreement_no": (body.agreement_no or "").strip() or None,
         "agreement_date_start": date_start,
         "agreement_date_finish": date_finish,
     }
     if body.has_tenant is not None:
         updates["has_tenant"] = body.has_tenant
+
+    payment_fields_touched = bool(
+        body.model_fields_set
+        & {"rent_payment_day", "rent_reminder_enabled", "rent_reminder_mode", "rent_reminder_days_after"}
+    )
+    if payment_fields_touched:
+        pay_day = body.rent_payment_day
+        if pay_day is not None and not (1 <= pay_day <= 31):
+            raise HTTPException(400, "Дата ежемесячного платежа должна быть числом от 1 до 31")
+        updates["rent_payment_day"] = pay_day
+
+        rem_enabled = bool(body.rent_reminder_enabled)
+        if rem_enabled:
+            if pay_day is None:
+                raise HTTPException(
+                    400,
+                    "Укажите дату ежемесячного платежа, чтобы включить напоминание об оплате",
+                )
+            mode = body.rent_reminder_mode
+            if mode not in RENT_REMINDER_MODES:
+                raise HTTPException(400, "Выберите вариант напоминания об оплате")
+            days_after = body.rent_reminder_days_after if mode == RENT_REMINDER_AFTER_DAYS else None
+            if mode == RENT_REMINDER_AFTER_DAYS:
+                if days_after is None or not (1 <= days_after <= 20):
+                    raise HTTPException(
+                        400,
+                        "Укажите количество дней после даты платежа (от 1 до 20)",
+                    )
+            updates["rent_reminder_enabled"] = True
+            updates["rent_reminder_mode"] = mode
+            updates["rent_reminder_days_after"] = days_after
+        else:
+            updates["rent_reminder_enabled"] = False
+            updates["rent_reminder_mode"] = None
+            updates["rent_reminder_days_after"] = None
 
     try:
         await operations.update_contract_atomic(apt_id, updates, user.telegram_id)
