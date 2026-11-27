@@ -22,6 +22,7 @@ from database.models import (
     TARIFF_LABELS,
     get_apartment_enabled_meters,
     get_apartment_irrigation_mode,
+    resolve_user_display_name,
 )
 from services.access import (
     get_accessible_apartments,
@@ -152,7 +153,7 @@ async def api_update_own_profile(
         raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
 
     try:
-        updated = await operations.update_own_profile_atomic(user.telegram_id, name)
+        updated = await operations.update_own_profile_atomic(user.telegram_id, name, is_actor_admin=is_admin(user.telegram_id))
     except LookupError as e:
         raise HTTPException(404, str(e))
     return {"ok": True, "name": updated.name}
@@ -214,7 +215,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
         for mt in ALL_TARIFF_TYPES
     }
     tenants = [
-        {"telegram_id": t.telegram_id, "name": t.name, "phone": t.phone}
+        {"telegram_id": t.telegram_id, "name": resolve_user_display_name(t, user.role, user.telegram_id), "phone": t.phone}
         for t in await crud.get_apartment_tenants(apt_id)
     ]
     readings_count = await crud.get_readings_count(apt_id)

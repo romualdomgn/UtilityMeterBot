@@ -13,6 +13,7 @@ from database.models import (
     RENT_REMINDER_AFTER_DAYS,
     RENT_REMINDER_MODES,
     format_property_short,
+    resolve_user_display_name,
 )
 from services.access import is_admin, user_can_access_apartment
 from services.notifications import (
@@ -231,7 +232,7 @@ async def api_update_tenant(
     except LookupError as e:
         raise HTTPException(404, str(e))
 
-    return {"ok": True, "name": updated.name, "phone": updated.phone}
+    return {"ok": True, "name": resolve_user_display_name(updated, user.role, user.telegram_id), "phone": updated.phone}
 
 
 @router.delete("/api/apartments/{apt_id}/tenants/{tenant_tg_id}")

@@ -866,6 +866,148 @@ async def test_rent_payment_day_and_reminders_validation_and_scheduler(temp_db, 
     assert reloaded.rent_reminder_mode is None
     assert reloaded.rent_reminder_days_after is None
 
+
+@pytest.mark.asyncio
+async def test_scoped_names_for_admin_landlord_and_tenant(temp_db, tmp_path, monkeypatch):
+    from database.session import _run_sqlite_migrations
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Администратор")
+    await crud.sync_admin_user(100)
+
+    # Admin creates family, adds landlord and apartment, landlord adds tenant
+    fam_res = await fam_router.api_create_family(FamilyBody(name="Семья от Админа"), user=admin)
+    fam_id = fam_res["id"]
+    await fam_router.api_add_family_owner(
+        fam_id, FamilyOwnerBody(telegram_id=201, name="Владелец от Админа"), user=admin
+    )
+    apt = await crud.create_apartment("75", fam_id)
+
+    landlord = WebAppUser(telegram_id=201, role="landlord", family_id=fam_id, name="Владелец от Админа")
+    req = make_request()
+    await ten_router.api_add_tenant(
+        apt.id,
+        TenantCreateBody(telegram_id=301, name="Наниматель от Владельца", force_no_contract=True),
+        req,
+        user=landlord,
+    )
+    tenant = WebAppUser(telegram_id=301, role="tenant", family_id=fam_id, name="Наниматель от Владельца")
+
+    # 1. Landlord renames their OWN name and THEIR family's name
+    await apt_router.api_update_own_profile(ProfileUpdateBody(name="Иван (своё имя)"), user=landlord)
+    await fam_router.api_rename_family(fam_id, FamilyBody(name="Моя Семья"), user=landlord)
+
+    # 2. Tenant renames their OWN name
+    await apt_router.api_update_own_profile(ProfileUpdateBody(name="Сергей (своё имя)"), user=tenant)
+
+    # 3. Admin gives their own label to the tenant
+    upd_adm_t = await ten_router.api_update_tenant(
+        301, TenantUpdateBody(name="Жилец 75 (от Админа)"), user=admin
+    )
+    assert upd_adm_t["name"] == "Жилец 75 (от Админа)"
+
+    # Verify Admin's view: Admin sees ONLY the names Admin gave!
+    adm_fams = await fam_router.api_families(user=admin)
+    assert adm_fams["families"][0]["name"] == "Семья от Админа"
+    assert adm_fams["families"][0]["owners"][0]["name"] == "Владелец от Админа"
+    assert adm_fams["tenants"][0]["name"] == "Жилец 75 (от Админа)"
+
+    adm_detail = await apt_router.api_apartment_detail(apt.id, user=admin)
+    assert adm_detail["tenants"][0]["name"] == "Жилец 75 (от Админа)"
+
+    adm_users = await admin_router.api_admin_users(user=admin)
+    adm_map = {u["telegram_id"]: u["name"] for u in adm_users["users"]}
+    assert adm_map[201] == "Владелец от Админа"
+    assert adm_map[301] == "Жилец 75 (от Админа)"
+
+    # Verify Landlord's view: Landlord sees own name, own family name, and Landlord's name for tenant!
+    ll_fams = await fam_router.api_families(user=landlord)
+    assert ll_fams["families"][0]["name"] == "Моя Семья"
+    assert ll_fams["families"][0]["owners"][0]["name"] == "Иван (своё имя)"
+    assert ll_fams["tenants"][0]["name"] == "Наниматель от Владельца"
+
+    ll_detail = await apt_router.api_apartment_detail(apt.id, user=landlord)
+    assert ll_detail["tenants"][0]["name"] == "Наниматель от Владельца"
+
+    ll_users = await admin_router.api_admin_users(user=landlord)
+    ll_map = {u["telegram_id"]: u["name"] for u in ll_users["users"]}
+    assert ll_map[201] == "Иван (своё имя)"
+    assert ll_map[301] == "Наниматель от Владельца"
+
+    # Verify Tenant's own profile name is preserved
+    db_t = await crud.get_user_by_telegram_id(301)
+    assert db_t is not None and db_t.name == "Сергей (своё имя)"
+
+    # 4. Admin renames family & owner later -> Landlord's custom names stay untouched!
+    await fam_router.api_rename_family(fam_id, FamilyBody(name="Семья VIP (Админ)"), user=admin)
+    await fam_router.api_update_family_owner(
+        fam_id, 201, FamilyOwnerUpdateBody(name="Иван VIP (Админ)"), user=admin
+    )
+    assert (await fam_router.api_families(user=admin))["families"][0]["name"] == "Семья VIP (Админ)"
+    assert (await fam_router.api_families(user=admin))["families"][0]["owners"][0]["name"] == "Иван VIP (Админ)"
+    assert (await fam_router.api_families(user=landlord))["families"][0]["name"] == "Моя Семья"
+    assert (await fam_router.api_families(user=landlord))["families"][0]["owners"][0]["name"] == "Иван (своё имя)"
+
+    # 5. Landlord renames tenant -> Admin's label and Tenant's own name stay untouched!
+    upd_ll_t = await ten_router.api_update_tenant(
+        301, TenantUpdateBody(name="Сергей кв.75 (Владелец)"), user=landlord
+    )
+    assert upd_ll_t["name"] == "Сергей кв.75 (Владелец)"
+    assert (await fam_router.api_families(user=landlord))["tenants"][0]["name"] == "Сергей кв.75 (Владелец)"
+    assert (await fam_router.api_families(user=admin))["tenants"][0]["name"] == "Жилец 75 (от Админа)"
+    assert (await crud.get_user_by_telegram_id(301)).name == "Сергей (своё имя)"
+
+    # 6. Photo forwarding caption shows per-recipient name (admin sees admin_name, landlord sees landlord_name)
+    await fam_router.api_add_family_owner(
+        fam_id, FamilyOwnerBody(telegram_id=100, name="Администратор"), user=admin
+    )
+    photo_bot = DummyBot()
+    sent = await notifications.forward_meter_photo_file(
+        bot=photo_bot,
+        apt_id=apt.id,
+        filepath=None,
+        sender_tg_id=301,
+        sender_name="Сергей (своё имя)",
+        comment="ХВС",
+        photo_file_id="FILE_ID_1",
+    )
+    assert sent == 2
+    by_uid = {p["chat_id"]: p["caption"] for p in photo_bot.photos}
+    assert "Жилец 75 (от Админа)" in by_uid[100]
+    assert "Сергей кв.75 (Владелец)" in by_uid[201]
+
+    # 7. Family backup does not leak admin_name aliases
+    exp_dir = tmp_path / "exp_names"
+    exp_dir.mkdir()
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite+aiosqlite:///{temp_db}")
+    monkeypatch.setattr(config, "EXPORT_DIR", exp_dir)
+    fam_db = await backup.create_family_backup(fam_id)
+    try:
+        raw = fam_db.read_bytes()
+        assert "Семья VIP (Админ)".encode("utf-8") not in raw
+        assert "Иван VIP (Админ)".encode("utf-8") not in raw
+        assert "Жилец 75 (от Админа)".encode("utf-8") not in raw
+    finally:
+        fam_db.unlink(missing_ok=True)
+
+    # 8. Legacy DB migration backfills families.admin_name, users.admin_name, users.landlord_name
+    leg_db = tmp_path / "legacy_names.db"
+    eng = create_async_engine(f"sqlite+aiosqlite:///{leg_db}", future=True)
+    async with eng.begin() as conn:
+        await conn.execute(text("CREATE TABLE families (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL)"))
+        await conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL, name VARCHAR(120), role VARCHAR(20) NOT NULL)"))
+        await conn.execute(text("INSERT INTO families VALUES (1, 'Старая семья')"))
+        await conn.execute(text("INSERT INTO users VALUES (1, 201, 'Старый владелец', 'landlord')"))
+        await conn.execute(text("INSERT INTO users VALUES (2, 301, 'Старый жилец', 'tenant')"))
+        await conn.run_sync(_run_sqlite_migrations)
+        fam_row = (await conn.execute(text("SELECT name, admin_name FROM families WHERE id = 1"))).fetchone()
+        u1_row = (await conn.execute(text("SELECT name, admin_name, landlord_name FROM users WHERE id = 1"))).fetchone()
+        u2_row = (await conn.execute(text("SELECT name, admin_name, landlord_name FROM users WHERE id = 2"))).fetchone()
+    await eng.dispose()
+    assert fam_row == ("Старая семья", "Старая семья")
+    assert u1_row == ("Старый владелец", "Старый владелец", None)
+    assert u2_row == ("Старый жилец", "Старый жилец", "Старый жилец")
+
 def test_ui_strings_and_removed_photo_storage_notice():
     import re as _re
 
@@ -956,3 +1098,14 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert "Напомнить в день оплаты" in app_js
     assert "Установить день напоминания об оплате" in app_js
     assert 'id="c-pay-after-days"' in app_js
+    assert "Дата ежемесячного платежа (число месяца)" in app_js
+    assert "Дата ежемесячного платежа (число месяца, опционально)" not in app_js
+    assert "приходят только владельцам внутри семьи." in app_js
+    assert "владелец может подтвердить корректировку ошибочного ввода" in app_js
+    assert "владелец может отредактировать любую сохранённую запись" in app_js
+    assert "нанимателю и владельцу в 15:00 UTC+5" in app_js
+    assert "удалить нанимателя с прекращением доступа к боту" in app_js
+    assert "укажите серийный номер счётчика, дату следующей поверки и выберите сроки уведомлений." in app_js
+    assert "выберите заменяемый счётчик, введите конечное показание старого и начальное показание нового счётчика." in app_js
+    assert "¡ Важно !" in app_js
+    assert "не передаются в управляющую компанию или в компанию-поставщик энергетических ресурсов!" in app_js

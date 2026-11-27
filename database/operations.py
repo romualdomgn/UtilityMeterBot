@@ -693,7 +693,7 @@ async def update_initial_readings_atomic(
 
 async def create_family_atomic(name: str, actor_tg_id: int) -> Family:
     async with UnitOfWork(write=True) as s:
-        fam = Family(name=name)
+        fam = Family(name=name, admin_name=name)
         s.add(fam)
         await s.flush()
         s.add(AuditLog(
@@ -705,14 +705,27 @@ async def create_family_atomic(name: str, actor_tg_id: int) -> Family:
         return fam
 
 
-async def rename_family_atomic(family_id: int, new_name: str, actor_tg_id: int) -> None:
-    """LOW-05 & MEDIUM-07: raise LookupError when family does not exist and log atomically."""
+async def rename_family_atomic(
+    family_id: int,
+    new_name: str,
+    actor_tg_id: int,
+    is_actor_admin: bool = False,
+) -> None:
+    """Rename family preserving admin_name vs landlord's own family name."""
     async with UnitOfWork(write=True) as s:
         fam = await s.get(Family, family_id)
         if not fam:
             raise LookupError("Семья не найдена")
-        old_name = fam.name
-        fam.name = new_name
+        if is_actor_admin:
+            old_name = fam.admin_name or fam.name
+            if fam.admin_name is None or fam.name == fam.admin_name:
+                fam.name = new_name
+            fam.admin_name = new_name
+        else:
+            old_name = fam.name
+            if fam.admin_name is None:
+                fam.admin_name = fam.name
+            fam.name = new_name
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
             action="rename_family",
@@ -780,6 +793,7 @@ async def add_family_owner_atomic(
         user = User(
             telegram_id=telegram_id,
             name=name,
+            admin_name=name,
             phone=phone,
             role="landlord",
             family_id=family_id,
@@ -807,6 +821,7 @@ async def update_family_owner_atomic(
     phone: str | None,
     update_phone: bool,
     actor_tg_id: int,
+    is_actor_admin: bool = False,
 ) -> User:
     async with UnitOfWork(write=True) as s:
         subq = select(FamilyOwner.user_id).where(FamilyOwner.family_id == family_id)
@@ -823,7 +838,22 @@ async def update_family_owner_atomic(
         if not target:
             raise LookupError("Член семьи не найден")
 
-        target.name = name
+        if config.ADMIN_TELEGRAM_ID and target.telegram_id == config.ADMIN_TELEGRAM_ID and not is_actor_admin:
+            raise PermissionError("Нельзя редактировать данные администратора")
+
+        if is_actor_admin:
+            if target.telegram_id == actor_tg_id:
+                target.name = name
+                target.admin_name = name
+            else:
+                if target.admin_name is None or target.name == target.admin_name:
+                    target.name = name
+                target.admin_name = name
+        else:
+            if target.admin_name is None and target.name:
+                target.admin_name = target.name
+            target.name = name
+
         if update_phone:
             target.phone = phone
 
@@ -951,6 +981,10 @@ async def add_tenant_atomic(
             target_user = existing
             if name and not target_user.name:
                 target_user.name = name
+            if name and not target_user.admin_name:
+                target_user.admin_name = name
+            if name and not target_user.landlord_name:
+                target_user.landlord_name = name
             if phone and not target_user.phone:
                 target_user.phone = phone
             if target_user.family_id is None:
@@ -959,6 +993,8 @@ async def add_tenant_atomic(
             target_user = User(
                 telegram_id=telegram_id,
                 name=name,
+                admin_name=name,
+                landlord_name=name,
                 phone=phone,
                 role="tenant",
                 family_id=apt.family_id,
@@ -1000,7 +1036,14 @@ async def update_tenant_profile_atomic(
         if not is_actor_admin and target.family_id != actor_family_id:
             raise PermissionError("Нет доступа к этому нанимателю")
 
-        target.name = name
+        if is_actor_admin:
+            if target.landlord_name is None and target.name:
+                target.landlord_name = target.name
+            target.admin_name = name
+        else:
+            if target.admin_name is None and target.name:
+                target.admin_name = target.name
+            target.landlord_name = name
         if update_phone:
             target.phone = phone
 
@@ -1207,19 +1250,31 @@ async def correct_reading_atomic(
         return apt_id, old_val, new_value
 
 
-async def update_own_profile_atomic(telegram_id: int, name: str) -> User:
+async def update_own_profile_atomic(
+    telegram_id: int,
+    name: str,
+    is_actor_admin: bool = False,
+) -> User:
     async with UnitOfWork(write=True) as s:
         res = await s.execute(select(User).where(User.telegram_id == telegram_id))
         user = res.scalar_one_or_none()
         if not user:
             if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
-                user = User(telegram_id=telegram_id, name=name, role="admin")
+                user = User(telegram_id=telegram_id, name=name, admin_name=name, role="admin")
                 s.add(user)
                 await s.flush()
             else:
                 raise LookupError("Профиль пользователя не найден")
         else:
-            user.name = name
+            if is_actor_admin or (config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID):
+                user.name = name
+                user.admin_name = name
+            else:
+                if user.admin_name is None and user.name:
+                    user.admin_name = user.name
+                if user.role == "tenant" and user.landlord_name is None and user.name:
+                    user.landlord_name = user.name
+                user.name = name
         s.add(AuditLog(
             user_telegram_id=telegram_id,
             action="update_own_name",

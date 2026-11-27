@@ -49,6 +49,15 @@ METER_READING_MIGRATIONS = (
     ("is_replacement_init", "ALTER TABLE meter_readings ADD COLUMN is_replacement_init BOOLEAN NOT NULL DEFAULT 0"),
 )
 
+FAMILY_MIGRATIONS = (
+    ("admin_name", "ALTER TABLE families ADD COLUMN admin_name VARCHAR(120)"),
+)
+
+USER_MIGRATIONS = (
+    ("admin_name", "ALTER TABLE users ADD COLUMN admin_name VARCHAR(120)"),
+    ("landlord_name", "ALTER TABLE users ADD COLUMN landlord_name VARCHAR(120)"),
+)
+
 
 def _apply_table_migrations(sync_conn, table_name: str, migrations: tuple[tuple[str, str], ...]) -> None:
     rows = sync_conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
@@ -61,12 +70,22 @@ def _apply_table_migrations(sync_conn, table_name: str, migrations: tuple[tuple[
             sync_conn.execute(text(ddl))
             if table_name == "apartments" and col_name == "sort_order":
                 sync_conn.execute(text("UPDATE apartments SET sort_order = id"))
+            elif table_name == "families" and col_name == "admin_name":
+                sync_conn.execute(text("UPDATE families SET admin_name = name WHERE admin_name IS NULL"))
+            elif table_name == "users" and col_name == "admin_name":
+                sync_conn.execute(text("UPDATE users SET admin_name = name WHERE admin_name IS NULL"))
+            elif table_name == "users" and col_name == "landlord_name":
+                sync_conn.execute(
+                    text("UPDATE users SET landlord_name = name WHERE role = 'tenant' AND landlord_name IS NULL")
+                )
 
 
 def _run_sqlite_migrations(sync_conn) -> None:
     """Safely add new columns to existing SQLite tables without data loss."""
     _apply_table_migrations(sync_conn, "apartments", APARTMENT_MIGRATIONS)
     _apply_table_migrations(sync_conn, "meter_readings", METER_READING_MIGRATIONS)
+    _apply_table_migrations(sync_conn, "families", FAMILY_MIGRATIONS)
+    _apply_table_migrations(sync_conn, "users", USER_MIGRATIONS)
 
 
 async def init_db() -> None:

@@ -214,6 +214,34 @@ def is_apartment_rented(apt, has_linked_tenants: bool = False) -> bool:
     )
 
 
+def resolve_family_name(fam: "Family", viewer_role: str) -> str:
+    """Resolve family name for viewer: admin sees admin_name; landlords see family's own name."""
+    if viewer_role == "admin":
+        return getattr(fam, "admin_name", None) or fam.name
+    return fam.name
+
+
+def resolve_user_display_name(
+    user: "User",
+    viewer_role: str,
+    viewer_tg_id: int | None = None,
+) -> str | None:
+    """Resolve user display name respecting per-role naming isolation.
+
+    - Any user viewing themselves sees their own `user.name`.
+    - Admin viewing another user sees `user.admin_name` (fallback `user.name`).
+    - Landlord viewing a tenant sees `user.landlord_name` (fallback `user.name`).
+    - Landlord viewing another co-owner sees that owner's own `user.name`.
+    """
+    if viewer_tg_id is not None and user.telegram_id == viewer_tg_id:
+        return user.name
+    if viewer_role == "admin":
+        return getattr(user, "admin_name", None) or user.name
+    if viewer_role == "landlord" and user.role == "tenant":
+        return getattr(user, "landlord_name", None) or user.name
+    return user.name
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -223,6 +251,7 @@ class Family(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    admin_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
     )
@@ -242,6 +271,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
     name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    admin_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    landlord_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="tenant")
     family_id: Mapped[int | None] = mapped_column(

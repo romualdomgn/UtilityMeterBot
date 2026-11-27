@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import config
 from database import crud, operations
-from database.models import format_property_short
+from database.models import format_property_short, resolve_family_name, resolve_user_display_name
 from services.access import is_admin, user_can_manage_family
 from webapp.auth import WebAppUser, get_current_user
 from webapp.schemas import FamilyBody, FamilyOwnerBody, FamilyOwnerUpdateBody, require_role
@@ -31,12 +31,12 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
         apts = await crud.get_apartments_by_family(f.id)
         items.append({
             "id": f.id,
-            "name": f.name,
+            "name": resolve_family_name(f, user.role),
             "apartments_count": len(apts),
             "owners": [
                 {
                     "telegram_id": o.telegram_id,
-                    "name": o.name,
+                    "name": resolve_user_display_name(o, user.role, user.telegram_id),
                     "phone": o.phone,
                     "is_admin": bool(config.ADMIN_TELEGRAM_ID and o.telegram_id == config.ADMIN_TELEGRAM_ID),
                 }
@@ -51,7 +51,7 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
         if entry is None:
             entry = {
                 "telegram_id": t_user.telegram_id,
-                "name": t_user.name,
+                "name": resolve_user_display_name(t_user, user.role, user.telegram_id),
                 "phone": t_user.phone,
                 "family_id": t_user.family_id,
                 "apartments": [],
@@ -93,7 +93,7 @@ async def api_rename_family(
     if not name:
         raise HTTPException(400, "Название не может быть пустым")
     try:
-        await operations.rename_family_atomic(family_id, name, user.telegram_id)
+        await operations.rename_family_atomic(family_id, name, user.telegram_id, is_actor_admin=is_admin(user.telegram_id))
     except LookupError as e:
         raise HTTPException(404, str(e))
     return {"ok": True}
@@ -164,11 +164,18 @@ async def api_update_family_owner(
             phone=phone_val,
             update_phone=update_phone,
             actor_tg_id=user.telegram_id,
+            is_actor_admin=is_admin(user.telegram_id),
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
 
-    return {"ok": True, "name": updated.name, "phone": updated.phone}
+    return {
+        "ok": True,
+        "name": resolve_user_display_name(updated, user.role, user.telegram_id),
+        "phone": updated.phone,
+    }
 
 
 @router.delete("/api/families/{family_id}/owners/{owner_tg_id}")

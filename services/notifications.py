@@ -14,8 +14,8 @@ from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarku
 
 from config import BASE_DIR, WEBAPP_URL
 from database import crud
-from database.models import format_property_short, format_property_title
-from services.access import get_notification_recipients
+from database.models import format_property_short, format_property_title, resolve_user_display_name
+from services.access import get_notification_recipients, is_admin
 from services.calculations import fmt_date, format_reading_notification
 
 logger = logging.getLogger(__name__)
@@ -182,15 +182,23 @@ async def forward_meter_photo_file(
         return 0
 
     safe_comment = h(comment.strip()[:500])
-    caption = (
-        f"📷 Фото счётчиков — <b>{h(format_property_short(apt))}</b>\n"
-        f"От: {h(sender_name)} (ID: {sender_tg_id})"
-    )
-    if safe_comment:
-        caption += f"\n💬 {safe_comment}"
+    sender_user = await crud.get_user_by_telegram_id(sender_tg_id)
+    prop_short = h(format_property_short(apt))
 
     sent = 0
     for uid in recipients:
+        viewer_role = "admin" if is_admin(uid) else "landlord"
+        resolved_sender = (
+            resolve_user_display_name(sender_user, viewer_role=viewer_role, viewer_tg_id=uid)
+            if sender_user
+            else None
+        ) or sender_name
+        caption = (
+            f"📷 Фото счётчиков — <b>{prop_short}</b>\n"
+            f"От: {h(resolved_sender)} (ID: {sender_tg_id})"
+        )
+        if safe_comment:
+            caption += f"\n💬 {safe_comment}"
         try:
             photo_payload = photo_file_id if photo_file_id else FSInputFile(filepath)
             await bot.send_photo(

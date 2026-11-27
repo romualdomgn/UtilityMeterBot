@@ -252,6 +252,13 @@ def _create_family_backup_sync(family_id: int) -> Path:
 
         if "families" in existing_tables:
             dst.execute("DELETE FROM families WHERE id != ?", (family_id,))
+            fam_cols = {r[1] for r in dst.execute("PRAGMA table_info(families)").fetchall()}
+            if "admin_name" in fam_cols:
+                dst.execute("UPDATE families SET admin_name = NULL")
+        if "users" in existing_tables:
+            usr_cols = {r[1] for r in dst.execute("PRAGMA table_info(users)").fetchall()}
+            if "admin_name" in usr_cols:
+                dst.execute("UPDATE users SET admin_name = NULL")
 
         dst.commit()
 

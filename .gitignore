@@ -30,6 +30,7 @@ repomix info.txt
 new AI chat.txt
 install.txt
 Информация.txt
+Check secrets info.txt
 
 # Logs
 *.log

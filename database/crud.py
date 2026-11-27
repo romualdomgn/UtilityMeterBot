@@ -111,7 +111,7 @@ async def get_family(family_id: int) -> Family | None:
 
 async def create_family(name: str) -> Family:
     async with UnitOfWork(write=True) as s:
-        fam = Family(name=name)
+        fam = Family(name=name, admin_name=name)
         s.add(fam)
         await s.flush()
         await s.refresh(fam)
@@ -207,6 +207,8 @@ async def get_or_create_user(
         user = User(
             telegram_id=telegram_id,
             name=name,
+            admin_name=name,
+            landlord_name=name if role == "tenant" else None,
             phone=phone,
             role=role,
             family_id=family_id,

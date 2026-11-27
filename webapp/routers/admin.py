@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from config import BOT_TZ
 from database import crud
+from database.models import resolve_user_display_name
 from services.access import get_accessible_apartments, is_admin, user_can_access_apartment
 from services.backup import create_family_backup, get_or_create_manual_backup
 from services.export import generate_excel_report, generate_pdf_report
@@ -76,7 +77,7 @@ async def api_admin_users(user: WebAppUser = Depends(get_current_user)):
         "users": [
             {
                 "telegram_id": u.telegram_id,
-                "name": u.name,
+                "name": resolve_user_display_name(u, user.role, user.telegram_id),
                 "phone": u.phone,
                 "role": u.role,
                 "family_id": u.family_id,
