@@ -214,7 +214,7 @@ async def test_reattach_existing_tenant_to_second_property(temp_db):
 
     await ten_router.api_add_tenant(
         apt1.id,
-        TenantCreateBody(telegram_id=555, name="Иван", phone="+7-912-345-6789", force_no_contract=True),
+        TenantCreateBody(telegram_id=555, name="Иван", force_no_contract=True),
         req,
         user=admin,
     )
@@ -249,12 +249,11 @@ async def test_family_member_rename_and_self_rename(temp_db):
     await fam_router.api_update_family_owner(
         fam.id,
         201,
-        FamilyOwnerUpdateBody(name="Новое имя владельца", phone="+7-999-111-2233"),
+        FamilyOwnerUpdateBody(name="Новое имя владельца"),
         user=admin,
     )
     u201 = await crud.get_user_by_telegram_id(201)
     assert u201.name == "Новое имя владельца"
-    assert u201.phone == "+7-999-111-2233"
 
     await apt_router.api_update_own_profile(ProfileUpdateBody(name="Алексей"), user=landlord)
     assert (await crud.get_user_by_telegram_id(201)).name == "Алексей"

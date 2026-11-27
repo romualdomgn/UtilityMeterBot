@@ -171,13 +171,12 @@ async def api_add_tenant(
     if len(name) > 120:
         raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
 
-    phone = (body.phone or "").strip() or None
     try:
         needs_confirm, apt, display_name = await operations.add_tenant_atomic(
             apartment_id=apt_id,
             telegram_id=body.telegram_id,
             name=name,
-            phone=phone,
+            phone=None,
             actor_tg_id=user.telegram_id,
             force_no_contract=body.force_no_contract,
         )
@@ -214,15 +213,12 @@ async def api_update_tenant(
     if len(name) > 120:
         raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
 
-    update_phone = "phone" in body.model_fields_set
-    phone_val = (body.phone or "").strip() or None if update_phone else None
-
     try:
         updated = await operations.update_tenant_profile_atomic(
             tenant_tg_id=tenant_tg_id,
             name=name,
-            phone=phone_val,
-            update_phone=update_phone,
+            phone=None,
+            update_phone=False,
             actor_tg_id=user.telegram_id,
             actor_family_id=user.family_id,
             is_actor_admin=is_admin(user.telegram_id),
@@ -232,7 +228,7 @@ async def api_update_tenant(
     except LookupError as e:
         raise HTTPException(404, str(e))
 
-    return {"ok": True, "name": resolve_user_display_name(updated, user.role, user.telegram_id), "phone": updated.phone}
+    return {"ok": True, "name": resolve_user_display_name(updated, user.role, user.telegram_id)}
 
 
 @router.delete("/api/apartments/{apt_id}/tenants/{tenant_tg_id}")

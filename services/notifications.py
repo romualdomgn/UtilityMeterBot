@@ -12,6 +12,7 @@ from typing import Coroutine
 from aiogram import Bot
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
+import config
 from config import BASE_DIR, WEBAPP_URL
 from database import crud
 from database.models import format_property_short, format_property_title, resolve_user_display_name
@@ -220,3 +221,37 @@ async def send_document_to_user(bot: Bot, telegram_id: int, filepath: Path, capt
         caption=caption,
         parse_mode="HTML",
     )
+
+
+async def notify_admin_new_family_created(
+    bot: Bot,
+    creator_tg_id: int,
+    creator_name: str,
+    family_name: str,
+    owner_name: str,
+    owner_tg_id: int,
+) -> bool:
+    """Notify ADMIN_TELEGRAM_ID whenever a new family and initial owner are created."""
+    admin_id = config.ADMIN_TELEGRAM_ID
+    if not admin_id:
+        return False
+
+    actor_user = await crud.get_user_by_telegram_id(creator_tg_id)
+    resolved_creator = (
+        resolve_user_display_name(actor_user, viewer_role="admin", viewer_tg_id=admin_id)
+        if actor_user
+        else None
+    ) or creator_name
+
+    text = (
+        f"🆕 <b>Добавлена новая семья и новый владелец</b>\n\n"
+        f"👤 Кто добавил: <b>{h(resolved_creator)}</b> (ID: <code>{creator_tg_id}</code>)\n"
+        f"👨‍👩‍👧‍👦 Новая семья: <b>{h(family_name)}</b>\n"
+        f"🔑 Новый владелец: <b>{h(owner_name)}</b> (ID: <code>{owner_tg_id}</code>)"
+    )
+    try:
+        await bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        logger.warning("Failed to notify admin %s about new family: %s", admin_id, e)
+        return False

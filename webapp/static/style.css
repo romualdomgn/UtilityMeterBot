@@ -756,3 +756,16 @@ input.int-mask {
   font-size: 15px;
   font-weight: 600;
 }
+
+.invite-copy-box {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 13.5px;
+  line-height: 1.45;
+  margin-top: 8px;
+  user-select: text;
+  -webkit-user-select: text;
+  word-break: break-word;
+}

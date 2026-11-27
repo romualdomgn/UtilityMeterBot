@@ -215,7 +215,7 @@ async def api_apartment_detail(apt_id: int, user: WebAppUser = Depends(get_curre
         for mt in ALL_TARIFF_TYPES
     }
     tenants = [
-        {"telegram_id": t.telegram_id, "name": resolve_user_display_name(t, user.role, user.telegram_id), "phone": t.phone}
+        {"telegram_id": t.telegram_id, "name": resolve_user_display_name(t, user.role, user.telegram_id)}
         for t in await crud.get_apartment_tenants(apt_id)
     ]
     readings_count = await crud.get_readings_count(apt_id)

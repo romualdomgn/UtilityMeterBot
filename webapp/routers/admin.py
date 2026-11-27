@@ -78,7 +78,6 @@ async def api_admin_users(user: WebAppUser = Depends(get_current_user)):
             {
                 "telegram_id": u.telegram_id,
                 "name": resolve_user_display_name(u, user.role, user.telegram_id),
-                "phone": u.phone,
                 "role": u.role,
                 "family_id": u.family_id,
                 "is_blocked": u.is_blocked,

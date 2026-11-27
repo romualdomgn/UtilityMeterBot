@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 import config
 from database import crud, operations
 from database.models import format_property_short, resolve_family_name, resolve_user_display_name
 from services.access import is_admin, user_can_manage_family
+from services.notifications import dispatch_notification, notify_admin_new_family_created
 from webapp.auth import WebAppUser, get_current_user
-from webapp.schemas import FamilyBody, FamilyOwnerBody, FamilyOwnerUpdateBody, require_role
+from webapp.schemas import FamilyBody, FamilyInviteBody, FamilyOwnerBody, FamilyOwnerUpdateBody, require_role
 
 router = APIRouter()
 
@@ -37,7 +38,6 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
                 {
                     "telegram_id": o.telegram_id,
                     "name": resolve_user_display_name(o, user.role, user.telegram_id),
-                    "phone": o.phone,
                     "is_admin": bool(config.ADMIN_TELEGRAM_ID and o.telegram_id == config.ADMIN_TELEGRAM_ID),
                 }
                 for o in owners
@@ -52,7 +52,6 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
             entry = {
                 "telegram_id": t_user.telegram_id,
                 "name": resolve_user_display_name(t_user, user.role, user.telegram_id),
-                "phone": t_user.phone,
                 "family_id": t_user.family_id,
                 "apartments": [],
             }
@@ -68,6 +67,7 @@ async def api_families(user: WebAppUser = Depends(get_current_user)):
 
     return {
         "can_create": is_admin(user.telegram_id),
+        "can_invite_family": user.role in ("admin", "landlord"),
         "families": items,
         "tenants": list(tenants_map.values()),
     }
@@ -81,6 +81,66 @@ async def api_create_family(body: FamilyBody, user: WebAppUser = Depends(get_cur
         raise HTTPException(400, "Название семьи не может быть пустым")
     fam = await operations.create_family_atomic(name, user.telegram_id)
     return {"ok": True, "id": fam.id}
+
+
+def build_new_owner_invite_text(owner_name: str) -> str:
+    return (
+        f"Привет {owner_name}, приглашаю присоединиться к боту для управления недвижимостью "
+        f"(передавать показания счётчиков, следить за сроками поверки, отслеживать договоры найма, "
+        f"нанимателей и даты платежей, а так же многое другое). "
+        f"Ссылка на Телеграм бот - @TG_Utility_Meter_bot"
+    )
+
+
+@router.post("/api/families/invite")
+async def api_invite_family(
+    body: FamilyInviteBody,
+    request: Request,
+    user: WebAppUser = Depends(get_current_user),
+):
+    """Allow any landlord (or admin) to create a new isolated family with one initial owner."""
+    require_role(user, ("admin", "landlord"))
+    family_name = body.family_name.strip()
+    if not family_name:
+        raise HTTPException(400, "Название семьи не может быть пустым")
+    if len(family_name) > 120:
+        raise HTTPException(400, "Название семьи слишком длинное (максимум 120 символов)")
+
+    owner_name = body.owner_name.strip()
+    if not owner_name:
+        raise HTTPException(400, "Имя нового владельца не может быть пустым")
+    if len(owner_name) > 120:
+        raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
+
+    try:
+        fam, new_owner = await operations.create_family_with_owner_atomic(
+            family_name=family_name,
+            owner_telegram_id=body.owner_telegram_id,
+            owner_name=owner_name,
+            actor_tg_id=user.telegram_id,
+        )
+    except operations.ConflictError as e:
+        raise HTTPException(409, str(e))
+
+    await dispatch_notification(
+        request,
+        notify_admin_new_family_created(
+            bot=request.app.state.bot,
+            creator_tg_id=user.telegram_id,
+            creator_name=user.name,
+            family_name=fam.name,
+            owner_name=new_owner.name or owner_name,
+            owner_tg_id=new_owner.telegram_id,
+        ),
+        name=f"notify_admin_new_family_{fam.id}",
+    )
+
+    return {
+        "ok": True,
+        "family_name": fam.name,
+        "owner_name": new_owner.name or owner_name,
+        "invite_text": build_new_owner_invite_text(new_owner.name or owner_name),
+    }
 
 
 @router.put("/api/families/{family_id}")
@@ -128,7 +188,7 @@ async def api_add_family_owner(
             family_id=family_id,
             telegram_id=body.telegram_id,
             name=name,
-            phone=(body.phone or "").strip() or None,
+            phone=None,
             actor_tg_id=user.telegram_id,
         )
     except LookupError as e:
@@ -153,16 +213,13 @@ async def api_update_family_owner(
     if len(name) > 120:
         raise HTTPException(400, "Имя слишком длинное (максимум 120 символов)")
 
-    update_phone = "phone" in body.model_fields_set
-    phone_val = (body.phone or "").strip() or None if update_phone else None
-
     try:
         updated = await operations.update_family_owner_atomic(
             family_id=family_id,
             owner_tg_id=owner_tg_id,
             name=name,
-            phone=phone_val,
-            update_phone=update_phone,
+            phone=None,
+            update_phone=False,
             actor_tg_id=user.telegram_id,
             is_actor_admin=is_admin(user.telegram_id),
         )
@@ -174,7 +231,6 @@ async def api_update_family_owner(
     return {
         "ok": True,
         "name": resolve_user_display_name(updated, user.role, user.telegram_id),
-        "phone": updated.phone,
     }
 
 

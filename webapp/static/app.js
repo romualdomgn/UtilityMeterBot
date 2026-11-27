@@ -399,72 +399,6 @@ function getEnabledGroups(apt) {
   return groups;
 }
 
-// ── Phone mask: +7-xxx-xxx-xxxx ───────────────────────────────────────
-function formatRuPhone(raw) {
-  let digits = String(raw || "").replace(/\D/g, "");
-  if (digits.startsWith("7")) {
-    digits = digits.slice(1);
-    if (digits.length === 11 && (digits.startsWith("7") || digits.startsWith("8"))) {
-      digits = digits.slice(1);
-    }
-  } else if (digits.length >= 11 && digits.startsWith("8")) {
-    digits = digits.slice(1);
-  }
-  digits = digits.slice(0, 10);
-  if (!digits.length) return "+7-";
-  if (digits.length <= 3) return `+7-${digits}`;
-  if (digits.length <= 6) return `+7-${digits.slice(0, 3)}-${digits.slice(3)}`;
-  return `+7-${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6, 10)}`;
-}
-
-function attachPhoneMask(input) {
-  if (!input) return;
-  input.value = formatRuPhone(input.value);
-
-  const ensureCaretAfterPrefix = () => {
-    const pos = input.selectionStart ?? input.value.length;
-    if (pos < 3) {
-      input.setSelectionRange(input.value.length, input.value.length);
-    }
-  };
-
-  input.addEventListener("focus", () => {
-    if (!input.value.startsWith("+7-")) input.value = formatRuPhone(input.value);
-    setTimeout(ensureCaretAfterPrefix, 0);
-  });
-
-  input.addEventListener("click", ensureCaretAfterPrefix);
-
-  input.addEventListener("keydown", (e) => {
-    const start = input.selectionStart ?? 0;
-    const end = input.selectionEnd ?? 0;
-    if (e.key === "Backspace" && start <= 3 && end <= 3) {
-      e.preventDefault();
-      return;
-    }
-    if (e.key === "Delete" && start < 3) {
-      e.preventDefault();
-    }
-  });
-
-  input.addEventListener("input", () => {
-    input.value = formatRuPhone(input.value);
-  });
-}
-
-function readMaskedPhone(inputId) {
-  const el = document.getElementById(inputId);
-  if (!el) return { ok: true, value: null };
-  const val = formatRuPhone(el.value);
-  el.value = val;
-  if (val === "+7-") return { ok: true, value: null };
-  const subDigits = val.slice(3).replace(/\D/g, "");
-  if (subDigits.length !== 10) {
-    return { ok: false, error: "Введите полный номер в формате +7-xxx-xxx-xxxx или оставьте поле пустым" };
-  }
-  return { ok: true, value: val };
-}
-
 function wireTelegramLinks(container) {
   container.querySelectorAll(".tg-link").forEach(link => {
     link.addEventListener("click", (e) => {
@@ -492,7 +426,6 @@ function openModal(title, bodyHtml, buttons, opts = {}) {
   document.getElementById("modal-title").textContent = title;
   const bodyEl = document.getElementById("modal-body");
   bodyEl.innerHTML = bodyHtml;
-  bodyEl.querySelectorAll(".phone-mask").forEach(attachPhoneMask);
   bodyEl.querySelectorAll(".int-mask").forEach(attachIntMask);
   wireTelegramLinks(bodyEl);
 
@@ -3026,7 +2959,7 @@ function renderApartments(root) {
           <div id="rent-tenant-section" class="rent-sub-panel ${initialHasTenantSection ? "" : "hidden"}">
             ${tenants.length ? tenants.map(t => `
               <div class="table-row">
-                <div><div class="bold">${esc(t.name || "—")}</div><div class="small muted">ID: ${t.telegram_id}${t.phone ? " · " + esc(t.phone) : ""}</div></div>
+                <div><div class="bold">${esc(t.name || "—")}</div><div class="small muted">ID: ${t.telegram_id}</div></div>
                 <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-btn" data-tid="${t.telegram_id}" title="Удалить"><span class="del-x">❌</span></button>
               </div>`).join("") : `<p class="small muted">Нанимателей пока нет.</p>`}
             <button class="btn btn-secondary mt-8" id="btn-add-tenant">➕ Добавить нанимателя</button>
@@ -3627,7 +3560,6 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
       <div class="small muted">Telegram ID можно взять в боте <a href="https://t.me/userinfobot" target="_blank" rel="noopener" class="tg-link" data-tg-link="https://t.me/userinfobot">@userinfobot</a></div>
     </div>
     <div class="field"><label>Имя</label><input type="text" id="nt-name" placeholder="Введите имя" /></div>
-    <div class="field"><label>Телефон (необязательно)</label><input type="tel" inputmode="tel" id="nt-phone" class="phone-mask" placeholder="+7-___-___-____" /></div>
     <p class="small muted">Бот сможет отправить приглашение только если наниматель ранее уже нажимал /start.</p>
   `, [
     {
@@ -3641,12 +3573,9 @@ function openAddTenantModal(defaultAptId = null, onSuccess = null) {
         const name = document.getElementById("nt-name").value.trim();
         if (!Number.isSafeInteger(tgId) || tgId <= 0) { showToast("Введите корректный Telegram ID", "error"); return false; }
         if (!name) { showToast("Введите имя нанимателя", "error"); return false; }
-        const ph = readMaskedPhone("nt-phone");
-        if (!ph.ok) { showToast(ph.error, "error"); return false; }
         return await submitAddTenant(targetAptId, {
           telegram_id: tgId,
           name,
-          phone: ph.value,
           force_no_contract: false,
         }, onSuccess);
       },
@@ -3697,6 +3626,125 @@ async function submitAddTenant(aptId, payload, onSuccess = null) {
   }
 }
 
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {}
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  return ok;
+}
+
+function openInviteMessageModal(inviteText) {
+  const botHandle = "@TG_Utility_Meter_bot";
+  const botUrl = "https://t.me/TG_Utility_Meter_bot";
+  const escaped = esc(inviteText);
+  const clickableHtml = escaped.replace(
+    botHandle,
+    `<a href="${botUrl}" target="_blank" rel="noopener" class="tg-link" data-tg-link="${botUrl}">${botHandle}</a>`
+  );
+
+  openModal("📨 Приглашение новому владельцу", `
+    <p>Скопируйте текст ниже и перешлите в Телеграм тому, кого вы только что добавили как владельца в новую семью</p>
+    <div class="invite-copy-box" id="invite-copy-box">${clickableHtml}</div>
+  `, [
+    {
+      label: "📋 Скопировать текст",
+      onClick: async () => {
+        const ok = await copyTextToClipboard(inviteText);
+        if (ok) {
+          showToast("✅ Текст приглашения скопирован");
+        } else {
+          showToast("Выделите и скопируйте текст вручную", "info");
+        }
+        return false;
+      },
+    },
+    { label: "Закрыть", cls: "btn-secondary" },
+  ]);
+}
+
+function openInviteFamilyModal(onSuccess = null) {
+  openModal("➕ Новая семья", `
+    <div class="field">
+      <label>Название новой семьи</label>
+      <input type="text" id="inv-fam-name" maxlength="120" placeholder="Например: Семья Ивановых" />
+    </div>
+    <div class="field">
+      <label>Telegram ID нового владельца</label>
+      <input type="number" id="inv-owner-id" placeholder="Например: 123456789" />
+      <div class="small muted">Telegram ID можно взять в боте <a href="https://t.me/userinfobot" target="_blank" rel="noopener" class="tg-link" data-tg-link="https://t.me/userinfobot">@userinfobot</a></div>
+    </div>
+    <div class="field">
+      <label>Имя нового владельца</label>
+      <input type="text" id="inv-owner-name" maxlength="120" placeholder="Введите имя" />
+    </div>
+    <p class="small muted">Новая семья полностью изолирована: после создания у вас не будет доступа к ней и её владельцам.</p>
+  `, [
+    {
+      id: "modal-invite-family",
+      label: "Создать",
+      disabled: true,
+      onClick: async () => {
+        const familyName = (document.getElementById("inv-fam-name")?.value || "").trim();
+        const tgId = Number(document.getElementById("inv-owner-id")?.value);
+        const ownerName = (document.getElementById("inv-owner-name")?.value || "").trim();
+        if (!familyName) { showToast("Введите название новой семьи", "error"); return false; }
+        if (!Number.isSafeInteger(tgId) || tgId <= 0) { showToast("Введите корректный Telegram ID", "error"); return false; }
+        if (!ownerName) { showToast("Введите имя нового владельца", "error"); return false; }
+        try {
+          const res = await api("/api/families/invite", {
+            method: "POST",
+            body: {
+              family_name: familyName,
+              owner_telegram_id: tgId,
+              owner_name: ownerName,
+            },
+          });
+          showToast("✅ Новая семья и владелец созданы");
+          if (onSuccess) await onSuccess();
+          setTimeout(() => {
+            openInviteMessageModal(res.invite_text);
+          }, 0);
+          return true;
+        } catch (err) {
+          showToast("❌ " + err.message, "error");
+          return false;
+        }
+      },
+    },
+    { label: "Отмена", cls: "btn-secondary" },
+  ]);
+
+  const submitBtn = document.getElementById("modal-invite-family");
+  const updateReady = () => {
+    if (!submitBtn) return;
+    const famName = (document.getElementById("inv-fam-name")?.value || "").trim();
+    const tgId = Number(document.getElementById("inv-owner-id")?.value);
+    const ownName = (document.getElementById("inv-owner-name")?.value || "").trim();
+    submitBtn.disabled = !(famName.length > 0 && Number.isSafeInteger(tgId) && tgId > 0 && ownName.length > 0);
+  };
+  document.getElementById("inv-fam-name")?.addEventListener("input", updateReady);
+  document.getElementById("inv-owner-id")?.addEventListener("input", updateReady);
+  document.getElementById("inv-owner-name")?.addEventListener("input", updateReady);
+}
+
 // ── People (Люди — семьи + наниматели, MEDIUM-12 race-protected) ──────
 async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   const data = await api("/api/families");
@@ -3721,11 +3769,11 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
               <div class="table-row">
                 <div>
                   <div class="bold">${esc(t.name || "—")}</div>
-                  <div class="small muted">ID: ${t.telegram_id}${t.phone ? " · " + esc(t.phone) : ""}</div>
+                  <div class="small muted">ID: ${t.telegram_id}</div>
                   <div class="small muted">🏠 ${aptsInfo}</div>
                 </div>
                 <div class="row-nowrap">
-                  <button class="btn btn-secondary btn-sm edit-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || "")}" data-tphone="${esc(t.phone || "")}" title="Редактировать">✏️</button>
+                  <button class="btn btn-secondary btn-sm edit-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || "")}" title="Редактировать">✏️</button>
                   <button class="btn btn-secondary btn-sm btn-del-icon del-tenant-people-btn" data-tid="${t.telegram_id}" data-tname="${esc(t.name || t.telegram_id)}" data-first-apt="${firstAptId}" title="Удалить"><span class="del-x">❌</span></button>
                 </div>
               </div>`;
@@ -3739,7 +3787,7 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
     : "";
 
   root.innerHTML = `
-    <div class="card"><div class="row-between"><h2>👨‍👩‍👧‍👦 Люди</h2>${data.can_create ? `<button class="btn btn-sm" id="btn-new-fam">➕ Создать семью</button>` : ""}</div></div>
+    <div class="card"><div class="row-between"><h2>👨‍👩‍👧‍👦 Люди</h2><div class="row-nowrap">${data.can_create ? `<button class="btn btn-sm" id="btn-new-fam">➕ Создать семью</button><button class="btn btn-secondary btn-sm" id="btn-invite-family" title="Создать новую семью и пригласить владельца">🤝 Пригласить</button>` : (data.can_invite_family ? `<button class="btn btn-sm" id="btn-invite-family">➕ Создать семью</button>` : "")}</div></div></div>
     ${data.families.map(f => `
       <div class="card">
         <div class="row-between"><h3>${esc(f.name)}</h3><span class="pill">🌆 ${f.apartments_count}</span></div>
@@ -3748,11 +3796,11 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             <div class="table-row">
               <div>
                 <div class="bold">${esc(o.name || "—")}${o.is_admin ? ' <span class="pill">Админ</span>' : ""}</div>
-                <div class="small muted">ID: ${o.telegram_id}${o.phone ? " · " + esc(o.phone) : ""}</div>
+                <div class="small muted">ID: ${o.telegram_id}</div>
               </div>
               <div class="row-nowrap">
                 ${(!o.is_admin || state.user.role === "admin") ? `
-                  <button class="btn btn-secondary btn-sm edit-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || "")}" data-ophone="${esc(o.phone || "")}" title="Редактировать">✏️</button>
+                  <button class="btn btn-secondary btn-sm edit-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || "")}" title="Редактировать">✏️</button>
                   <button class="btn btn-secondary btn-sm btn-del-icon del-owner-btn" data-fid="${f.id}" data-oid="${o.telegram_id}" data-oname="${esc(o.name || o.telegram_id)}" title="Удалить"><span class="del-x">❌</span></button>
                 ` : ""}
               </div>
@@ -3790,6 +3838,13 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
     nfInput?.addEventListener("input", () => {
       if (createFamBtn) createFamBtn.disabled = !nfInput.value.trim();
     });
+  });
+
+  document.getElementById("btn-invite-family")?.addEventListener("click", () => {
+    haptic("light");
+    openInviteFamilyModal(
+      data.can_create ? () => renderFamilies(root, state.tabRenderSeq) : null
+    );
   });
 
   root.querySelectorAll(".ren-fam-btn").forEach(btn => {
@@ -3830,7 +3885,6 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           <div class="small muted">Telegram ID можно взять в боте <a href="https://t.me/userinfobot" target="_blank" rel="noopener" class="tg-link" data-tg-link="https://t.me/userinfobot">@userinfobot</a></div>
         </div>
         <div class="field"><label>Имя</label><input type="text" id="no-name" placeholder="Введите имя" /></div>
-        <div class="field"><label>Телефон (необязательно)</label><input type="tel" inputmode="tel" id="no-phone" class="phone-mask" placeholder="+7-___-___-____" /></div>
       `, [
         {
           id: "modal-add-owner",
@@ -3841,12 +3895,10 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
             const name = document.getElementById("no-name").value.trim();
             if (!Number.isSafeInteger(tgId) || tgId <= 0) { showToast("Введите корректный Telegram ID", "error"); return false; }
             if (!name) { showToast("Введите имя владельца", "error"); return false; }
-            const ph = readMaskedPhone("no-phone");
-            if (!ph.ok) { showToast(ph.error, "error"); return false; }
             try {
               await api(`/api/families/${btn.dataset.fid}/owners`, {
                 method: "POST",
-                body: { telegram_id: tgId, name, phone: ph.value },
+                body: { telegram_id: tgId, name },
               });
               showToast("✅ Владелец добавлен");
               await renderFamilies(root, state.tabRenderSeq);
@@ -3870,15 +3922,10 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
   root.querySelectorAll(".edit-owner-btn").forEach(btn => {
     btn.onclick = () => {
       const initialOwnerName = String(btn.dataset.oname || "").trim();
-      const initialOwnerPhone = formatRuPhone(btn.dataset.ophone || "");
       openModal("✏️ Редактировать члена семьи", `
         <div class="field">
           <label>Имя</label>
           <input type="text" id="eo-name" maxlength="120" value="${esc(btn.dataset.oname)}" placeholder="Введите имя" />
-        </div>
-        <div class="field">
-          <label>Телефон (необязательно)</label>
-          <input type="tel" inputmode="tel" id="eo-phone" class="phone-mask" value="${esc(btn.dataset.ophone)}" placeholder="+7-___-___-____" />
         </div>
       `, [
         {
@@ -3888,12 +3935,10 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           onClick: async () => {
             const name = document.getElementById("eo-name").value.trim();
             if (!name) { showToast("Имя не может быть пустым", "error"); return false; }
-            const ph = readMaskedPhone("eo-phone");
-            if (!ph.ok) { showToast(ph.error, "error"); return false; }
             try {
               await api(`/api/families/${btn.dataset.fid}/owners/${btn.dataset.oid}`, {
                 method: "PUT",
-                body: { name, phone: ph.value },
+                body: { name },
               });
               if (state.user && Number(btn.dataset.oid) === state.user.telegram_id) {
                 state.user.name = name;
@@ -3907,16 +3952,12 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
         { label: "Отмена", cls: "btn-secondary" },
       ]);
       const nameEl = document.getElementById("eo-name");
-      const phoneEl = document.getElementById("eo-phone");
       const saveBtn = document.getElementById("modal-save-owner");
       const updateOwnerDirty = () => {
         const curName = (nameEl?.value || "").trim();
-        const curPhone = formatRuPhone(phoneEl?.value || "");
-        const changed = curName !== initialOwnerName || curPhone !== initialOwnerPhone;
-        if (saveBtn) saveBtn.disabled = !curName || !changed;
+        if (saveBtn) saveBtn.disabled = !curName || curName === initialOwnerName;
       };
       nameEl?.addEventListener("input", updateOwnerDirty);
-      phoneEl?.addEventListener("input", updateOwnerDirty);
     };
   });
 
@@ -3965,15 +4006,10 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
     btn.onclick = () => {
       const tid = Number(btn.dataset.tid);
       const initName = String(btn.dataset.tname || "").trim();
-      const initPhone = formatRuPhone(btn.dataset.tphone || "");
       openModal("✏️ Редактировать нанимателя", `
         <div class="field">
           <label>Имя</label>
           <input type="text" id="et-name" maxlength="120" value="${esc(btn.dataset.tname)}" placeholder="Введите имя" />
-        </div>
-        <div class="field">
-          <label>Телефон (необязательно)</label>
-          <input type="tel" inputmode="tel" id="et-phone" class="phone-mask" value="${esc(btn.dataset.tphone)}" placeholder="+7-___-___-____" />
         </div>
       `, [
         {
@@ -3983,10 +4019,8 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
           onClick: async () => {
             const name = document.getElementById("et-name").value.trim();
             if (!name) { showToast("Имя не может быть пустым", "error"); return false; }
-            const ph = readMaskedPhone("et-phone");
-            if (!ph.ok) { showToast(ph.error, "error"); return false; }
             try {
-              await api(`/api/tenants/${tid}`, { method: "PUT", body: { name, phone: ph.value } });
+              await api(`/api/tenants/${tid}`, { method: "PUT", body: { name } });
               showToast("✅ Данные нанимателя обновлены");
               if (state.selectedAptId) await loadApartmentDetail(state.selectedAptId);
               await renderFamilies(root, state.tabRenderSeq);
@@ -3996,15 +4030,12 @@ async function renderFamilies(root, renderSeq = state.tabRenderSeq) {
         { label: "Отмена", cls: "btn-secondary" },
       ]);
       const nameEl = document.getElementById("et-name");
-      const phoneEl = document.getElementById("et-phone");
       const saveBtn = document.getElementById("modal-save-tenant");
       const updateDirty = () => {
         const cn = (nameEl?.value || "").trim();
-        const cp = formatRuPhone(phoneEl?.value || "");
-        if (saveBtn) saveBtn.disabled = !cn || (cn === initName && cp === initPhone);
+        if (saveBtn) saveBtn.disabled = !cn || cn === initName;
       };
       nameEl?.addEventListener("input", updateDirty);
-      phoneEl?.addEventListener("input", updateDirty);
     };
   });
 
@@ -4137,8 +4168,23 @@ const APP_GUIDE_TOPICS = [
         <ul>
           <li><b>Изоляция семей:</b> каждая семья видит и управляет только своими объектами недвижимости.</li>
           <li><b>Адресные уведомления:</b> сообщения о показаниях, фото, договорах и поверке приходят только владельцам внутри семьи.</li>
-          <li><b>Наниматели:</b> редактирование имени и телефона, просмотр привязанных объектов и сроков договоров, добавление новых нанимателей.</li>
+          <li><b>Наниматели:</b> редактирование имени, просмотр привязанных объектов и сроков договоров, добавление новых нанимателей.</li>
           <li><b>Личные имена:</b> каждый владелец может изменить своё имя (через ✏️ в шапке или в «Люди») и название своей семьи, а наниматель — своё имя. При этом владелец всегда видит то имя нанимателя, которое задал сам.</li>
+        </ul>
+      </div>`,
+  },
+  {
+    id: "new_family",
+    title: "➕ Создание новой семьи и владельца",
+    html: `
+      <div class="guide-text">
+        <p>Каждый владелец может создать новую семью и пригласить в неё нового владельца:</p>
+        <ul>
+          <li>Откройте раздел <b>«👨‍👩‍👧‍👦 Люди»</b> и нажмите <b>«➕ Создать семью»</b>.</li>
+          <li>Введите название новой семьи, имя нового владельца и его Telegram ID (узнать ID можно в боте @userinfobot).</li>
+          <li>Если указанный Telegram ID уже есть в базе, бот сообщит, что такой пользователь уже зарегистрирован.</li>
+          <li>После создания появится готовое приглашение — скопируйте текст и перешлите его новому владельцу в Telegram.</li>
+          <li><b>Приватность:</b> созданная семья полностью изолирована — пользователь, который её создал, не имеет доступа к новой семье, её объектам и владельцам.</li>
         </ul>
       </div>`,
   },
@@ -4265,7 +4311,7 @@ async function renderAdmin(root, renderSeq = state.tabRenderSeq) {
       <h3>👥 Пользователи (${usersRes.users.length})</h3>
       ${usersRes.users.map(u => `
         <div class="table-row">
-          <div><div class="bold">${esc(u.name || "—")} ${u.is_blocked ? "🚫" : ""}</div><div class="small muted">ID: ${u.telegram_id}${u.phone ? " · " + esc(u.phone) : ""}</div></div>
+          <div><div class="bold">${esc(u.name || "—")} ${u.is_blocked ? "🚫" : ""}</div><div class="small muted">ID: ${u.telegram_id}</div></div>
           <span class="pill">${esc(ROLE_RU[u.role] || u.role)}</span>
         </div>`).join("")}
     </div>

@@ -140,28 +140,30 @@ class ContractBody(BaseModel):
 class TenantCreateBody(BaseModel):
     telegram_id: StrictTelegramId
     name: str
-    phone: str | None = None
     force_no_contract: bool = False
 
 
 class TenantUpdateBody(BaseModel):
     name: str
-    phone: str | None = None
 
 
 class FamilyBody(BaseModel):
     name: str
 
 
+class FamilyInviteBody(BaseModel):
+    family_name: str
+    owner_telegram_id: StrictTelegramId
+    owner_name: str
+
+
 class FamilyOwnerBody(BaseModel):
     telegram_id: StrictTelegramId
     name: str
-    phone: str | None = None
 
 
 class FamilyOwnerUpdateBody(BaseModel):
     name: str
-    phone: str | None = None
 
 
 class ExportBody(BaseModel):

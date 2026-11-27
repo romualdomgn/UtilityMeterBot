@@ -35,11 +35,14 @@ from webapp.schemas import (
     ApartmentSettingsBody,
     ContractBody,
     FamilyBody,
+    FamilyInviteBody,
     FamilyOwnerBody,
+    FamilyOwnerUpdateBody,
     MeterDeviceItemBody,
     MeterDevicesUpdateBody,
     MeterReplacementBody,
     MeterReplacementTariffEntry,
+    ProfileUpdateBody,
     TenantCreateBody,
     TenantUpdateBody,
     WaterReadingBody,
@@ -497,10 +500,10 @@ async def test_people_section_tenants_edit_and_overdue_indicator(temp_db, monkey
     assert people["tenants"][0]["telegram_id"] == 301
 
     upd = await ten_router.api_update_tenant(
-        301, TenantUpdateBody(name="Иван Петров", phone="+7-999-000-1122"), user=landlord
+        301, TenantUpdateBody(name="Иван Петров"), user=landlord
     )
     assert upd["name"] == "Иван Петров"
-    assert upd["phone"] == "+7-999-000-1122"
+    assert "phone" not in upd
 
 
 @pytest.mark.asyncio
@@ -1008,6 +1011,98 @@ async def test_scoped_names_for_admin_landlord_and_tenant(temp_db, tmp_path, mon
     assert u1_row == ("Старый владелец", "Старый владелец", None)
     assert u2_row == ("Старый жилец", "Старый жилец", "Старый жилец")
 
+
+@pytest.mark.asyncio
+async def test_landlord_creates_isolated_family_with_owner_and_notifies_admin(temp_db):
+    await crud.sync_admin_user(100)
+    fam1 = await crud.create_family("Семья 1")
+    await crud.get_or_create_user(201, name="Владелец 1", role="landlord", family_id=fam1.id)
+    landlord1 = WebAppUser(telegram_id=201, role="landlord", family_id=fam1.id, name="Владелец 1")
+
+    bot = DummyBot()
+    req = make_request(bot)
+
+    # 1. Landlord 1 creates a new family + 1 new owner
+    res = await fam_router.api_invite_family(
+        FamilyInviteBody(
+            family_name="Семья Друзей",
+            owner_telegram_id=250,
+            owner_name="Дмитрий",
+        ),
+        req,
+        user=landlord1,
+    )
+    assert res["ok"] is True
+    assert res["family_name"] == "Семья Друзей"
+    assert res["owner_name"] == "Дмитрий"
+    assert res["invite_text"] == (
+        "Привет Дмитрий, приглашаю присоединиться к боту для управления недвижимостью "
+        "(передавать показания счётчиков, следить за сроками поверки, отслеживать договоры найма, "
+        "нанимателей и даты платежей, а так же многое другое). "
+        "Ссылка на Телеграм бот - @TG_Utility_Meter_bot"
+    )
+
+    # 2. Admin receives notification with creator, new family name, new owner name and TG ID
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["chat_id"] == 100
+    adm_msg = bot.sent[0]["text"]
+    assert "Владелец 1" in adm_msg
+    assert "201" in adm_msg
+    assert "Семья Друзей" in adm_msg
+    assert "Дмитрий" in adm_msg
+    assert "250" in adm_msg
+
+    # 3. Duplicate Telegram ID (existing owner, creator, or admin) returns 409 with exact message
+    for dup_id in (250, 201, 100):
+        with pytest.raises(HTTPException) as exc_dup:
+            await fam_router.api_invite_family(
+                FamilyInviteBody(
+                    family_name="Дубль",
+                    owner_telegram_id=dup_id,
+                    owner_name="Кто-то",
+                ),
+                req,
+                user=landlord1,
+            )
+        assert exc_dup.value.status_code == 409
+        assert "Такой пользователь уже зарегистрирован" in exc_dup.value.detail
+
+    # 4. Strict isolation: creator (landlord1) has NO access to the new family or its owner
+    new_owner_db = await crud.get_user_by_telegram_id(250)
+    assert new_owner_db is not None and new_owner_db.role == "landlord"
+    new_fam_id = new_owner_db.family_id
+    assert new_fam_id is not None and new_fam_id != fam1.id
+
+    ll1_fams = await fam_router.api_families(user=landlord1)
+    assert [f["id"] for f in ll1_fams["families"]] == [fam1.id]
+    assert ll1_fams["can_invite_family"] is True
+
+    ll1_users = await admin_router.api_admin_users(user=landlord1)
+    assert 250 not in {u["telegram_id"] for u in ll1_users["users"]}
+
+    assert await access.user_can_manage_family(201, new_fam_id) is False
+    with pytest.raises(HTTPException) as exc_forb:
+        await fam_router.api_rename_family(new_fam_id, FamilyBody(name="Хак"), user=landlord1)
+    assert exc_forb.value.status_code == 403
+
+    # 5. New owner CAN access and manage their own new family
+    new_owner_user = WebAppUser(telegram_id=250, role="landlord", family_id=new_fam_id, name="Дмитрий")
+    new_owner_fams = await fam_router.api_families(user=new_owner_user)
+    assert len(new_owner_fams["families"]) == 1
+    assert new_owner_fams["families"][0]["name"] == "Семья Друзей"
+    assert [o["telegram_id"] for o in new_owner_fams["families"][0]["owners"]] == [250]
+
+    # 6. Tenant cannot create a family
+    u_t, _ = await crud.get_or_create_user(390, name="Жилец", role="tenant", family_id=fam1.id)
+    tenant_user = WebAppUser(telegram_id=390, role="tenant", family_id=fam1.id, name="Жилец")
+    with pytest.raises(HTTPException) as exc_t:
+        await fam_router.api_invite_family(
+            FamilyInviteBody(family_name="Т", owner_telegram_id=299, owner_name="Х"),
+            req,
+            user=tenant_user,
+        )
+    assert exc_t.value.status_code == 403
+
 def test_ui_strings_and_removed_photo_storage_notice():
     import re as _re
 
@@ -1109,3 +1204,16 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert "выберите заменяемый счётчик, введите конечное показание старого и начальное показание нового счётчика." in app_js
     assert "¡ Важно !" in app_js
     assert "не передаются в управляющую компанию или в компанию-поставщик энергетических ресурсов!" in app_js
+    # New family + owner invite modal, copy box, clickable bot link, and guide without admin mention
+    assert 'id="btn-invite-family"' in app_js
+    assert 'id: "modal-invite-family"' in app_js
+    assert "Скопируйте текст ниже и перешлите в Телеграм тому, кого вы только что добавили как владельца в новую семью" in app_js
+    assert "@TG_Utility_Meter_bot" in app_js
+    assert "https://t.me/TG_Utility_Meter_bot" in app_js
+    assert "➕ Создание новой семьи и владельца" in app_js
+    guide_slice = app_js[app_js.index("const APP_GUIDE_TOPICS = ["):app_js.index("function buildAboutAppHtml()")]
+    assert "админ" not in guide_slice.lower()
+    # Phone number inputs/masks removed everywhere from UI and schemas
+    assert "phone" not in app_js.lower()
+    assert "телефон" not in app_js.lower()
+    assert "phone" not in schemas_py.lower()

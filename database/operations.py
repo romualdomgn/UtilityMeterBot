@@ -705,6 +705,53 @@ async def create_family_atomic(name: str, actor_tg_id: int) -> Family:
         return fam
 
 
+async def create_family_with_owner_atomic(
+    family_name: str,
+    owner_telegram_id: int,
+    owner_name: str,
+    actor_tg_id: int,
+) -> tuple[Family, User]:
+    """Create a new isolated family with one initial landlord owner; reject already-registered Telegram IDs."""
+    if config.ADMIN_TELEGRAM_ID and owner_telegram_id == config.ADMIN_TELEGRAM_ID:
+        raise ConflictError("Такой пользователь уже зарегистрирован")
+
+    async with UnitOfWork(write=True) as s:
+        res_ex = await s.execute(select(User).where(User.telegram_id == owner_telegram_id))
+        if res_ex.scalar_one_or_none() is not None:
+            raise ConflictError("Такой пользователь уже зарегистрирован")
+
+        fam = Family(name=family_name, admin_name=family_name)
+        s.add(fam)
+        await s.flush()
+
+        new_owner = User(
+            telegram_id=owner_telegram_id,
+            name=owner_name,
+            admin_name=owner_name,
+            role="landlord",
+            family_id=fam.id,
+        )
+        s.add(new_owner)
+        try:
+            await s.flush()
+        except IntegrityError as exc:
+            raise ConflictError("Такой пользователь уже зарегистрирован") from exc
+
+        s.add(FamilyOwner(family_id=fam.id, user_id=new_owner.id))
+        s.add(AuditLog(
+            user_telegram_id=actor_tg_id,
+            action="create_family_with_owner",
+            details=(
+                f"Создана семья '{family_name}' (id={fam.id}), "
+                f"новый владелец {owner_name} (ID: {owner_telegram_id})"
+            ),
+        ))
+        await s.flush()
+        await s.refresh(fam)
+        await s.refresh(new_owner)
+        return fam, new_owner
+
+
 async def rename_family_atomic(
     family_id: int,
     new_name: str,
