@@ -90,9 +90,10 @@ async def main() -> None:
     dp.include_router(bot_router)
 
     await setup_bot_ui(bot)
+    # P2-03: run catch-up before starting cron to prevent concurrent overlap at scheduled hour
+    await run_missed_jobs_on_startup(bot)
     scheduler = setup_scheduler(bot)
     scheduler.start()
-    await run_missed_jobs_on_startup(bot)
 
     bg_tasks = BackgroundTaskManager()
     web_app = create_web_app(bot, bg_tasks=bg_tasks)
@@ -120,12 +121,12 @@ async def main() -> None:
                 raise exc
     finally:
         server.should_exit = True
+        scheduler.shutdown(wait=False)
         for task in (polling_task, server_task):
             if not task.done():
                 task.cancel()
         await asyncio.gather(polling_task, server_task, return_exceptions=True)
         await bg_tasks.wait_all(timeout=10.0)
-        scheduler.shutdown(wait=False)
         await bot.session.close()
 
 

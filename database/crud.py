@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Iterable
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import and_, desc, extract, func, or_, select
+from sqlalchemy import and_, delete, desc, extract, func, or_, select
 
 import config
 from database.models import (
@@ -17,6 +17,7 @@ from database.models import (
     Apartment,
     ApartmentUser,
     AuditLog,
+    DbMeta,
     Family,
     FamilyOwner,
     InitialReading,
@@ -98,6 +99,20 @@ class UnitOfWork:
                 self._lock = None
 
 
+BUSINESS_REVISION_KEY = "business_revision"
+
+
+async def bump_business_revision_in_session(s) -> int:
+    """Increment durable business revision inside an active write transaction (P1-09/P2-20)."""
+    meta = await s.get(DbMeta, BUSINESS_REVISION_KEY)
+    if meta is None:
+        meta = DbMeta(key=BUSINESS_REVISION_KEY, value=1)
+        s.add(meta)
+        return 1
+    meta.value = int(meta.value) + 1
+    return int(meta.value)
+
+
 async def get_all_families() -> list[Family]:
     async with UnitOfWork() as s:
         res = await s.execute(select(Family).order_by(Family.id))
@@ -113,6 +128,7 @@ async def create_family(name: str) -> Family:
     async with UnitOfWork(write=True) as s:
         fam = Family(name=name, admin_name=name)
         s.add(fam)
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(fam)
         return fam
@@ -124,19 +140,25 @@ async def rename_family(family_id: int, new_name: str) -> bool:
         if not fam:
             return False
         fam.name = new_name
+        await bump_business_revision_in_session(s)
         return True
 
 
 async def get_family_owners(family_id: int) -> list[User]:
-    """Return family landlords plus any explicit FamilyOwner members (including admin)."""
+    """Return active family landlords plus valid explicit FamilyOwner members (excludes revoked admins)."""
     async with UnitOfWork() as s:
         subq = select(FamilyOwner.user_id).where(FamilyOwner.family_id == family_id)
+        explicit_conds = [User.role == "landlord"]
+        if config.ADMIN_TELEGRAM_ID:
+            explicit_conds.append(
+                and_(User.role == "admin", User.telegram_id == config.ADMIN_TELEGRAM_ID)
+            )
         res = await s.execute(
             select(User)
             .where(
                 or_(
                     and_(User.family_id == family_id, User.role == "landlord"),
-                    User.id.in_(subq),
+                    and_(User.id.in_(subq), or_(*explicit_conds)),
                 )
             )
             .order_by(User.id)
@@ -214,6 +236,7 @@ async def get_or_create_user(
             family_id=family_id,
         )
         s.add(user)
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(user)
         return user, True
@@ -269,21 +292,32 @@ async def update_family_owner(
 
 
 async def sync_admin_user(admin_tg_id: int) -> None:
-    """Revoke old admin roles in DB; set only current ADMIN_TELEGRAM_ID."""
+    """Revoke old admin roles and detach stale owner/apartment links; set only current ADMIN_TELEGRAM_ID."""
     if not admin_tg_id:
         return
     async with UnitOfWork(write=True) as s:
+        changed = False
         res = await s.execute(select(User).where(User.role == "admin", User.telegram_id != admin_tg_id))
         for old in res.scalars().all():
             old.role = "revoked"
+            old.family_id = None
+            await s.execute(delete(FamilyOwner).where(FamilyOwner.user_id == old.id))
+            await s.execute(delete(ApartmentUser).where(ApartmentUser.user_id == old.id))
+            changed = True
 
         res_cur = await s.execute(select(User).where(User.telegram_id == admin_tg_id))
         cur = res_cur.scalar_one_or_none()
         if cur:
-            cur.role = "admin"
-            cur.is_blocked = False
+            if cur.role != "admin" or cur.is_blocked:
+                cur.role = "admin"
+                cur.is_blocked = False
+                changed = True
         else:
-            s.add(User(telegram_id=admin_tg_id, name="Администратор", role="admin"))
+            s.add(User(telegram_id=admin_tg_id, name="Администратор", admin_name="Администратор", role="admin"))
+            changed = True
+
+        if changed:
+            await bump_business_revision_in_session(s)
 
 
 async def get_apartment(apartment_id: int) -> Apartment | None:
@@ -327,6 +361,7 @@ async def create_apartment(
             sort_order=next_order,
         )
         s.add(apt)
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(apt)
         return apt
@@ -340,6 +375,7 @@ async def update_apartment(apartment_id: int, **kwargs) -> Apartment | None:
         for k, v in kwargs.items():
             if k in ALLOWED_APARTMENT_FIELDS:
                 setattr(apt, k, v)
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(apt)
         return apt
@@ -369,6 +405,7 @@ async def link_user_to_apartment(apartment_id: int, user_id: int, role: str = "t
             existing.role = role
         else:
             s.add(ApartmentUser(apartment_id=apartment_id, user_id=user_id, role=role))
+        await bump_business_revision_in_session(s)
 
 
 async def get_apartments_for_user(telegram_id: int) -> list[Apartment]:
@@ -451,6 +488,7 @@ async def set_tariff(
             changed_by=changed_by,
         )
         s.add(tariff)
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(tariff)
         return tariff
@@ -560,6 +598,7 @@ async def update_reading(reading_id: int, new_value: int) -> MeterReading | None
         if not rec:
             return None
         rec.value = new_value
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(rec)
         return rec
@@ -748,10 +787,12 @@ async def add_audit_log(
     user_telegram_id: int,
     action: str,
     details: str | None = None,
+    family_id: int | None = None,
 ) -> AuditLog:
     async with UnitOfWork(write=True) as s:
         log = AuditLog(
             user_telegram_id=user_telegram_id,
+            family_id=family_id,
             action=action,
             details=details,
         )
@@ -770,12 +811,11 @@ async def get_audit_logs(limit: int = 50) -> list[AuditLog]:
 
 
 async def get_family_audit_logs(family_id: int, limit: int = 50) -> list[AuditLog]:
-    """Return audit log entries performed strictly by users whose primary family_id matches."""
+    """Return audit log entries strictly scoped by immutable AuditLog.family_id (P1-01)."""
     async with UnitOfWork() as s:
-        tg_subq = select(User.telegram_id).where(User.family_id == family_id)
         res = await s.execute(
             select(AuditLog)
-            .where(AuditLog.user_telegram_id.in_(tg_subq))
+            .where(AuditLog.family_id == family_id)
             .order_by(desc(AuditLog.created_at), desc(AuditLog.id))
             .limit(limit)
         )

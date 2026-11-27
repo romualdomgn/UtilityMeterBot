@@ -7,19 +7,27 @@ import datetime
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 
+from sqlalchemy import and_, desc, select
+
 from config import local_today
 from database import crud
 from database.models import (
     ALL_METERS,
+    ALL_TARIFF_TYPES,
+    Apartment,
     ELECTRICITY_METERS,
     GAS_METERS,
     IRRIGATION_METERS,
     IRRIGATION_MODE_AFTER_COLD,
     IRRIGATION_MODE_PARALLEL,
+    InitialReading,
     METER_LABELS,
     METER_UNITS,
+    MeterReading,
+    MeterReplacement,
     SEWERAGE_TARIFF,
     TARIFF_LABELS,
+    Tariff,
     WATER_METERS,
     get_apartment_enabled_meters,
     get_apartment_irrigation_mode,
@@ -87,6 +95,7 @@ class BillingResult:
     meters: dict[str, MeterResult] = field(default_factory=dict)
     sewerage: MeterResult | None = None
     irrigation_mode: str = IRRIGATION_MODE_PARALLEL
+    irrigation_exceeds_cold: bool = False
 
     @property
     def water_consumption_total(self) -> int:
@@ -149,6 +158,8 @@ class BillingResult:
             reasons.append("не задано начальное показание")
         if any(m.submitted and m.has_base and not m.has_tariff for m in self.meters.values()):
             reasons.append("не задан тариф")
+        if self.irrigation_exceeds_cold:
+            reasons.append("полив превышает расход ХВС")
         return reasons
 
     @property
@@ -206,6 +217,8 @@ def sanitize_billing_for_tenant(billing_dict: dict) -> dict:
         reasons.append("не все показания поданы")
     if has_missing_base:
         reasons.append("не задано начальное показание")
+    if "полив превышает расход ХВС" in (billing_dict.get("incomplete_reasons") or []):
+        reasons.append("полив превышает расход ХВС")
 
     return {
         "apartment_id": billing_dict["apartment_id"],
@@ -229,23 +242,112 @@ async def get_prev_value(apartment_id: int, meter_type: str) -> int | None:
     return initial.value if initial else None
 
 
+async def _read_billing_snapshot_in_session(
+    s,
+    apartment_id: int,
+    target_year: int,
+    target_month: int,
+    tariff_date: datetime.date,
+    include_month_rows: bool,
+):
+    """P2-10: load apartment, tariffs, initials, readings, and replacements from one consistent read transaction."""
+    first_day = datetime.date(target_year, target_month, 1)
+    next_month = (
+        datetime.date(target_year + 1, 1, 1)
+        if target_month == 12
+        else datetime.date(target_year, target_month + 1, 1)
+    )
+
+    apt = await s.get(Apartment, apartment_id)
+
+    tariffs: dict[str, Tariff | None] = {mt: None for mt in ALL_TARIFF_TYPES}
+    res_t = await s.execute(
+        select(Tariff)
+        .where(Tariff.apartment_id == apartment_id, Tariff.effective_from <= tariff_date)
+        .order_by(desc(Tariff.effective_from), desc(Tariff.id))
+    )
+    for row in res_t.scalars().all():
+        if row.tariff_type in tariffs and tariffs[row.tariff_type] is None:
+            tariffs[row.tariff_type] = row
+
+    initials: dict[str, int | None] = {mt: None for mt in ALL_METERS}
+    res_i = await s.execute(select(InitialReading).where(InitialReading.apartment_id == apartment_id))
+    for r in res_i.scalars().all():
+        if r.meter_type in initials:
+            initials[r.meter_type] = r.value
+
+    month_readings: list[MeterReading] = []
+    month_replacements: list[MeterReplacement] = []
+    latest_before: dict[str, MeterReading] = {}
+    latest_any: dict[str, MeterReading] = {}
+
+    if include_month_rows:
+        res_mr = await s.execute(
+            select(MeterReading)
+            .where(
+                and_(
+                    MeterReading.apartment_id == apartment_id,
+                    MeterReading.reading_date >= first_day,
+                    MeterReading.reading_date < next_month,
+                )
+            )
+            .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
+        )
+        month_readings = list(res_mr.scalars().all())
+
+        res_rep = await s.execute(
+            select(MeterReplacement)
+            .where(
+                MeterReplacement.apartment_id == apartment_id,
+                MeterReplacement.replacement_date >= first_day,
+                MeterReplacement.replacement_date < next_month,
+            )
+            .order_by(MeterReplacement.replacement_date, MeterReplacement.id)
+        )
+        month_replacements = list(res_rep.scalars().all())
+
+        res_before = await s.execute(
+            select(MeterReading)
+            .where(
+                MeterReading.apartment_id == apartment_id,
+                MeterReading.reading_date < first_day,
+            )
+            .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
+        )
+        for r in res_before.scalars().all():
+            if r.meter_type not in latest_before:
+                latest_before[r.meter_type] = r
+    else:
+        res_all = await s.execute(
+            select(MeterReading)
+            .where(MeterReading.apartment_id == apartment_id)
+            .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
+        )
+        for r in res_all.scalars().all():
+            if r.meter_type not in latest_any:
+                latest_any[r.meter_type] = r
+
+    return apt, tariffs, initials, month_readings, month_replacements, latest_before, latest_any
+
+
 async def get_month_base_info(
     apartment_id: int,
     year: int | None = None,
     month: int | None = None,
 ) -> dict[str, dict]:
-    """HIGH-01: per-meter calendar month baseline and replacement offset for accurate live previews."""
+    """HIGH-01 & P2-10: per-meter calendar month baseline and replacement offset from a single read snapshot."""
     today = local_today()
     target_year = year or today.year
     target_month = month or today.month
-    first_day = datetime.date(target_year, target_month, 1)
 
-    apt = await crud.get_apartment(apartment_id)
+    async with crud.UnitOfWork() as s:
+        apt, _, initials, month_readings, month_replacements, latest_before, _ = (
+            await _read_billing_snapshot_in_session(
+                s, apartment_id, target_year, target_month, today, include_month_rows=True
+            )
+        )
+
     enabled = get_apartment_enabled_meters(apt)
-    initials = await crud.get_all_initial_readings(apartment_id)
-    month_readings = await crud.get_readings_by_month(apartment_id, target_year, target_month)
-    month_replacements = await crud.get_meter_replacements_by_month(apartment_id, target_year, target_month)
-
     reps_by_mt: dict[str, list] = {}
     for rep in month_replacements:
         reps_by_mt.setdefault(rep.meter_type, []).append(rep)
@@ -256,7 +358,7 @@ async def get_month_base_info(
 
     info: dict[str, dict] = {}
     for mt in enabled:
-        prev_rec = await crud.get_latest_reading_before(apartment_id, mt, first_day)
+        prev_rec = latest_before.get(mt)
         base_before = prev_rec.value if prev_rec else initials.get(mt)
         reps = reps_by_mt.get(mt, [])
         if reps:
@@ -290,31 +392,36 @@ async def calculate_billing(
     today = local_today()
     target_year = year or today.year
     target_month = month or today.month
-    first_day = datetime.date(target_year, target_month, 1)
     last_day = calendar.monthrange(target_year, target_month)[1]
     end_of_month = datetime.date(target_year, target_month, last_day)
 
     period_label = f"{MONTH_NAMES_RU.get(target_month, target_month)} {target_year}"
     tariff_date = today if current_readings is not None else end_of_month
 
-    apt = await crud.get_apartment(apartment_id)
+    async with crud.UnitOfWork() as s:
+        apt, tariffs, initials, month_readings, month_replacements, latest_before, latest_any = (
+            await _read_billing_snapshot_in_session(
+                s,
+                apartment_id,
+                target_year,
+                target_month,
+                tariff_date,
+                include_month_rows=(current_readings is None),
+            )
+        )
+
     enabled_set = set(get_apartment_enabled_meters(apt))
     irrigation_mode = get_apartment_irrigation_mode(apt)
 
-    tariffs = await crud.get_all_tariffs(apartment_id, as_of_date=tariff_date)
-    initials = await crud.get_all_initial_readings(apartment_id)
-
-    month_readings: list = []
     latest_in_month: dict[str, int] = {}
     readings_by_mt: dict[str, list] = {}
     reps_by_mt: dict[str, list] = {}
     if current_readings is None:
-        month_readings = await crud.get_readings_by_month(apartment_id, target_year, target_month)
         for r in month_readings:
             readings_by_mt.setdefault(r.meter_type, []).append(r)
             if not getattr(r, "is_replacement_init", False) and r.meter_type not in latest_in_month:
                 latest_in_month[r.meter_type] = r.value
-        for rep in await crud.get_meter_replacements_by_month(apartment_id, target_year, target_month):
+        for rep in month_replacements:
             reps_by_mt.setdefault(rep.meter_type, []).append(rep)
 
     res = BillingResult(
@@ -345,7 +452,8 @@ async def calculate_billing(
         replaced = False
 
         if current_readings is not None:
-            prev_val = await get_prev_value(apartment_id, mt)
+            latest_rec = latest_any.get(mt)
+            prev_val = latest_rec.value if latest_rec is not None else init_val
             curr_val: int | None = current_readings[mt]
             submitted = True
             has_base = prev_val is not None
@@ -354,7 +462,7 @@ async def calculate_billing(
             else:
                 consumption = 0
         else:
-            prev_rec = await crud.get_latest_reading_before(apartment_id, mt, first_day)
+            prev_rec = latest_before.get(mt)
             prev_val = prev_rec.value if prev_rec else init_val
             reps = reps_by_mt.get(mt, [])
             if reps:
@@ -423,6 +531,16 @@ async def calculate_billing(
             replaced=replaced,
         )
 
+    # P2-08: detect impossible irrigation > cold_water volume in after_cold mode & never deduct excess from ГВС
+    cold_m = res.meters.get("cold_water")
+    hot_m = res.meters.get("hot_water")
+    irr_m = res.meters.get("irrigation")
+    cold_ready = bool(cold_m and cold_m.submitted and cold_m.has_base)
+    irr_ready = bool(irr_m and irr_m.submitted and irr_m.has_base)
+    if irrigation_mode == IRRIGATION_MODE_AFTER_COLD and cold_ready and irr_ready:
+        if irr_m.consumption > cold_m.consumption:
+            res.irrigation_exceeds_cold = True
+
     water_in_res = [res.meters[m] for m in WATER_METERS if m in res.meters]
     sew_obj = tariffs.get(SEWERAGE_TARIFF)
     sew_rate = Decimal(sew_obj.rate) if sew_obj is not None else None
@@ -430,15 +548,12 @@ async def calculate_billing(
         sew_submitted = any(m.submitted for m in water_in_res)
         sew_has_base = any(m.submitted and m.has_base for m in water_in_res)
         if sew_has_base:
-            if (
-                irrigation_mode == IRRIGATION_MODE_AFTER_COLD
-                and "irrigation" in res.meters
-                and res.meters["irrigation"].submitted
-                and res.meters["irrigation"].has_base
-            ):
-                sew_consumption = max(0, res.water_consumption_total - res.irrigation_consumption_total)
+            cold_cons = cold_m.consumption if cold_ready else 0
+            hot_cons = hot_m.consumption if (hot_m and hot_m.submitted and hot_m.has_base) else 0
+            if irrigation_mode == IRRIGATION_MODE_AFTER_COLD and irr_ready:
+                sew_consumption = max(0, cold_cons - irr_m.consumption) + hot_cons
             else:
-                sew_consumption = res.water_consumption_total
+                sew_consumption = cold_cons + hot_cons
             sew_cost = _round_to_rubles(Decimal(sew_consumption) * sew_rate)
         else:
             sew_consumption = 0

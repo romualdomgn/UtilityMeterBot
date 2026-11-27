@@ -427,8 +427,7 @@ async def test_backup_skip_if_unchanged_and_60_day_retention(temp_db, tmp_path, 
     old_t = time.time() - 65 * 86400
     os.utime(old_b, (old_t, old_t))
 
-    future_t = time.time() + 5
-    os.utime(temp_db, (future_t, future_t))
+    await crud.create_family("Updated Family")
     p3 = await backup.create_backup(skip_if_unchanged=True)
     assert p3 is not None and p3.exists()
     assert not old_b.exists()
@@ -1217,3 +1216,370 @@ def test_ui_strings_and_removed_photo_storage_notice():
     assert "phone" not in app_js.lower()
     assert "телефон" not in app_js.lower()
     assert "phone" not in schemas_py.lower()
+
+
+@pytest.mark.asyncio
+async def test_p1_01_audit_and_family_backup_strict_family_scope_isolation(temp_db, tmp_path, monkeypatch):
+    import sqlite3 as _sqlite3
+
+    exp_dir = tmp_path / "exp_p1_01"
+    exp_dir.mkdir()
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite+aiosqlite:///{temp_db}")
+    monkeypatch.setattr(config, "EXPORT_DIR", exp_dir)
+
+    fam_a = await crud.create_family("Семья A")
+    fam_b = await crud.create_family("Семья B")
+    apt_a = await crud.create_apartment("101", fam_a.id, enabled_meters=["cold_water"])
+    apt_b = await crud.create_apartment("202", fam_b.id, enabled_meters=["cold_water"])
+
+    await crud.get_or_create_user(201, name="Владелец A", role="landlord", family_id=fam_a.id)
+    await crud.get_or_create_user(202, name="Владелец B", role="landlord", family_id=fam_b.id)
+    u_t, _ = await crud.get_or_create_user(555, name="Переезжающий", role="tenant", family_id=fam_a.id)
+    await crud.link_user_to_apartment(apt_a.id, u_t.id, role="tenant")
+
+    tenant_a = WebAppUser(telegram_id=555, role="tenant", family_id=fam_a.id, name="Переезжающий")
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    landlord_b = WebAppUser(telegram_id=202, role="landlord", family_id=fam_b.id, name="Владелец B")
+    req = make_request()
+
+    # Tenant submits reading in Family A
+    await read_router.api_submit_water(apt_a.id, WaterReadingBody(cold_water=777), req, user=tenant_a)
+    # Remove tenant from Family A and register the SAME Telegram ID in Family B
+    await ten_router.api_remove_tenant(apt_a.id, 555, req, user=admin)
+    await ten_router.api_add_tenant(
+        apt_b.id, TenantCreateBody(telegram_id=555, name="Переезжающий B", force_no_contract=True), req, user=landlord_b
+    )
+
+    # Family B audit log MUST NOT contain Family A's reading event
+    audit_b = await admin_router.api_admin_audit(user=landlord_b)
+    assert not any("777" in (l["details"] or "") or "101" in (l["details"] or "") for l in audit_b["logs"])
+
+    # Family B backup MUST NOT contain Family A's audit records or bytes
+    bak_b = await backup.create_family_backup(fam_b.id)
+    try:
+        raw = bak_b.read_bytes()
+        assert b"777" not in raw
+        conn = _sqlite3.connect(str(bak_b))
+        try:
+            rows = conn.execute("SELECT details FROM audit_logs").fetchall()
+        finally:
+            conn.close()
+        assert not any("101" in (r[0] or "") for r in rows)
+    finally:
+        bak_b.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_p1_02_revoked_admin_removed_from_family_owners_and_notifications(temp_db, monkeypatch):
+    fam = await crud.create_family("Семья")
+    apt = await crud.create_apartment("1", fam.id)
+    await crud.sync_admin_user(100)
+    await crud.get_or_create_user(201, name="Владелец", role="landlord", family_id=fam.id)
+
+    admin_old = WebAppUser(telegram_id=100, role="admin", family_id=None, name="OldAdmin")
+    await fam_router.api_add_family_owner(fam.id, FamilyOwnerBody(telegram_id=100, name="OldAdmin"), user=admin_old)
+    assert set(await access.get_notification_recipients(apt.id)) == {201, 100}
+
+    # Rotate ADMIN_TELEGRAM_ID to 999
+    monkeypatch.setattr(config, "ADMIN_TELEGRAM_ID", 999)
+    await crud.sync_admin_user(999)
+
+    assert await access.get_notification_recipients(apt.id) == [201]
+    assert [o.telegram_id for o in await crud.get_family_owners(fam.id)] == [201]
+
+
+@pytest.mark.asyncio
+async def test_p1_03_toctou_revoked_access_blocked_inside_write_transaction(temp_db):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("1", fam.id, enabled_meters=["cold_water"])
+    u_t, _ = await crud.get_or_create_user(310, name="Жилец", role="tenant", family_id=fam.id)
+    await crud.link_user_to_apartment(apt.id, u_t.id, role="tenant")
+
+    # Revoke tenant right before atomic write executes
+    await operations.remove_tenant_from_apartment_atomic(apt.id, 310, actor_tg_id=100)
+    with pytest.raises(PermissionError):
+        await operations.submit_meter_group_atomic(
+            apt.id, {"cold_water": 150}, 310, datetime.date(2026, 11, 20), "submit_water"
+        )
+    assert await crud.get_readings_count(apt.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_p1_04_and_p1_05_replacement_init_locked_neighbor_bounds_and_enabled_initial(temp_db, monkeypatch):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("1", fam.id, enabled_meters=["cold_water"])
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    req = make_request()
+
+    # P1-05: setting initial reading for disabled meter fails with 400
+    from webapp.schemas import InitialReadingsBody, ReadingCorrectionBody
+    with pytest.raises(HTTPException) as exc_dis:
+        await apt_router.api_update_initial_readings(apt.id, InitialReadingsBody(hot_water=50), user=admin)
+    assert exc_dis.value.status_code == 400
+
+    await operations.update_initial_readings_atomic(apt.id, {"cold_water": 100}, 100)
+    await operations.save_meter_group_readings(apt.id, {"cold_water": 110}, 100, datetime.date(2026, 10, 20), "s", "oct")
+    await operations.save_meter_group_readings(apt.id, {"cold_water": 130}, 100, datetime.date(2026, 11, 20), "s", "nov")
+    await operations.save_meter_group_readings(apt.id, {"cold_water": 150}, 100, datetime.date(2026, 12, 20), "s", "dec")
+
+    rows = await crud.get_all_readings(apt.id)
+    nov_rec = [r for r in rows if r.value == 130][0]
+
+    # P1-05: editing Nov above Dec (160 > 150) or below Oct (105 < 110) is rejected with 400
+    with pytest.raises(HTTPException) as exc_hi:
+        await read_router.api_correct_reading(nov_rec.id, ReadingCorrectionBody(value=160), user=admin)
+    assert exc_hi.value.status_code == 400
+    with pytest.raises(HTTPException) as exc_lo:
+        await read_router.api_correct_reading(nov_rec.id, ReadingCorrectionBody(value=105), user=admin)
+    assert exc_lo.value.status_code == 400
+
+    # Valid edit within [110, 150] succeeds
+    ok = await read_router.api_correct_reading(nov_rec.id, ReadingCorrectionBody(value=135), user=admin)
+    assert ok["ok"] is True and ok["new_value"] == 135
+
+    # P1-04: editing replacement_init reading is rejected with 400
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 12, 25))
+    monkeypatch.setattr(apt_router, "local_today", lambda: datetime.date(2026, 12, 25))
+    await apt_router.api_replace_meter(
+        apt.id,
+        MeterReplacementBody(meter_type="cold_water", old_final_value=155, new_initial_value=5),
+        user=admin,
+    )
+    all_rows = await crud.get_all_readings(apt.id)
+    rep_init = [r for r in all_rows if r.is_replacement_init][0]
+    with pytest.raises(HTTPException) as exc_rep:
+        await read_router.api_correct_reading(rep_init.id, ReadingCorrectionBody(value=10), user=admin)
+    assert exc_rep.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_p1_06_p2_01_p2_02_replacement_validation_idempotency_metadata_reset_and_dedup(temp_db):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("42", fam.id, enabled_meters=["cold_water", "t1", "t2", "t3"])
+    await crud.get_or_create_user(201, name="Владелец", role="landlord", family_id=fam.id)
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # Save device metadata with old serial & verification date
+    await apt_router.api_update_meter_devices(
+        apt.id,
+        MeterDevicesUpdateBody(
+            items=[
+                MeterDeviceItemBody(
+                    meter_type="t",
+                    serial_number="OLD-EL-1",
+                    verification_due_date="25.02.2027",
+                    notify_intervals=["3m"],
+                )
+            ]
+        ),
+        user=admin,
+    )
+
+    # P1-06: single tariff replacement of t1 is rejected
+    with pytest.raises(HTTPException) as exc_s:
+        await apt_router.api_replace_meter(
+            apt.id,
+            MeterReplacementBody(meter_type="t1", old_final_value=10, new_initial_value=0),
+            user=admin,
+        )
+    assert exc_s.value.status_code == 400
+
+    # P1-06: incomplete batch (only t1, t2) rejected
+    with pytest.raises(HTTPException) as exc_inc:
+        await apt_router.api_replace_meter(
+            apt.id,
+            MeterReplacementBody(
+                meter_type="t",
+                tariff_entries=[
+                    MeterReplacementTariffEntry(meter_type="t1", old_final_value=10, new_initial_value=0),
+                    MeterReplacementTariffEntry(meter_type="t2", old_final_value=20, new_initial_value=0),
+                ],
+            ),
+            user=admin,
+        )
+    assert exc_inc.value.status_code == 400
+
+    # P1-06: duplicate tariff rejected
+    with pytest.raises(HTTPException) as exc_dup:
+        await apt_router.api_replace_meter(
+            apt.id,
+            MeterReplacementBody(
+                meter_type="t",
+                tariff_entries=[
+                    MeterReplacementTariffEntry(meter_type="t1", old_final_value=10, new_initial_value=0),
+                    MeterReplacementTariffEntry(meter_type="t1", old_final_value=10, new_initial_value=0),
+                    MeterReplacementTariffEntry(meter_type="t3", old_final_value=30, new_initial_value=0),
+                ],
+            ),
+            user=admin,
+        )
+    assert exc_dup.value.status_code == 400
+
+    # Valid batch replacement WITHOUT new serial/due date -> P2-01 clears old serial & verification date!
+    batch_body = MeterReplacementBody(
+        meter_type="t",
+        tariff_entries=[
+            MeterReplacementTariffEntry(meter_type="t1", old_final_value=10, new_initial_value=0),
+            MeterReplacementTariffEntry(meter_type="t2", old_final_value=20, new_initial_value=0),
+            MeterReplacementTariffEntry(meter_type="t3", old_final_value=30, new_initial_value=0),
+        ],
+        replacement_id="rep-elec-1",
+    )
+    r1 = await apt_router.api_replace_meter(apt.id, batch_body, user=admin)
+    assert r1["ok"] is True and r1["deduplicated"] is False
+
+    # P1-06: identical retry returns deduplicated=True and does not create extra replacement rows
+    r2 = await apt_router.api_replace_meter(apt.id, batch_body, user=admin)
+    assert r2["ok"] is True and r2["deduplicated"] is True
+    assert len(await crud.get_meter_replacements(apt.id)) == 3
+
+    # P2-01: old verification date cleared -> no stale verification reminder sent
+    bot = DummyBot()
+    await scheduler.check_meter_verifications(bot, today=datetime.date(2026, 11, 25))
+    assert bot.sent == []
+
+    # P2-02: legacy t1/t2 MeterDevice rows alongside canonical t produce only ONE verification alert
+    from database.models import MeterDevice
+    async with crud.UnitOfWork(write=True) as s:
+        s.add(MeterDevice(apartment_id=apt.id, meter_type="t1", serial_number="L1", verification_due_date=datetime.date(2027, 2, 25), notify_intervals="3m"))
+        s.add(MeterDevice(apartment_id=apt.id, meter_type="t2", serial_number="L2", verification_due_date=datetime.date(2027, 2, 25), notify_intervals="3m"))
+    await apt_router.api_update_meter_devices(
+        apt.id,
+        MeterDevicesUpdateBody(items=[MeterDeviceItemBody(meter_type="t", serial_number="CANON", verification_due_date="25.02.2027", notify_intervals=["3m"])]),
+        user=admin,
+    )
+    bot2 = DummyBot()
+    await scheduler.check_meter_verifications(bot2, today=datetime.date(2026, 11, 25))
+    assert len(bot2.sent) == 1
+    assert "CANON" in bot2.sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_p1_08_and_p2_17_concurrent_settings_and_partial_contract_preservation(temp_db, monkeypatch):
+    monkeypatch.setattr(config, "local_today", lambda: datetime.date(2026, 11, 25))
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment("10", fam.id, property_type="house", enabled_meters=["cold_water", "t"])
+    u_t, _ = await crud.get_or_create_user(320, name="Истёкший", role="tenant", family_id=fam.id)
+    await crud.link_user_to_apartment(apt.id, u_t.id, role="tenant")
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+
+    # P1-08: parallel partial settings updates preserve both days
+    await asyncio.gather(
+        apt_router.api_update_settings(apt.id, ApartmentSettingsBody(water_submission_day=18), user=admin),
+        apt_router.api_update_settings(apt.id, ApartmentSettingsBody(electricity_submission_day=24), user=admin),
+    )
+    reloaded = await crud.get_apartment(apt.id)
+    assert reloaded.water_submission_day == 18
+    assert reloaded.electricity_submission_day == 24
+
+    # P1-08: concurrent house->apartment and adding irrigation cannot produce invalid state
+    results = await asyncio.gather(
+        apt_router.api_update_settings(apt.id, ApartmentSettingsBody(property_type="apartment"), user=admin),
+        apt_router.api_update_settings(apt.id, ApartmentSettingsBody(enabled_meters=["cold_water", "irrigation", "t"]), user=admin),
+        return_exceptions=True,
+    )
+    assert sum(1 for r in results if isinstance(r, dict) and r.get("ok")) == 1
+    assert sum(1 for r in results if isinstance(r, HTTPException) and r.status_code == 400) == 1
+
+    # P2-17: partial PUT contract with only has_tenant MUST NOT wipe expired finish date
+    await ten_router.api_update_contract(
+        apt.id,
+        ContractBody(agreement_no="99", agreement_date_start="01.01.2025", agreement_date_finish="01.01.2026"),
+        user=admin,
+    )
+    assert await access.user_can_access_apartment(320, apt.id) is False
+
+    await ten_router.api_update_contract(apt.id, ContractBody(has_tenant=True), user=admin)
+    after = await crud.get_apartment(apt.id)
+    assert after.agreement_no == "99"
+    assert after.agreement_date_finish == datetime.date(2026, 1, 1)
+    assert await access.user_can_access_apartment(320, apt.id) is False
+
+
+@pytest.mark.asyncio
+async def test_p1_09_p2_20_p2_12_backup_revision_ignores_service_writes_and_cleans_photos(temp_db, tmp_path, monkeypatch):
+    bdir = tmp_path / "b_rev"
+    pdir = tmp_path / "p_old"
+    bdir.mkdir()
+    pdir.mkdir()
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite+aiosqlite:///{temp_db}")
+    monkeypatch.setattr(config, "BACKUP_DIR", bdir)
+    monkeypatch.setattr(backup, "PHOTOS_DIR", pdir)
+
+    old_photo = pdir / "stale.jpg"
+    old_photo.write_bytes(b"img")
+    old_t = time.time() - 40 * 86400
+    os.utime(old_photo, (old_t, old_t))
+
+    p1 = await backup.create_backup(skip_if_unchanged=True)
+    assert p1 is not None
+
+    # P2-20: service writes (scheduler_runs & manual_backup audit) do NOT force a new backup
+    await crud.record_scheduler_run("test_job", datetime.date(2026, 11, 25))
+    await crud.add_audit_log(100, "manual_backup", "noop")
+    p2 = await backup.create_backup(skip_if_unchanged=True)
+    assert p2 is None
+
+    # P1-09: real business write increments business_revision -> next backup is created
+    await crud.create_family("Real Change")
+    p3 = await backup.create_backup(skip_if_unchanged=True)
+    assert p3 is not None and p3 != p1
+
+    # P2-12: daily backup job cleans up old legacy photos
+    await scheduler._run_daily_backup_and_cleanup()
+    assert not old_photo.exists()
+
+
+@pytest.mark.asyncio
+async def test_p2_05_p2_08_p2_09_p2_11_deeplink_irrigation_midnight_and_heic(temp_db, monkeypatch):
+    fam = await crud.create_family("F")
+    apt = await crud.create_apartment(
+        "188", fam.id, property_type="house",
+        enabled_meters=["cold_water", "hot_water", "irrigation"],
+        irrigation_mode="after_cold",
+    )
+    admin = WebAppUser(telegram_id=100, role="admin", family_id=None, name="Admin")
+    req = make_request()
+
+    # P2-05: build_webapp_url includes apt_id
+    url = notifications.build_webapp_url(tab="water", apt_id=apt.id)
+    assert f"tab=water&apt_id={apt.id}" in url
+
+    # P2-08: irrigation > cold_water does NOT deduct excess from hot_water and flags incomplete_reasons
+    await operations.update_initial_readings_atomic(apt.id, {"cold_water": 100, "hot_water": 50, "irrigation": 10}, 100)
+    await crud.set_tariff(apt.id, "cold_water", Decimal("40"), datetime.date(2026, 1, 1), 100)
+    await crud.set_tariff(apt.id, "hot_water", Decimal("150"), datetime.date(2026, 1, 1), 100)
+    await crud.set_tariff(apt.id, "sewerage", Decimal("30"), datetime.date(2026, 1, 1), 100)
+
+    monkeypatch.setattr(read_router, "local_today", lambda: datetime.date(2026, 11, 25))
+    monkeypatch.setattr(calculations, "local_today", lambda: datetime.date(2026, 11, 25))
+    await read_router.api_submit_water(
+        apt.id,
+        WaterReadingBody(cold_water=110, hot_water=55, irrigation=22, submission_id="mid-sub-1"),
+        req,
+        user=admin,
+    )
+    bill = await calculations.calculate_billing(apt.id, year=2026, month=11)
+    # ХВС=10, ГВС=5, Полив=12 -> sewerage = max(0, 10 - 12) + 5 = 5 м³ (NOT 3 м³!)
+    assert bill.sewerage is not None
+    assert bill.sewerage.consumption == 5
+    assert bill.sewerage.cost == 150
+    assert bill.is_complete is False
+    assert "полив превышает расход ХВС" in bill.incomplete_reasons
+
+    # P2-09: retrying same submission_id after midnight deduplicates cleanly instead of 409
+    monkeypatch.setattr(read_router, "local_today", lambda: datetime.date(2026, 11, 26))
+    retry_after_midnight = await read_router.api_submit_water(
+        apt.id,
+        WaterReadingBody(cold_water=110, hot_water=55, irrigation=22, submission_id="mid-sub-1"),
+        req,
+        user=admin,
+    )
+    assert retry_after_midnight["ok"] is True
+    assert retry_after_midnight["deduplicated"] is True
+
+    # P2-11: HEIC file is rejected (not silently renamed to .jpg)
+    heic = DummyUploadFile(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00", "photo.heic")
+    with pytest.raises(HTTPException) as exc_heic:
+        await read_router.api_upload_photo(apt.id, req, file=heic, comment="", user=admin)
+    assert exc_heic.value.status_code == 400

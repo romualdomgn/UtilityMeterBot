@@ -134,7 +134,7 @@ async def on_direct_photo(message: Message) -> None:
         comment=message.caption or "",
         photo_file_id=photo.file_id,
     )
-    await crud.add_audit_log(tid, "upload_photo_chat", f"{prop_label}, получателей: {sent}")
+    await crud.add_audit_log(tid, "upload_photo_chat", f"{prop_label}, получателей: {sent}", family_id=apt.family_id)
     if sent > 0:
         await message.answer(f"✅ Фото счётчика ({h(prop_label)}) отправлено владельцам ({sent}).", parse_mode="HTML")
     else:

@@ -6,14 +6,16 @@ import hashlib
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import config
 from services.notifications import BackgroundTaskManager
 from webapp.routers import admin, apartments, families, readings, tenants
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 NO_CACHE_PATHS = frozenset({"/", "/index.html", "/app.js", "/style.css"})
+MAX_JSON_BODY_BYTES = 1 * 1024 * 1024
 
 
 def _asset_hash(filename: str) -> str:
@@ -37,6 +39,27 @@ def create_web_app(bot, bg_tasks: BackgroundTaskManager | None = None) -> FastAP
     app = FastAPI(title="Utility Meter Web App")
     app.state.bot = bot
     app.state.bg_tasks = bg_tasks or BackgroundTaskManager()
+
+    @app.middleware("http")
+    async def enforce_request_body_limits(request: Request, call_next):
+        """P2-11 & P2-19: reject oversized payloads before multipart/JSON parsing."""
+        if request.method in ("POST", "PUT", "PATCH"):
+            content_len = request.headers.get("content-length")
+            if content_len:
+                try:
+                    size = int(content_len)
+                except ValueError:
+                    return JSONResponse(status_code=400, content={"detail": "Некорректный заголовок Content-Length"})
+                is_photo = request.url.path.endswith("/photo")
+                limit = (config.MAX_PHOTO_BYTES + 1024 * 1024) if is_photo else MAX_JSON_BODY_BYTES
+                if size > limit:
+                    msg = (
+                        "Файл превышает максимально допустимый размер 15 МБ"
+                        if is_photo
+                        else "Размер тела запроса превышает допустимый лимит"
+                    )
+                    return JSONResponse(status_code=413, content={"detail": msg})
+        return await call_next(request)
 
     @app.middleware("http")
     async def disable_static_cache(request: Request, call_next):

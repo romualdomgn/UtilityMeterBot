@@ -59,17 +59,15 @@ async def api_update_contract(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа")
 
-    date_start = parse_iso_date(body.agreement_date_start)
-    date_finish = parse_iso_date(body.agreement_date_finish)
-    if date_start and date_finish and date_start > date_finish:
-        raise HTTPException(400, "Дата начала договора не может быть позже даты окончания")
-
-    updates: dict = {
-        "agreement_no": (body.agreement_no or "").strip() or None,
-        "agreement_date_start": date_start,
-        "agreement_date_finish": date_finish,
-    }
-    if body.has_tenant is not None:
+    # P2-17: apply ONLY explicitly sent fields so partial PUT never wipes dates or re-enables expired tenants
+    updates: dict = {}
+    if "agreement_no" in body.model_fields_set:
+        updates["agreement_no"] = (body.agreement_no or "").strip() or None
+    if "agreement_date_start" in body.model_fields_set:
+        updates["agreement_date_start"] = parse_iso_date(body.agreement_date_start)
+    if "agreement_date_finish" in body.model_fields_set:
+        updates["agreement_date_finish"] = parse_iso_date(body.agreement_date_finish)
+    if "has_tenant" in body.model_fields_set and body.has_tenant is not None:
         updates["has_tenant"] = body.has_tenant
 
     payment_fields_touched = bool(
@@ -77,42 +75,28 @@ async def api_update_contract(
         & {"rent_payment_day", "rent_reminder_enabled", "rent_reminder_mode", "rent_reminder_days_after"}
     )
     if payment_fields_touched:
-        pay_day = body.rent_payment_day
-        if pay_day is not None and not (1 <= pay_day <= 31):
-            raise HTTPException(400, "Дата ежемесячного платежа должна быть числом от 1 до 31")
-        updates["rent_payment_day"] = pay_day
-
-        rem_enabled = bool(body.rent_reminder_enabled)
-        if rem_enabled:
-            if pay_day is None:
-                raise HTTPException(
-                    400,
-                    "Укажите дату ежемесячного платежа, чтобы включить напоминание об оплате",
-                )
-            mode = body.rent_reminder_mode
-            if mode not in RENT_REMINDER_MODES:
-                raise HTTPException(400, "Выберите вариант напоминания об оплате")
-            days_after = body.rent_reminder_days_after if mode == RENT_REMINDER_AFTER_DAYS else None
-            if mode == RENT_REMINDER_AFTER_DAYS:
-                if days_after is None or not (1 <= days_after <= 20):
-                    raise HTTPException(
-                        400,
-                        "Укажите количество дней после даты платежа (от 1 до 20)",
-                    )
-            updates["rent_reminder_enabled"] = True
-            updates["rent_reminder_mode"] = mode
-            updates["rent_reminder_days_after"] = days_after
-        else:
-            updates["rent_reminder_enabled"] = False
-            updates["rent_reminder_mode"] = None
-            updates["rent_reminder_days_after"] = None
+        if "rent_payment_day" in body.model_fields_set:
+            if body.rent_payment_day is not None and not (1 <= body.rent_payment_day <= 31):
+                raise HTTPException(400, "Дата ежемесячного платежа должна быть числом от 1 до 31")
+            updates["rent_payment_day"] = body.rent_payment_day
+        if "rent_reminder_enabled" in body.model_fields_set:
+            updates["rent_reminder_enabled"] = bool(body.rent_reminder_enabled)
+        if "rent_reminder_mode" in body.model_fields_set:
+            updates["rent_reminder_mode"] = body.rent_reminder_mode
+        if "rent_reminder_days_after" in body.model_fields_set:
+            updates["rent_reminder_days_after"] = body.rent_reminder_days_after
 
     try:
-        await operations.update_contract_atomic(apt_id, updates, user.telegram_id)
+        updated_apt = await operations.update_contract_atomic(apt_id, updates, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     resp: dict = {"ok": True}
-    if is_contract_over_one_year(date_start, date_finish):
+    if is_contract_over_one_year(updated_apt.agreement_date_start, updated_apt.agreement_date_finish):
         resp["long_term_warning"] = LONG_TERM_CONTRACT_WARNING
     return resp
 
@@ -132,6 +116,8 @@ async def api_delete_contract(
         prop_label, affected_tenants = await operations.delete_contract_atomic(
             apt_id, user.telegram_id, unlink_tenants=unlink_tenants
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
 
@@ -180,6 +166,8 @@ async def api_add_tenant(
             actor_tg_id=user.telegram_id,
             force_no_contract=body.force_no_contract,
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except operations.ConflictError as e:
         raise HTTPException(409, str(e))
     except LookupError as e:

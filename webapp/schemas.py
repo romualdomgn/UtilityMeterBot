@@ -45,7 +45,7 @@ class ApartmentCreateBody(BaseModel):
 
 
 class ApartmentReorderBody(BaseModel):
-    apartment_ids: list[int]
+    apartment_ids: list[int] = Field(max_length=200)
 
 
 class ApartmentSettingsBody(BaseModel):
@@ -108,7 +108,7 @@ class MeterDeviceItemBody(BaseModel):
 
 
 class MeterDevicesUpdateBody(BaseModel):
-    items: list[MeterDeviceItemBody]
+    items: list[MeterDeviceItemBody] = Field(max_length=20)
 
 
 class MeterReplacementTariffEntry(BaseModel):
@@ -121,9 +121,10 @@ class MeterReplacementBody(BaseModel):
     meter_type: str
     old_final_value: StrictReadingInt | None = None
     new_initial_value: StrictReadingInt | None = None
-    tariff_entries: list[MeterReplacementTariffEntry] | None = None
+    tariff_entries: list[MeterReplacementTariffEntry] | None = Field(default=None, max_length=10)
     new_serial_number: str | None = Field(default=None, max_length=100)
     new_verification_due_date: str | None = None
+    replacement_id: str | None = Field(default=None, max_length=64)
 
 
 class ContractBody(BaseModel):

@@ -521,11 +521,21 @@ class SchedulerRun(Base):
     )
 
 
+class DbMeta(Base):
+    """Service metadata such as monotonic business revision for reliable backup change detection."""
+
+    __tablename__ = "db_meta"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    family_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(

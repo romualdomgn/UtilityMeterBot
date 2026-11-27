@@ -154,6 +154,8 @@ async def api_update_own_profile(
 
     try:
         updated = await operations.update_own_profile_atomic(user.telegram_id, name, is_actor_admin=is_admin(user.telegram_id))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     return {"ok": True, "name": updated.name}
@@ -175,7 +177,10 @@ async def api_reorder_apartments(
         raise HTTPException(403, "Нет доступа к одному из объектов недвижимости")
 
     full_order = requested_ids + [a.id for a in accessible if a.id not in set(requested_ids)]
-    updated_ids = await operations.reorder_apartments_atomic(full_order, user.telegram_id)
+    try:
+        updated_ids = await operations.reorder_apartments_atomic(full_order, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     return {"ok": True, "apartment_ids": updated_ids}
 
 
@@ -265,14 +270,19 @@ async def api_create_apartment(body: ApartmentCreateBody, user: WebAppUser = Dep
         if not family_id:
             raise HTTPException(400, "Администратор должен сначала привязать вас к семье")
 
-    apt = await operations.create_apartment_atomic(
-        number=number,
-        family_id=family_id,
-        property_type=body.property_type,
-        enabled_meters=enabled_meters,
-        irrigation_mode=body.irrigation_mode,
-        actor_tg_id=user.telegram_id,
-    )
+    try:
+        apt = await operations.create_apartment_atomic(
+            number=number,
+            family_id=family_id,
+            property_type=body.property_type,
+            enabled_meters=enabled_meters,
+            irrigation_mode=body.irrigation_mode,
+            actor_tg_id=user.telegram_id,
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     return {"ok": True, "apartment": serialize_apartment(apt)}
 
 
@@ -291,6 +301,8 @@ async def api_delete_apartment(
             apartment_id=apt_id,
             actor_tg_id=user.telegram_id,
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
 
@@ -333,25 +345,9 @@ async def api_update_settings(
         if len(clean_number) > 50:
             raise HTTPException(400, "Название/номер объекта не длиннее 50 символов")
 
-    existing_apt = await crud.get_apartment(apt_id)
-    if not existing_apt:
-        raise HTTPException(404, "Объект недвижимости не найден")
-
-    effective_ptype = body.property_type or existing_apt.property_type or "apartment"
-    effective_irr_mode = body.irrigation_mode or get_apartment_irrigation_mode(existing_apt)
-    enabled_meters = _validate_enabled_meters(
-        body.enabled_meters,
-        property_type=effective_ptype,
-        irrigation_mode=effective_irr_mode,
-    )
-    final_meters = enabled_meters if enabled_meters is not None else get_apartment_enabled_meters(existing_apt)
-    _validate_effective_configuration(effective_ptype, final_meters, effective_irr_mode)
-
     parsed_tariffs: dict[str, Decimal] = {}
     for mt, raw_rate in body.tariffs.items():
         if mt not in ALL_TARIFF_TYPES or raw_rate in (None, ""):
-            continue
-        if mt in IRRIGATION_METERS and effective_irr_mode == IRRIGATION_MODE_AFTER_COLD:
             continue
         try:
             rate = Decimal(str(raw_rate).strip().replace(",", "."))
@@ -362,38 +358,28 @@ async def api_update_settings(
             raise HTTPException(400, f"Некорректный тариф для {mt}")
         parsed_tariffs[mt] = rate
 
-    eff_wday = (
-        body.water_submission_day
-        if "water_submission_day" in body.model_fields_set
-        else existing_apt.water_submission_day
-    )
-    eff_eday = (
-        body.electricity_submission_day
-        if "electricity_submission_day" in body.model_fields_set
-        else existing_apt.electricity_submission_day
-    )
-    eff_gday = (
-        body.gas_submission_day
-        if "gas_submission_day" in body.model_fields_set
-        else existing_apt.gas_submission_day
-    )
-
+    # P1-08: merge partial fields & validate final configuration strictly inside write transaction
     try:
         updated_tariffs = await operations.update_apartment_settings_atomic(
             apartment_id=apt_id,
-            water_submission_day=eff_wday,
-            electricity_submission_day=eff_eday,
-            gas_submission_day=eff_gday,
+            water_submission_day=body.water_submission_day,
+            electricity_submission_day=body.electricity_submission_day,
+            gas_submission_day=body.gas_submission_day,
             tariffs=parsed_tariffs,
             changed_by=user.telegram_id,
             effective_from=local_today(),
             number=clean_number,
             property_type=body.property_type,
-            enabled_meters=enabled_meters,
+            enabled_meters=body.enabled_meters,
             irrigation_mode=body.irrigation_mode,
+            fields_set=set(body.model_fields_set),
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True, "updated_tariffs": updated_tariffs}
 
 
@@ -438,8 +424,12 @@ async def api_update_initial_readings(
     if readings_map:
         try:
             await operations.update_initial_readings_atomic(apt_id, readings_map, user.telegram_id)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
         except LookupError as e:
             raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     return {"ok": True}
 
 
@@ -494,6 +484,8 @@ async def api_update_meter_devices(
 
     try:
         updated = await operations.upsert_meter_devices_atomic(apt_id, parsed_items, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -513,21 +505,24 @@ async def api_replace_meter(
         raise HTTPException(403, "Нет доступа")
 
     due = parse_iso_date(body.new_verification_due_date)
+    deduplicated = False
     try:
-        if body.tariff_entries:
-            reps = await operations.replace_meter_batch_atomic(
+        if body.tariff_entries is not None:
+            reps, deduplicated = await operations.replace_meter_batch_atomic(
                 apartment_id=apt_id,
                 entries=[e.model_dump() for e in body.tariff_entries],
                 actor_tg_id=user.telegram_id,
                 replacement_date=local_today(),
+                meter_type=body.meter_type,
                 new_serial_number=body.new_serial_number,
                 new_verification_due_date=due,
+                replacement_id=body.replacement_id,
             )
             rep_id = reps[0].id if reps else None
         else:
             if body.old_final_value is None or body.new_initial_value is None:
                 raise HTTPException(400, "Укажите конечное показание старого и начальное показание нового счётчика")
-            rep = await operations.replace_meter_atomic(
+            rep, deduplicated = await operations.replace_meter_atomic(
                 apartment_id=apt_id,
                 meter_type=body.meter_type,
                 old_final_value=body.old_final_value,
@@ -536,8 +531,13 @@ async def api_replace_meter(
                 replacement_date=local_today(),
                 new_serial_number=body.new_serial_number,
                 new_verification_due_date=due,
+                replacement_id=body.replacement_id,
             )
             rep_id = rep.id
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except operations.ConflictError as e:
+        raise HTTPException(409, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except ValueError as e:
@@ -546,6 +546,7 @@ async def api_replace_meter(
     billing = await calculate_billing(apt_id)
     return {
         "ok": True,
+        "deduplicated": deduplicated,
         "replacement_id": rep_id,
         "billing": billing.to_dict(),
     }

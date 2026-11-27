@@ -58,6 +58,10 @@ USER_MIGRATIONS = (
     ("landlord_name", "ALTER TABLE users ADD COLUMN landlord_name VARCHAR(120)"),
 )
 
+AUDIT_LOG_MIGRATIONS = (
+    ("family_id", "ALTER TABLE audit_logs ADD COLUMN family_id INTEGER"),
+)
+
 
 def _apply_table_migrations(sync_conn, table_name: str, migrations: tuple[tuple[str, str], ...]) -> None:
     rows = sync_conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
@@ -86,6 +90,16 @@ def _run_sqlite_migrations(sync_conn) -> None:
     _apply_table_migrations(sync_conn, "meter_readings", METER_READING_MIGRATIONS)
     _apply_table_migrations(sync_conn, "families", FAMILY_MIGRATIONS)
     _apply_table_migrations(sync_conn, "users", USER_MIGRATIONS)
+    _apply_table_migrations(sync_conn, "audit_logs", AUDIT_LOG_MIGRATIONS)
+
+    tables = {
+        row[0]
+        for row in sync_conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+    }
+    if "audit_logs" in tables:
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_family_id ON audit_logs (family_id)"))
+    if "db_meta" in tables:
+        sync_conn.execute(text("INSERT OR IGNORE INTO db_meta (key, value) VALUES ('business_revision', 0)"))
 
 
 async def init_db() -> None:

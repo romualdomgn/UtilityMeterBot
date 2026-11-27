@@ -9,14 +9,19 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Iterable
 
-from sqlalchemy import and_, delete, desc, func, or_, select
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 import config
-from database.crud import ALLOWED_APARTMENT_FIELDS, UnitOfWork
+from database.crud import ALLOWED_APARTMENT_FIELDS, UnitOfWork, bump_business_revision_in_session
 from database.models import (
     ALL_METERS,
     ELECTRICITY_METERS,
+    IRRIGATION_METERS,
+    IRRIGATION_MODE_AFTER_COLD,
+    MULTI_ELECTRICITY_METERS,
+    RENT_REMINDER_AFTER_DAYS,
+    RENT_REMINDER_MODES,
     SINGLE_ELECTRICITY_METER,
     Apartment,
     ApartmentUser,
@@ -38,6 +43,12 @@ from database.models import (
     serialize_notify_intervals,
     utcnow_naive,
 )
+from services.access import (
+    assert_active_actor_in_session,
+    assert_can_access_apartment_in_session,
+    assert_can_manage_family_in_session,
+    is_admin,
+)
 
 
 class ConflictError(Exception):
@@ -53,15 +64,62 @@ class SubmissionOutcome:
     property_label: str = ""
 
 
+def validate_apartment_configuration(
+    property_type: str,
+    enabled_meters: list[str],
+    irrigation_mode: str,
+) -> list[str]:
+    """Validate property type, meter combination, and irrigation mode; returns canonical meters list."""
+    valid = [m for m in ALL_METERS if m in set(enabled_meters)]
+    if not valid:
+        raise ValueError("Выберите хотя бы один счётчик для объекта")
+    if SINGLE_ELECTRICITY_METER in valid and any(m in valid for m in MULTI_ELECTRICITY_METERS):
+        raise ValueError("Нельзя одновременно выбрать «Один тариф (Т)» и тарифы Т1, Т2, Т3")
+    if property_type != "house" and any(m in valid for m in IRRIGATION_METERS):
+        raise ValueError("Счётчик «Полив» доступен только для типа недвижимости «Дом»")
+    if (
+        any(m in valid for m in IRRIGATION_METERS)
+        and irrigation_mode == IRRIGATION_MODE_AFTER_COLD
+        and "cold_water" not in valid
+    ):
+        raise ValueError("Режим «Полив после ХВС» требует включённого счётчика ХВС")
+    return valid
+
+
 def _compute_submission_hash(
     meters: dict[str, int],
-    reading_date: datetime.date,
+    reading_date: datetime.date | None,
     action: str,
 ) -> str:
+    """P2-09: hash immutable submission payload without server date so cross-midnight retries deduplicate."""
     payload = {
         "action": action,
-        "reading_date": reading_date.isoformat(),
         "meters": sorted((k, int(v)) for k, v in meters.items()),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _make_replacement_ledger_key(replacement_id: str) -> str:
+    clean = replacement_id.strip()
+    raw = f"rep:{clean}"
+    if len(raw) <= 64:
+        return raw
+    return f"rep:{hashlib.sha256(clean.encode('utf-8')).hexdigest()[:56]}"
+
+
+def _compute_replacement_hash(
+    meter_type: str,
+    entries: list[tuple[str, int, int]],
+    new_serial: str | None,
+    new_due_date: datetime.date | None,
+) -> str:
+    payload = {
+        "action": "replace_meter",
+        "meter_type": meter_type,
+        "entries": sorted((mt, int(of), int(ni)) for mt, of, ni in entries),
+        "new_serial": new_serial or "",
+        "new_due_date": new_due_date.isoformat() if new_due_date else "",
     }
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -101,7 +159,7 @@ async def submit_meter_group_atomic(
     submission_id: str | None = None,
     dedup_window_seconds: int = 10,
 ) -> SubmissionOutcome:
-    """HIGH-07 & MEDIUM-02: validate prev values, decrease/repeat rules, and save atomically."""
+    """HIGH-07, MEDIUM-02, P1-03, P2-09: verify rights, validate rules, and save atomically."""
     if not meters:
         raise ValueError("Укажите хотя бы одно показание счётчика")
 
@@ -116,6 +174,11 @@ async def submit_meter_group_atomic(
     )
 
     async with UnitOfWork(write=True) as s:
+        apt, actor_role = await assert_can_access_apartment_in_session(
+            s, submitted_by, apartment_id, allow_tenant=True
+        )
+        effective_allow_decrease = bool(allow_decrease and actor_role in ("admin", "landlord"))
+
         if clean_sub_id:
             res_sub = await s.execute(
                 select(MeterSubmission).where(MeterSubmission.submission_id == clean_sub_id)
@@ -136,10 +199,6 @@ async def submit_meter_group_atomic(
                 }
                 return SubmissionOutcome(status="deduplicated", prev_meters=prev_map)
 
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
-
         enabled = set(get_apartment_enabled_meters(apt))
         for mt in meters:
             if mt not in enabled:
@@ -155,32 +214,11 @@ async def submit_meter_group_atomic(
             mt for mt, val in meters.items()
             if prev_meters[mt] is not None and val < prev_meters[mt]
         ]
-        if decreased and not allow_decrease:
+        if decreased and not effective_allow_decrease:
             return SubmissionOutcome(
                 status="rejected_decrease",
                 prev_meters=prev_meters,
                 decreased=decreased,
-                property_label=format_property_short(apt),
-            )
-
-        res_month = await s.execute(
-            select(MeterReading.meter_type)
-            .where(
-                MeterReading.apartment_id == apartment_id,
-                MeterReading.meter_type.in_(list(meters.keys())),
-                MeterReading.reading_date >= first_day,
-                MeterReading.reading_date < next_month,
-                MeterReading.is_replacement_init.is_(False),
-            )
-            .distinct()
-        )
-        already_in_month = set(res_month.scalars().all())
-        repeated = [mt for mt in meters if mt in already_in_month]
-        if repeated and not force:
-            return SubmissionOutcome(
-                status="needs_confirm_repeat",
-                prev_meters=prev_meters,
-                repeated=repeated,
                 property_label=format_property_short(apt),
             )
 
@@ -208,6 +246,27 @@ async def submit_meter_group_atomic(
                         property_label=format_property_short(apt),
                     )
 
+        res_month = await s.execute(
+            select(MeterReading.meter_type)
+            .where(
+                MeterReading.apartment_id == apartment_id,
+                MeterReading.meter_type.in_(list(meters.keys())),
+                MeterReading.reading_date >= first_day,
+                MeterReading.reading_date < next_month,
+                MeterReading.is_replacement_init.is_(False),
+            )
+            .distinct()
+        )
+        already_in_month = set(res_month.scalars().all())
+        repeated = [mt for mt in meters if mt in already_in_month]
+        if repeated and not force:
+            return SubmissionOutcome(
+                status="needs_confirm_repeat",
+                prev_meters=prev_meters,
+                repeated=repeated,
+                property_label=format_property_short(apt),
+            )
+
         if clean_sub_id:
             s.add(MeterSubmission(
                 submission_id=clean_sub_id,
@@ -228,12 +287,14 @@ async def submit_meter_group_atomic(
 
         prop_label = format_property_short(apt)
         parts = ", ".join(f"{METER_PLAIN_LABELS.get(mt, mt)}={val}" for mt, val in meters.items())
-        suffix = " (корректировка)" if (decreased and allow_decrease) else ""
+        suffix = " (корректировка)" if (decreased and effective_allow_decrease) else ""
         s.add(AuditLog(
             user_telegram_id=submitted_by,
+            family_id=apt.family_id,
             action=action,
             details=f"{prop_label} (id={apartment_id}): {parts}{suffix}",
         ))
+        await bump_business_revision_in_session(s)
         return SubmissionOutcome(
             status="saved",
             prev_meters=prev_meters,
@@ -258,6 +319,10 @@ async def save_meter_group_readings(
     payload_hash = _compute_submission_hash(meters, reading_date, action)
 
     async with UnitOfWork(write=True) as s:
+        apt = await s.get(Apartment, apartment_id)
+        if not apt:
+            raise LookupError("Объект недвижимости не найден")
+
         if clean_sub_id:
             res_sub = await s.execute(
                 select(MeterSubmission).where(MeterSubmission.submission_id == clean_sub_id)
@@ -310,9 +375,11 @@ async def save_meter_group_readings(
 
         s.add(AuditLog(
             user_telegram_id=submitted_by,
+            family_id=apt.family_id,
             action=action,
             details=audit_details,
         ))
+        await bump_business_revision_in_session(s)
         return True
 
 
@@ -325,17 +392,58 @@ async def replace_meter_atomic(
     replacement_date: datetime.date,
     new_serial_number: str | None = None,
     new_verification_due_date: datetime.date | None = None,
-) -> MeterReplacement:
-    """HIGH-02: record physical meter replacement preserving old-meter residual consumption."""
+    replacement_id: str | None = None,
+) -> tuple[MeterReplacement, bool]:
+    """HIGH-02, P1-06, P2-01: record physical meter replacement atomically. Returns (replacement, deduplicated)."""
     if meter_type not in ALL_METERS:
         raise ValueError("Неизвестный тип счётчика")
+    if meter_type in MULTI_ELECTRICITY_METERS:
+        raise ValueError(
+            "Для многотарифного электросчётчика необходимо заменить все активные тарифы (Т1/Т2/Т3) одновременно"
+        )
+
+    clean_new_serial = (new_serial_number or "").strip() or None
+    clean_rep_id = (replacement_id or "").strip() or None
+    ledger_key = _make_replacement_ledger_key(clean_rep_id) if clean_rep_id else None
+    payload_hash = _compute_replacement_hash(
+        meter_type, [(meter_type, old_final_value, new_initial_value)], clean_new_serial, new_verification_due_date
+    )
 
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
+
+        if ledger_key:
+            res_sub = await s.execute(
+                select(MeterSubmission).where(MeterSubmission.submission_id == ledger_key)
+            )
+            existing_sub = res_sub.scalar_one_or_none()
+            if existing_sub is not None:
+                if (
+                    existing_sub.apartment_id != apartment_id
+                    or existing_sub.submitted_by != actor_tg_id
+                    or existing_sub.payload_hash != payload_hash
+                ):
+                    raise ConflictError("Идентификатор замены уже использован с другими данными")
+                res_last = await s.execute(
+                    select(MeterReplacement)
+                    .where(
+                        MeterReplacement.apartment_id == apartment_id,
+                        MeterReplacement.meter_type == meter_type,
+                    )
+                    .order_by(desc(MeterReplacement.id))
+                    .limit(1)
+                )
+                existing_rep = res_last.scalar_one_or_none()
+                if existing_rep is not None:
+                    return existing_rep, True
 
         enabled = set(get_apartment_enabled_meters(apt))
+        if meter_type == SINGLE_ELECTRICITY_METER and any(m in enabled for m in MULTI_ELECTRICITY_METERS):
+            raise ValueError(
+                "Для многотарифного электросчётчика передайте показания по всем активным тарифам (Т1/Т2/Т3)"
+            )
         if meter_type not in enabled:
             label = METER_PLAIN_LABELS.get(meter_type, meter_type)
             raise ValueError(f"Счётчик «{label}» не подключён для этого объекта")
@@ -368,7 +476,6 @@ async def replace_meter_atomic(
         s.add(init_reading)
         await s.flush()
 
-        clean_new_serial = (new_serial_number or "").strip() or None
         rep = MeterReplacement(
             apartment_id=apartment_id,
             meter_type=meter_type,
@@ -382,36 +489,44 @@ async def replace_meter_atomic(
         )
         s.add(rep)
 
-        if clean_new_serial is not None or new_verification_due_date is not None:
-            now = utcnow_naive()
-            if device is None:
-                device = MeterDevice(
+        if ledger_key:
+            s.add(MeterSubmission(
+                submission_id=ledger_key,
+                apartment_id=apartment_id,
+                submitted_by=actor_tg_id,
+                payload_hash=payload_hash,
+            ))
+
+        # P2-01: always replace physical device metadata (clear stale serial/verification date when omitted)
+        now = utcnow_naive()
+        if device is None:
+            if clean_new_serial is not None or new_verification_due_date is not None:
+                s.add(MeterDevice(
                     apartment_id=apartment_id,
                     meter_type=device_meter_type,
                     serial_number=clean_new_serial,
                     verification_due_date=new_verification_due_date,
                     updated_at=now,
-                )
-                s.add(device)
-            else:
-                if clean_new_serial is not None:
-                    device.serial_number = clean_new_serial
-                if new_verification_due_date is not None:
-                    device.verification_due_date = new_verification_due_date
-                device.updated_at = now
+                ))
+        else:
+            device.serial_number = clean_new_serial
+            device.verification_due_date = new_verification_due_date
+            device.updated_at = now
 
         label = METER_PLAIN_LABELS.get(meter_type, meter_type)
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="replace_meter",
             details=(
                 f"{format_property_short(apt)} (id={apartment_id}), {label}: "
                 f"старый финал={old_final_value}, новый старт={new_initial_value}"
             ),
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(rep)
-        return rep
+        return rep, False
 
 
 async def replace_meter_batch_atomic(
@@ -419,19 +534,73 @@ async def replace_meter_batch_atomic(
     entries: list[dict],
     actor_tg_id: int,
     replacement_date: datetime.date,
+    meter_type: str = SINGLE_ELECTRICITY_METER,
     new_serial_number: str | None = None,
     new_verification_due_date: datetime.date | None = None,
-) -> list[MeterReplacement]:
-    """Atomically replace a multi-tariff electricity meter (T1/T2/T3) in a single transaction."""
+    replacement_id: str | None = None,
+) -> tuple[list[MeterReplacement], bool]:
+    """P1-06 & P2-01: atomically replace a multi-tariff electricity meter (exact active tariff set)."""
+    if meter_type != SINGLE_ELECTRICITY_METER:
+        raise ValueError("Групповая замена тарифов поддерживается только для электрического счётчика ('t')")
     if not entries:
         raise ValueError("Укажите показания счётчика для замены")
 
+    entry_mts = [e["meter_type"] for e in entries]
+    if len(entry_mts) != len(set(entry_mts)):
+        raise ValueError("В списке тарифов для замены обнаружены дубликаты")
+
+    clean_new_serial = (new_serial_number or "").strip() or None
+    clean_rep_id = (replacement_id or "").strip() or None
+    ledger_key = _make_replacement_ledger_key(clean_rep_id) if clean_rep_id else None
+    payload_hash = _compute_replacement_hash(
+        meter_type,
+        [(e["meter_type"], int(e["old_final_value"]), int(e["new_initial_value"])) for e in entries],
+        clean_new_serial,
+        new_verification_due_date,
+    )
+
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
+
+        if ledger_key:
+            res_sub = await s.execute(
+                select(MeterSubmission).where(MeterSubmission.submission_id == ledger_key)
+            )
+            existing_sub = res_sub.scalar_one_or_none()
+            if existing_sub is not None:
+                if (
+                    existing_sub.apartment_id != apartment_id
+                    or existing_sub.submitted_by != actor_tg_id
+                    or existing_sub.payload_hash != payload_hash
+                ):
+                    raise ConflictError("Идентификатор замены уже использован с другими данными")
+                res_last = await s.execute(
+                    select(MeterReplacement)
+                    .where(
+                        MeterReplacement.apartment_id == apartment_id,
+                        MeterReplacement.meter_type.in_(entry_mts),
+                    )
+                    .order_by(desc(MeterReplacement.id))
+                    .limit(len(entry_mts))
+                )
+                return list(res_last.scalars().all()), True
 
         enabled = set(get_apartment_enabled_meters(apt))
+        active_multi = {m for m in MULTI_ELECTRICITY_METERS if m in enabled}
+        if not active_multi:
+            raise ValueError("Для этого объекта не подключён многотарифный электросчётчик")
+        if set(entry_mts) != active_multi:
+            missing = [METER_PLAIN_LABELS.get(m, m) for m in MULTI_ELECTRICITY_METERS if m in (active_multi - set(entry_mts))]
+            extra = [METER_PLAIN_LABELS.get(m, m) for m in entry_mts if m not in active_multi]
+            parts = []
+            if missing:
+                parts.append(f"отсутствуют тарифы: {', '.join(missing)}")
+            if extra:
+                parts.append(f"неподключённые тарифы: {', '.join(extra)}")
+            raise ValueError(f"Укажите показания для всех активных тарифов электросчётчика ({'; '.join(parts)})")
+
         res_dev = await s.execute(
             select(MeterDevice).where(
                 MeterDevice.apartment_id == apartment_id,
@@ -440,7 +609,6 @@ async def replace_meter_batch_atomic(
         )
         device = res_dev.scalar_one_or_none()
         old_serial = device.serial_number if device else None
-        clean_new_serial = (new_serial_number or "").strip() or None
 
         reps: list[MeterReplacement] = []
         audit_parts: list[str] = []
@@ -448,9 +616,6 @@ async def replace_meter_batch_atomic(
             mt = entry["meter_type"]
             old_final = int(entry["old_final_value"])
             new_init = int(entry["new_initial_value"])
-            if mt not in ELECTRICITY_METERS or mt not in enabled:
-                label = METER_PLAIN_LABELS.get(mt, mt)
-                raise ValueError(f"Тариф «{label}» не подключён для этого объекта")
 
             prev_val = await _get_prev_value_in_session(s, apartment_id, mt)
             if prev_val is not None and old_final < prev_val:
@@ -486,36 +651,55 @@ async def replace_meter_batch_atomic(
             reps.append(rep)
             audit_parts.append(f"{METER_PLAIN_LABELS.get(mt, mt)}: {old_final}→{new_init}")
 
-        if clean_new_serial is not None or new_verification_due_date is not None:
-            now = utcnow_naive()
-            if device is None:
-                device = MeterDevice(
+        if ledger_key:
+            s.add(MeterSubmission(
+                submission_id=ledger_key,
+                apartment_id=apartment_id,
+                submitted_by=actor_tg_id,
+                payload_hash=payload_hash,
+            ))
+
+        # P2-01: always replace physical electricity device metadata & clear stale legacy T1/T2/T3 metadata
+        now = utcnow_naive()
+        if device is None:
+            if clean_new_serial is not None or new_verification_due_date is not None:
+                s.add(MeterDevice(
                     apartment_id=apartment_id,
                     meter_type=SINGLE_ELECTRICITY_METER,
                     serial_number=clean_new_serial,
                     verification_due_date=new_verification_due_date,
                     updated_at=now,
-                )
-                s.add(device)
-            else:
-                if clean_new_serial is not None:
-                    device.serial_number = clean_new_serial
-                if new_verification_due_date is not None:
-                    device.verification_due_date = new_verification_due_date
-                device.updated_at = now
+                ))
+        else:
+            device.serial_number = clean_new_serial
+            device.verification_due_date = new_verification_due_date
+            device.updated_at = now
+
+        res_legacy_elec = await s.execute(
+            select(MeterDevice).where(
+                MeterDevice.apartment_id == apartment_id,
+                MeterDevice.meter_type.in_(list(MULTI_ELECTRICITY_METERS)),
+            )
+        )
+        for leg_dev in res_legacy_elec.scalars().all():
+            leg_dev.serial_number = None
+            leg_dev.verification_due_date = None
+            leg_dev.updated_at = now
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="replace_meter",
             details=(
                 f"{format_property_short(apt)} (id={apartment_id}), Электрический счётчик: "
                 f"{', '.join(audit_parts)}"
             ),
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         for r in reps:
             await s.refresh(r)
-        return reps
+        return reps, False
 
 
 async def upsert_meter_devices_atomic(
@@ -523,21 +707,32 @@ async def upsert_meter_devices_atomic(
     items: list[dict],
     actor_tg_id: int,
 ) -> int:
-    """Atomically save serial numbers, verification due dates, and notify intervals for meters."""
+    """P2-02: atomically save canonical meter devices (T1/T2/T3 unified into 't')."""
     now = utcnow_naive()
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
 
         enabled = set(get_apartment_enabled_meters(apt))
-        updated = 0
         has_any_elec = any(em in enabled for em in ELECTRICITY_METERS)
+        seen_canonical: set[str] = set()
+        updated = 0
+
         for item in items:
-            mt = item["meter_type"]
-            is_unified_elec = mt == SINGLE_ELECTRICITY_METER and has_any_elec
-            if mt not in ALL_METERS or (mt not in enabled and not is_unified_elec):
+            raw_mt = item["meter_type"]
+            if raw_mt not in ALL_METERS:
+                raise ValueError(f"Неизвестный тип счётчика «{raw_mt}»")
+            mt = SINGLE_ELECTRICITY_METER if raw_mt in ELECTRICITY_METERS else raw_mt
+            if mt == SINGLE_ELECTRICITY_METER:
+                if not has_any_elec:
+                    raise ValueError("Электрический счётчик не подключён для этого объекта")
+            elif mt not in enabled:
                 raise ValueError(f"Счётчик «{METER_PLAIN_LABELS.get(mt, mt)}» не подключён для этого объекта")
+
+            if mt in seen_canonical:
+                raise ValueError("В запросе обнаружены дублирующиеся записи для одного физического счётчика")
+            seen_canonical.add(mt)
 
             serial = (item.get("serial_number") or "").strip() or None
             due_date = item.get("verification_due_date")
@@ -568,9 +763,11 @@ async def upsert_meter_devices_atomic(
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="update_meter_devices",
             details=f"{format_property_short(apt)} (id={apartment_id}), обновлено счётчиков: {updated}",
         ))
+        await bump_business_revision_in_session(s)
         return updated
 
 
@@ -586,29 +783,57 @@ async def update_apartment_settings_atomic(
     property_type: str | None = None,
     enabled_meters: Iterable[str] | None = None,
     irrigation_mode: str | None = None,
+    fields_set: set[str] | None = None,
 ) -> int:
-    """Validate and save property settings, days, and changed tariffs in one transaction."""
+    """P1-08: merge partial fields and validate effective configuration inside the write transaction."""
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, changed_by, apartment_id, allow_tenant=False
+        )
 
         old_irr_mode = get_apartment_irrigation_mode(apt)
-        if number is not None:
-            apt.number = number
-        if property_type is not None:
-            apt.property_type = property_type
-        if enabled_meters is not None:
-            apt.enabled_meters = serialize_enabled_meters(enabled_meters)
-        if irrigation_mode is not None:
-            apt.irrigation_mode = irrigation_mode
+        use_partial = fields_set is not None
 
-        apt.water_submission_day = water_submission_day
-        apt.electricity_submission_day = electricity_submission_day
-        apt.gas_submission_day = gas_submission_day
+        eff_number = (
+            number
+            if (use_partial and "number" in fields_set) or (not use_partial and number is not None)
+            else apt.number
+        )
+        eff_ptype = (
+            (property_type or apt.property_type or "apartment")
+            if (use_partial and "property_type" in fields_set) or (not use_partial and property_type is not None)
+            else (apt.property_type or "apartment")
+        )
+        eff_irr_mode = (
+            (irrigation_mode or old_irr_mode)
+            if (use_partial and "irrigation_mode" in fields_set) or (not use_partial and irrigation_mode is not None)
+            else old_irr_mode
+        )
+
+        meters_provided = (use_partial and "enabled_meters" in fields_set and enabled_meters is not None) or (
+            not use_partial and enabled_meters is not None
+        )
+        candidate_meters = list(enabled_meters) if meters_provided else get_apartment_enabled_meters(apt)
+        validated_meters = validate_apartment_configuration(eff_ptype, candidate_meters, eff_irr_mode)
+
+        if eff_number is not None:
+            apt.number = eff_number
+        apt.property_type = eff_ptype
+        if meters_provided:
+            apt.enabled_meters = serialize_enabled_meters(validated_meters)
+        apt.irrigation_mode = eff_irr_mode
+
+        if not use_partial or "water_submission_day" in fields_set:
+            apt.water_submission_day = water_submission_day
+        if not use_partial or "electricity_submission_day" in fields_set:
+            apt.electricity_submission_day = electricity_submission_day
+        if not use_partial or "gas_submission_day" in fields_set:
+            apt.gas_submission_day = gas_submission_day
 
         inserted_tariffs = 0
         for mt, rate in tariffs.items():
+            if mt in IRRIGATION_METERS and eff_irr_mode == IRRIGATION_MODE_AFTER_COLD:
+                continue
             res_latest = await s.execute(
                 select(Tariff)
                 .where(
@@ -638,12 +863,14 @@ async def update_apartment_settings_atomic(
 
         s.add(AuditLog(
             user_telegram_id=changed_by,
+            family_id=apt.family_id,
             action="update_settings",
             details=(
                 f"{format_property_short(apt)} (id={apartment_id}), "
                 f"тарифов обновлено: {inserted_tariffs}{extra}"
             ),
         ))
+        await bump_business_revision_in_session(s)
         return inserted_tariffs
 
 
@@ -652,12 +879,17 @@ async def update_initial_readings_atomic(
     readings: dict[str, int],
     set_by: int,
 ) -> None:
-    """HIGH-06: atomically update initial readings with detailed old -> new audit."""
+    """HIGH-06 & P1-05: atomically update initial readings for enabled meters with detailed audit."""
     now = utcnow_naive()
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, set_by, apartment_id, allow_tenant=False
+        )
+        enabled = set(get_apartment_enabled_meters(apt))
+        for mt in readings:
+            if mt not in enabled:
+                label = METER_PLAIN_LABELS.get(mt, mt)
+                raise ValueError(f"Счётчик «{label}» не подключён для этого объекта")
 
         changes: list[str] = []
         for mt, val in readings.items():
@@ -686,21 +918,26 @@ async def update_initial_readings_atomic(
 
         s.add(AuditLog(
             user_telegram_id=set_by,
+            family_id=apt.family_id,
             action="set_initial_readings",
             details=f"{format_property_short(apt)} (id={apartment_id}): {', '.join(changes)}",
         ))
+        await bump_business_revision_in_session(s)
 
 
 async def create_family_atomic(name: str, actor_tg_id: int) -> Family:
     async with UnitOfWork(write=True) as s:
+        await assert_active_actor_in_session(s, actor_tg_id, ("admin",))
         fam = Family(name=name, admin_name=name)
         s.add(fam)
         await s.flush()
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=fam.id,
             action="create_family",
             details=f"Семья '{name}' (id={fam.id})",
         ))
+        await bump_business_revision_in_session(s)
         await s.refresh(fam)
         return fam
 
@@ -716,6 +953,8 @@ async def create_family_with_owner_atomic(
         raise ConflictError("Такой пользователь уже зарегистрирован")
 
     async with UnitOfWork(write=True) as s:
+        await assert_active_actor_in_session(s, actor_tg_id, ("admin", "landlord"))
+
         res_ex = await s.execute(select(User).where(User.telegram_id == owner_telegram_id))
         if res_ex.scalar_one_or_none() is not None:
             raise ConflictError("Такой пользователь уже зарегистрирован")
@@ -738,14 +977,17 @@ async def create_family_with_owner_atomic(
             raise ConflictError("Такой пользователь уже зарегистрирован") from exc
 
         s.add(FamilyOwner(family_id=fam.id, user_id=new_owner.id))
+        # Admin-scoped audit (family_id=None) so neither creator's family nor new family leaks cross-family metadata
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=None,
             action="create_family_with_owner",
             details=(
                 f"Создана семья '{family_name}' (id={fam.id}), "
                 f"новый владелец {owner_name} (ID: {owner_telegram_id})"
             ),
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(fam)
         await s.refresh(new_owner)
@@ -760,10 +1002,9 @@ async def rename_family_atomic(
 ) -> None:
     """Rename family preserving admin_name vs landlord's own family name."""
     async with UnitOfWork(write=True) as s:
-        fam = await s.get(Family, family_id)
-        if not fam:
-            raise LookupError("Семья не найдена")
-        if is_actor_admin:
+        fam, actor_role = await assert_can_manage_family_in_session(s, actor_tg_id, family_id)
+        effective_admin = is_actor_admin and actor_role == "admin"
+        if effective_admin:
             old_name = fam.admin_name or fam.name
             if fam.admin_name is None or fam.name == fam.admin_name:
                 fam.name = new_name
@@ -775,9 +1016,11 @@ async def rename_family_atomic(
             fam.name = new_name
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=family_id,
             action="rename_family",
             details=f"Семья id={family_id}: '{old_name}' → '{new_name}'",
         ))
+        await bump_business_revision_in_session(s)
 
 
 async def add_family_owner_atomic(
@@ -789,9 +1032,7 @@ async def add_family_owner_atomic(
 ) -> User:
     """HIGH-03 & Admin-as-owner: atomically add a landlord or attach ADMIN_TELEGRAM_ID to a family."""
     async with UnitOfWork(write=True) as s:
-        fam = await s.get(Family, family_id)
-        if not fam:
-            raise LookupError("Семья не найдена")
+        await assert_can_manage_family_in_session(s, actor_tg_id, family_id)
 
         if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
             res_adm = await s.execute(select(User).where(User.telegram_id == telegram_id))
@@ -800,6 +1041,7 @@ async def add_family_owner_atomic(
                 admin_user = User(
                     telegram_id=telegram_id,
                     name=name,
+                    admin_name=name,
                     phone=phone,
                     role="admin",
                 )
@@ -823,9 +1065,11 @@ async def add_family_owner_atomic(
             s.add(FamilyOwner(family_id=family_id, user_id=admin_user.id))
             s.add(AuditLog(
                 user_telegram_id=actor_tg_id,
+                family_id=family_id,
                 action="add_family_owner",
                 details=f"Администратор {admin_user.name or name} (ID: {telegram_id}) добавлен как владелец в семью id={family_id}",
             ))
+            await bump_business_revision_in_session(s)
             await s.flush()
             await s.refresh(admin_user)
             return admin_user
@@ -854,9 +1098,11 @@ async def add_family_owner_atomic(
         s.add(FamilyOwner(family_id=family_id, user_id=user.id))
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=family_id,
             action="add_family_owner",
             details=f"Владелец {name} (ID: {telegram_id}) добавлен в семью id={family_id}",
         ))
+        await bump_business_revision_in_session(s)
         await s.refresh(user)
         return user
 
@@ -871,6 +1117,9 @@ async def update_family_owner_atomic(
     is_actor_admin: bool = False,
 ) -> User:
     async with UnitOfWork(write=True) as s:
+        _, actor_role = await assert_can_manage_family_in_session(s, actor_tg_id, family_id)
+        effective_admin = is_actor_admin and actor_role == "admin"
+
         subq = select(FamilyOwner.user_id).where(FamilyOwner.family_id == family_id)
         res = await s.execute(
             select(User).where(
@@ -885,10 +1134,10 @@ async def update_family_owner_atomic(
         if not target:
             raise LookupError("Член семьи не найден")
 
-        if config.ADMIN_TELEGRAM_ID and target.telegram_id == config.ADMIN_TELEGRAM_ID and not is_actor_admin:
+        if config.ADMIN_TELEGRAM_ID and target.telegram_id == config.ADMIN_TELEGRAM_ID and not effective_admin:
             raise PermissionError("Нельзя редактировать данные администратора")
 
-        if is_actor_admin:
+        if effective_admin:
             if target.telegram_id == actor_tg_id:
                 target.name = name
                 target.admin_name = name
@@ -906,9 +1155,11 @@ async def update_family_owner_atomic(
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=family_id,
             action="update_family_owner",
             details=f"Владелец ID={owner_tg_id} (семья id={family_id}) обновлён: имя='{name}'",
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(target)
         return target
@@ -921,6 +1172,8 @@ async def delete_family_owner_atomic(
 ) -> None:
     """Verify family membership; detach admin from FamilyOwner without deleting admin User."""
     async with UnitOfWork(write=True) as s:
+        await assert_can_manage_family_in_session(s, actor_tg_id, family_id)
+
         if config.ADMIN_TELEGRAM_ID and owner_tg_id == config.ADMIN_TELEGRAM_ID:
             res_adm = await s.execute(select(User).where(User.telegram_id == owner_tg_id))
             adm = res_adm.scalar_one_or_none()
@@ -938,9 +1191,11 @@ async def delete_family_owner_atomic(
             await s.delete(link)
             s.add(AuditLog(
                 user_telegram_id=actor_tg_id,
+                family_id=family_id,
                 action="delete_family_owner",
                 details=f"Администратор ID={owner_tg_id} откреплён от владельцев семьи id={family_id}",
             ))
+            await bump_business_revision_in_session(s)
             return
 
         res = await s.execute(select(User).where(User.telegram_id == owner_tg_id))
@@ -951,14 +1206,17 @@ async def delete_family_owner_atomic(
         await s.delete(target)
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=family_id,
             action="delete_family_owner",
             details=f"Владелец ID={owner_tg_id} удалён из семьи id={family_id}",
         ))
+        await bump_business_revision_in_session(s)
 
 
 async def delete_family_atomic(family_id: int, actor_tg_id: int) -> None:
-    """Delete family and cascade-revoke its orphaned users."""
+    """Delete family, revoke orphaned users, and unlink family audit scope (prevents ROWID reuse leak)."""
     async with UnitOfWork(write=True) as s:
+        await assert_active_actor_in_session(s, actor_tg_id, ("admin",))
         fam = await s.get(Family, family_id)
         if not fam:
             raise LookupError("Семья не найдена")
@@ -973,12 +1231,19 @@ async def delete_family_atomic(family_id: int, actor_tg_id: int) -> None:
             await s.execute(delete(ApartmentUser).where(ApartmentUser.user_id == u.id))
             await s.delete(u)
 
+        # Detach audit logs from deleted family_id so future SQLite ROWID reuse can never expose them
+        await s.execute(
+            update(AuditLog).where(AuditLog.family_id == family_id).values(family_id=None)
+        )
+
         await s.delete(fam)
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=None,
             action="delete_family",
             details=f"Семья id={family_id} удалена",
         ))
+        await bump_business_revision_in_session(s)
 
 
 async def add_tenant_atomic(
@@ -989,14 +1254,14 @@ async def add_tenant_atomic(
     actor_tg_id: int,
     force_no_contract: bool = False,
 ) -> tuple[bool, Apartment, str]:
-    """HIGH-03: serialize tenant lookup/creation/linking/audit in one transaction."""
+    """HIGH-03 & P1-03: serialize permission check, tenant creation, linking, and audit in one transaction."""
     if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
         raise ValueError("Нельзя добавить администратора в качестве нанимателя")
 
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
 
         res_ex = await s.execute(select(User).where(User.telegram_id == telegram_id))
         existing = res_ex.scalar_one_or_none()
@@ -1058,9 +1323,11 @@ async def add_tenant_atomic(
         display_name = target_user.name or name
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="add_tenant",
             details=f"Наниматель {display_name} (ID: {telegram_id}) добавлен в {prop_label}",
         ))
+        await bump_business_revision_in_session(s)
         return False, apt, display_name
 
 
@@ -1074,16 +1341,22 @@ async def update_tenant_profile_atomic(
     is_actor_admin: bool,
 ) -> User:
     async with UnitOfWork(write=True) as s:
+        actor_role, actor_user = await assert_active_actor_in_session(
+            s, actor_tg_id, ("admin", "landlord")
+        )
+        effective_admin = is_actor_admin and actor_role == "admin"
+        effective_family_id = actor_user.family_id if actor_user else actor_family_id
+
         res = await s.execute(
             select(User).where(User.telegram_id == tenant_tg_id, User.role == "tenant")
         )
         target = res.scalar_one_or_none()
         if not target:
             raise LookupError("Наниматель не найден")
-        if not is_actor_admin and target.family_id != actor_family_id:
+        if not effective_admin and target.family_id != effective_family_id:
             raise PermissionError("Нет доступа к этому нанимателю")
 
-        if is_actor_admin:
+        if effective_admin:
             if target.landlord_name is None and target.name:
                 target.landlord_name = target.name
             target.admin_name = name
@@ -1096,9 +1369,11 @@ async def update_tenant_profile_atomic(
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=target.family_id,
             action="update_tenant",
             details=f"Наниматель ID={tenant_tg_id} обновлён: имя='{name}'",
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(target)
         return target
@@ -1109,14 +1384,14 @@ async def remove_tenant_from_apartment_atomic(
     tenant_tg_id: int,
     actor_tg_id: int,
 ) -> tuple[str, bool]:
-    """Verify tenant link to apt_id, unlink atomically. Returns (property_label, fully_removed)."""
+    """Verify access and tenant link, unlink atomically. Returns (property_label, fully_removed)."""
     if config.ADMIN_TELEGRAM_ID and tenant_tg_id == config.ADMIN_TELEGRAM_ID:
         raise PermissionError("Нельзя удалить администратора")
 
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
 
         res_u = await s.execute(select(User).where(User.telegram_id == tenant_tg_id))
         target = res_u.scalar_one_or_none()
@@ -1155,9 +1430,11 @@ async def remove_tenant_from_apartment_atomic(
         prop_label = format_property_short(apt)
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="remove_tenant",
             details=f"Наниматель ID={tenant_tg_id} удалён из {prop_label} (full={fully_removed})",
         ))
+        await bump_business_revision_in_session(s)
         return prop_label, fully_removed
 
 
@@ -1166,18 +1443,43 @@ async def update_contract_atomic(
     updates: dict,
     actor_tg_id: int,
 ) -> Apartment:
+    """P1-03 & P2-17: merge only provided contract fields and validate final state inside transaction."""
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
         for k, v in updates.items():
             if k in ALLOWED_APARTMENT_FIELDS:
                 setattr(apt, k, v)
+
+        if apt.agreement_date_start and apt.agreement_date_finish:
+            if apt.agreement_date_start > apt.agreement_date_finish:
+                raise ValueError("Дата начала договора не может быть позже даты окончания")
+
+        if apt.rent_payment_day is not None and not (1 <= apt.rent_payment_day <= 31):
+            raise ValueError("Дата ежемесячного платежа должна быть числом от 1 до 31")
+
+        if apt.rent_reminder_enabled:
+            if apt.rent_payment_day is None:
+                raise ValueError("Укажите дату ежемесячного платежа, чтобы включить напоминание об оплате")
+            if apt.rent_reminder_mode not in RENT_REMINDER_MODES:
+                raise ValueError("Выберите вариант напоминания об оплате")
+            if apt.rent_reminder_mode == RENT_REMINDER_AFTER_DAYS:
+                if apt.rent_reminder_days_after is None or not (1 <= apt.rent_reminder_days_after <= 20):
+                    raise ValueError("Укажите количество дней после даты платежа (от 1 до 20)")
+            else:
+                apt.rent_reminder_days_after = None
+        else:
+            apt.rent_reminder_mode = None
+            apt.rent_reminder_days_after = None
+
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="update_contract",
             details=f"Объект id={apartment_id}",
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(apt)
         return apt
@@ -1190,9 +1492,9 @@ async def delete_contract_atomic(
 ) -> tuple[str, list[tuple[int, bool]]]:
     """HIGH-04 & MEDIUM-07: clear lease contract and optionally unlink all tenants atomically."""
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
 
         apt.agreement_no = None
         apt.agreement_date_start = None
@@ -1233,12 +1535,14 @@ async def delete_contract_atomic(
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="delete_contract",
             details=(
                 f"Договор объекта {prop_label} (id={apartment_id}) удалён"
                 + (f", откреплено нанимателей: {len(affected_tenants)}" if unlink_tenants else "")
             ),
         ))
+        await bump_business_revision_in_session(s)
         return prop_label, affected_tenants
 
 
@@ -1252,6 +1556,7 @@ async def create_apartment_atomic(
 ) -> Apartment:
     meters_str = serialize_enabled_meters(enabled_meters) if enabled_meters is not None else None
     async with UnitOfWork(write=True) as s:
+        await assert_can_manage_family_in_session(s, actor_tg_id, family_id)
         max_order_res = await s.execute(select(func.coalesce(func.max(Apartment.sort_order), 0)))
         next_order = int(max_order_res.scalar() or 0) + 1
         apt = Apartment(
@@ -1266,12 +1571,14 @@ async def create_apartment_atomic(
         await s.flush()
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=family_id,
             action="create_apartment",
             details=(
                 f"Создан объект {format_property_short(apt)} "
                 f"(id={apt.id}, type={apt.property_type}, family_id={family_id})"
             ),
         ))
+        await bump_business_revision_in_session(s)
         await s.refresh(apt)
         return apt
 
@@ -1281,19 +1588,108 @@ async def correct_reading_atomic(
     new_value: int,
     actor_tg_id: int,
 ) -> tuple[int, int, int]:
-    """MEDIUM-07: update reading value and write audit log atomically. Returns (apt_id, old, new)."""
+    """P1-03, P1-04, P1-05: forbid replacement-init edits, enforce meter-generation neighbor bounds, audit."""
     async with UnitOfWork(write=True) as s:
         rec = await s.get(MeterReading, reading_id)
         if not rec:
             raise LookupError("Показание не найдено")
+
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, rec.apartment_id, allow_tenant=False
+        )
+
+        if getattr(rec, "is_replacement_init", False):
+            raise ValueError(
+                "Нельзя редактировать стартовое показание замены счётчика через обычную корректировку"
+            )
+
+        # Previous bound in the same meter generation (stops at any replacement-init row)
+        res_prev = await s.execute(
+            select(MeterReading)
+            .where(
+                MeterReading.apartment_id == rec.apartment_id,
+                MeterReading.meter_type == rec.meter_type,
+                or_(
+                    MeterReading.reading_date < rec.reading_date,
+                    and_(MeterReading.reading_date == rec.reading_date, MeterReading.id < rec.id),
+                ),
+            )
+            .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
+            .limit(1)
+        )
+        prev_rec = res_prev.scalar_one_or_none()
+        prev_bound: int | None = None
+        prev_desc = ""
+        if prev_rec is not None:
+            prev_bound = prev_rec.value
+            prev_desc = f"предыдущего показания ({prev_rec.value} от {prev_rec.reading_date.strftime('%d.%m.%Y')})"
+        else:
+            res_init = await s.execute(
+                select(InitialReading).where(
+                    InitialReading.apartment_id == rec.apartment_id,
+                    InitialReading.meter_type == rec.meter_type,
+                )
+            )
+            init_rec = res_init.scalar_one_or_none()
+            if init_rec is not None:
+                prev_bound = init_rec.value
+                prev_desc = f"начального показания ({init_rec.value})"
+
+        if prev_bound is not None and new_value < prev_bound:
+            raise ValueError(
+                f"Новое значение ({new_value}) меньше {prev_desc}. "
+                f"Исправление нарушит расчёт расхода."
+            )
+
+        # Next bound in the same meter generation
+        res_next = await s.execute(
+            select(MeterReading)
+            .where(
+                MeterReading.apartment_id == rec.apartment_id,
+                MeterReading.meter_type == rec.meter_type,
+                or_(
+                    MeterReading.reading_date > rec.reading_date,
+                    and_(MeterReading.reading_date == rec.reading_date, MeterReading.id > rec.id),
+                ),
+            )
+            .order_by(asc(MeterReading.reading_date), asc(MeterReading.id))
+            .limit(1)
+        )
+        next_rec = res_next.scalar_one_or_none()
+        next_bound: int | None = None
+        next_desc = ""
+        if next_rec is not None:
+            if getattr(next_rec, "is_replacement_init", False):
+                res_rep = await s.execute(
+                    select(MeterReplacement).where(MeterReplacement.init_reading_id == next_rec.id).limit(1)
+                )
+                rep_row = res_rep.scalar_one_or_none()
+                if rep_row is not None:
+                    next_bound = rep_row.old_final_value
+                    next_desc = (
+                        f"конечного показания при замене счётчика "
+                        f"({rep_row.old_final_value} от {rep_row.replacement_date.strftime('%d.%m.%Y')})"
+                    )
+            else:
+                next_bound = next_rec.value
+                next_desc = f"следующего показания ({next_rec.value} от {next_rec.reading_date.strftime('%d.%m.%Y')})"
+
+        if next_bound is not None and new_value > next_bound:
+            raise ValueError(
+                f"Новое значение ({new_value}) больше {next_desc}. "
+                f"Исправление обнулит расход следующего периода."
+            )
+
         old_val = rec.value
         apt_id = rec.apartment_id
         rec.value = new_value
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt.family_id,
             action="correct_reading",
             details=f"Показание #{reading_id}: {old_val} → {new_value}",
         ))
+        await bump_business_revision_in_session(s)
         return apt_id, old_val, new_value
 
 
@@ -1303,17 +1699,18 @@ async def update_own_profile_atomic(
     is_actor_admin: bool = False,
 ) -> User:
     async with UnitOfWork(write=True) as s:
-        res = await s.execute(select(User).where(User.telegram_id == telegram_id))
-        user = res.scalar_one_or_none()
+        actor_role, user = await assert_active_actor_in_session(
+            s, telegram_id, ("admin", "landlord", "tenant")
+        )
         if not user:
-            if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
+            if actor_role == "admin":
                 user = User(telegram_id=telegram_id, name=name, admin_name=name, role="admin")
                 s.add(user)
                 await s.flush()
             else:
                 raise LookupError("Профиль пользователя не найден")
         else:
-            if is_actor_admin or (config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID):
+            if actor_role == "admin" or is_actor_admin:
                 user.name = name
                 user.admin_name = name
             else:
@@ -1324,9 +1721,11 @@ async def update_own_profile_atomic(
                 user.name = name
         s.add(AuditLog(
             user_telegram_id=telegram_id,
+            family_id=user.family_id if actor_role != "admin" else None,
             action="update_own_name",
             details=f"Пользователь ID={telegram_id} изменил имя на '{name}'",
         ))
+        await bump_business_revision_in_session(s)
         await s.flush()
         await s.refresh(user)
         return user
@@ -1338,11 +1737,12 @@ async def delete_apartment_atomic(
 ) -> tuple[str, list[tuple[int, bool]]]:
     """Delete a property atomically with all its readings/tariffs/links and clean up orphaned tenants."""
     async with UnitOfWork(write=True) as s:
-        apt = await s.get(Apartment, apartment_id)
-        if not apt:
-            raise LookupError("Объект недвижимости не найден")
+        apt, _ = await assert_can_access_apartment_in_session(
+            s, actor_tg_id, apartment_id, allow_tenant=False
+        )
 
         prop_label = format_property_short(apt)
+        apt_family_id = apt.family_id
 
         res_tenants = await s.execute(
             select(User)
@@ -1371,12 +1771,14 @@ async def delete_apartment_atomic(
 
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=apt_family_id,
             action="delete_apartment",
             details=(
                 f"Удалён объект {prop_label} (id={apartment_id}), "
                 f"откреплено нанимателей: {len(affected_tenants)}"
             ),
         ))
+        await bump_business_revision_in_session(s)
         return prop_label, affected_tenants
 
 
@@ -1384,25 +1786,38 @@ async def reorder_apartments_atomic(
     apartment_ids: list[int],
     actor_tg_id: int,
 ) -> list[int]:
-    """Persist custom display order for properties in a single transaction."""
+    """Persist custom display order for properties in a single transaction with permission check."""
     unique_ids: list[int] = list(dict.fromkeys(apartment_ids))
     if not unique_ids:
         return []
 
     async with UnitOfWork(write=True) as s:
+        actor_role, actor_user = await assert_active_actor_in_session(
+            s, actor_tg_id, ("admin", "landlord")
+        )
         res = await s.execute(select(Apartment).where(Apartment.id.in_(unique_ids)))
         apt_map = {a.id: a for a in res.scalars().all()}
 
+        if actor_role == "landlord":
+            actor_fam = actor_user.family_id if actor_user else None
+            if any(apt_map.get(aid) is None or apt_map[aid].family_id != actor_fam for aid in unique_ids):
+                raise PermissionError("Нет доступа к одному из объектов недвижимости")
+
         updated_ids: list[int] = []
+        family_ids: set[int] = set()
         for idx, apt_id in enumerate(unique_ids, start=1):
             apt = apt_map.get(apt_id)
             if apt is not None:
                 apt.sort_order = idx
                 updated_ids.append(apt_id)
+                family_ids.add(apt.family_id)
 
+        audit_fam_id = next(iter(family_ids)) if len(family_ids) == 1 else None
         s.add(AuditLog(
             user_telegram_id=actor_tg_id,
+            family_id=audit_fam_id,
             action="reorder_apartments",
             details=f"Порядок объектов обновлён ({len(updated_ids)} шт.)",
         ))
+        await bump_business_revision_in_session(s)
         return updated_ids

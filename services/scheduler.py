@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import datetime
 import logging
 from html import escape as h
+from weakref import WeakKeyDictionary
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -27,12 +29,30 @@ from database.models import (
     get_apartment_enabled_meters,
     parse_notify_intervals,
 )
-from services.access import get_notification_recipients, is_lease_active_for_apartment
-from services.backup import create_backup
+from services.access import (
+    get_notification_recipients,
+    is_active_tenant_recipient,
+    is_lease_active_for_apartment,
+)
+from services.backup import cleanup_old_photos, create_backup
 from services.calculations import fmt_date
 from services.notifications import webapp_open_kb
 
 logger = logging.getLogger(__name__)
+_JOB_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = WeakKeyDictionary()
+
+
+def _get_job_lock(job_key: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    per_loop = _JOB_LOCKS.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _JOB_LOCKS[loop] = per_loop
+    lock = per_loop.get(job_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        per_loop[job_key] = lock
+    return lock
 
 
 def effective_submission_day(configured_day: int, year: int, month: int) -> int:
@@ -73,7 +93,7 @@ async def _get_apartment_reminder_recipients(apt: Apartment) -> list[int]:
     recipients = await get_notification_recipients(apt.id)
     if is_lease_active_for_apartment(apt):
         for tenant in await crud.get_apartment_tenants(apt.id):
-            if tenant.is_blocked:
+            if not is_active_tenant_recipient(tenant, apt.family_id):
                 continue
             if tenant.telegram_id not in recipients:
                 recipients.append(tenant.telegram_id)
@@ -106,7 +126,7 @@ async def _maybe_send_group_reminder(
     if not text:
         return
 
-    kb = webapp_open_kb(button_label, tab=tab)
+    kb = webapp_open_kb(button_label, tab=tab, apt_id=apt.id)
     for uid in await _get_apartment_reminder_recipients(apt):
         try:
             await bot.send_message(chat_id=uid, text=text, reply_markup=kb, parse_mode="HTML")
@@ -195,7 +215,7 @@ async def check_lease_expirations(bot: Bot, today: datetime.date | None = None) 
                     await bot.send_message(
                         chat_id=uid,
                         text=msg_text,
-                        reply_markup=webapp_open_kb("📱 Открыть управление договором", tab="apartments"),
+                        reply_markup=webapp_open_kb("📱 Открыть управление договором", tab="apartments", apt_id=apt.id),
                         parse_mode="HTML",
                     )
                 except Exception as e:
@@ -205,13 +225,31 @@ async def check_lease_expirations(bot: Bot, today: datetime.date | None = None) 
 async def check_meter_verifications(bot: Bot, today: datetime.date | None = None) -> None:
     cur = today or local_today()
     pairs = await crud.get_all_meter_devices_with_apartments()
+
+    # P2-02: if an apartment has canonical electricity device 't', ignore legacy t1/t2/t3 duplicates
+    apts_with_canonical_elec = {
+        apt.id for dev, apt in pairs if dev.meter_type == "t" and dev.verification_due_date
+    }
+    sent_keys: set[tuple[int, str, datetime.date]] = set()
+
     for dev, apt in pairs:
         if not dev.verification_due_date:
             continue
         enabled = set(get_apartment_enabled_meters(apt))
-        is_unified_elec = dev.meter_type == "t" and any(em in enabled for em in ELECTRICITY_METERS)
-        if dev.meter_type not in enabled and not is_unified_elec:
+        is_elec_dev = dev.meter_type in ELECTRICITY_METERS
+        if is_elec_dev:
+            if not any(em in enabled for em in ELECTRICITY_METERS):
+                continue
+            if dev.meter_type != "t" and apt.id in apts_with_canonical_elec:
+                continue
+        elif dev.meter_type not in enabled:
             continue
+
+        canonical_mt = "t" if is_elec_dev else dev.meter_type
+        dedup_key = (apt.id, canonical_mt, dev.verification_due_date)
+        if dedup_key in sent_keys:
+            continue
+
         intervals = parse_notify_intervals(dev.notify_intervals)
         if not intervals:
             continue
@@ -227,6 +265,7 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
         if matched_phrase is None:
             continue
 
+        sent_keys.add(dedup_key)
         device_names = {
             "cold_water": "Водомер холодной воды",
             "hot_water": "Водомер горячей воды",
@@ -234,7 +273,7 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
             "t": "Электрический счётчик",
             "gas": "Газовый счётчик",
         }
-        meter_name = h(device_names.get(dev.meter_type, METER_PLAIN_LABELS.get(dev.meter_type, dev.meter_type)))
+        meter_name = h(device_names.get(canonical_mt, METER_PLAIN_LABELS.get(canonical_mt, canonical_mt)))
         prop_label = h(format_property_short(apt))
         serial_part = f" (№ {h(dev.serial_number)})" if dev.serial_number else ""
         due_str = fmt_date(dev.verification_due_date)
@@ -249,7 +288,7 @@ async def check_meter_verifications(bot: Bot, today: datetime.date | None = None
                 await bot.send_message(
                     chat_id=uid,
                     text=msg_text,
-                    reply_markup=webapp_open_kb("🔧 Управление счётчиками", tab="apartments"),
+                    reply_markup=webapp_open_kb("🔧 Управление счётчиками", tab="apartments", apt_id=apt.id),
                     parse_mode="HTML",
                 )
             except Exception as e:
@@ -310,7 +349,10 @@ async def check_rent_payment_reminders(bot: Bot, today: datetime.date | None = N
         if pay_dt is None:
             continue
 
-        tenants = [t for t in await crud.get_apartment_tenants(apt.id) if not t.is_blocked]
+        tenants = [
+            t for t in await crud.get_apartment_tenants(apt.id)
+            if is_active_tenant_recipient(t, apt.family_id)
+        ]
         recipients: list[int] = [t.telegram_id for t in tenants]
 
         for uid in await get_notification_recipients(apt.id):
@@ -350,13 +392,21 @@ async def check_rent_payment_reminders(bot: Bot, today: datetime.date | None = N
                 logger.warning("Rent payment reminder failed for %s: %s", uid, e)
 
 
+async def _run_daily_backup_and_cleanup() -> None:
+    """P2-12: run daily incremental SQLite backup and clean up any legacy local meter photos."""
+    await create_backup(skip_if_unchanged=True)
+    await cleanup_old_photos()
+
+
 async def _run_job_once_today(job_key: str, fn, *args, run_date: datetime.date | None = None, **kwargs) -> bool:
+    """P2-03: serialize cron & startup catch-up per job_key so concurrent triggers cannot overlap."""
     cur = run_date or local_today()
-    if await crud.has_scheduler_run(job_key, cur):
-        return False
-    await fn(*args, **kwargs)
-    await crud.record_scheduler_run(job_key, cur)
-    return True
+    async with _get_job_lock(job_key):
+        if await crud.has_scheduler_run(job_key, cur):
+            return False
+        await fn(*args, **kwargs)
+        await crud.record_scheduler_run(job_key, cur)
+        return True
 
 
 async def run_daily_meter_reminders(bot: Bot) -> None:
@@ -376,7 +426,7 @@ async def run_daily_rent_payment_reminders(bot: Bot) -> None:
 
 
 async def run_daily_backup() -> None:
-    await _run_job_once_today("daily_backup", create_backup, skip_if_unchanged=True)
+    await _run_job_once_today("daily_backup", _run_daily_backup_and_cleanup)
 
 
 async def run_missed_jobs_on_startup(bot: Bot, now: datetime.datetime | None = None) -> list[str]:
@@ -385,7 +435,7 @@ async def run_missed_jobs_on_startup(bot: Bot, now: datetime.datetime | None = N
     executed: list[str] = []
 
     schedule_plan = (
-        ("daily_backup", 3, 0, create_backup, (), {"skip_if_unchanged": True}),
+        ("daily_backup", 3, 0, _run_daily_backup_and_cleanup, (), {}),
         ("meter_reminders", 15, 0, check_meter_reminders, (bot,), {"today": today}),
         ("lease_expirations", 15, 0, check_lease_expirations, (bot,), {"today": today}),
         ("meter_verifications", 15, 0, check_meter_verifications, (bot,), {"today": today}),

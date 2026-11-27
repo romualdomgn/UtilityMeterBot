@@ -12,6 +12,8 @@ from fpdf import FPDF
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from sqlalchemy import desc, func, select
+
 from config import BOT_TZ, EXPORT_DIR
 from database import crud
 from database.models import (
@@ -22,6 +24,7 @@ from database.models import (
     IRRIGATION_MODE_AFTER_COLD,
     METER_PLAIN_LABELS,
     METER_UNITS,
+    MeterReading,
     WATER_METERS,
     format_property_short,
     format_property_title,
@@ -58,8 +61,18 @@ async def _collect_export_snapshots(apartments: list, history_limit: int) -> lis
     snapshots: list[dict] = []
     for apt in apartments:
         billing = await calculate_billing(apt.id)
-        total_count = await crud.get_readings_count(apt.id)
-        readings = await crud.get_all_readings(apt.id, limit=history_limit)
+        async with crud.UnitOfWork() as s:
+            cnt_res = await s.execute(
+                select(func.count(MeterReading.id)).where(MeterReading.apartment_id == apt.id)
+            )
+            total_count = int(cnt_res.scalar() or 0)
+            rows_res = await s.execute(
+                select(MeterReading)
+                .where(MeterReading.apartment_id == apt.id)
+                .order_by(desc(MeterReading.reading_date), desc(MeterReading.id))
+                .limit(history_limit)
+            )
+            readings = list(rows_res.scalars().all())
         snapshots.append({
             "short": format_property_short(apt),
             "title": format_property_title(apt),
@@ -75,6 +88,7 @@ async def _collect_export_snapshots(apartments: list, history_limit: int) -> lis
                     "meter_type": r.meter_type,
                     "value": r.value,
                     "submitted_by": r.submitted_by,
+                    "is_replacement_init": bool(getattr(r, "is_replacement_init", False)),
                 }
                 for r in readings
             ],
@@ -188,7 +202,7 @@ def _build_excel_sync(snapshots: list[dict], filepath: Path) -> Path:
         )
         ws.append([hist_title])
         ws[f"A{ws.max_row}"].font = bold_font
-        ws.append(["ID", "Дата", "Счётчик", "Значение", "Ед.", "Кем подано (TG ID)"])
+        ws.append(["ID", "Дата", "Счётчик", "Значение", "Ед.", "Кем подано (TG ID)", "Примечание"])
         for cell in ws[ws.max_row]:
             cell.fill = header_fill
             cell.font = header_font
@@ -201,6 +215,7 @@ def _build_excel_sync(snapshots: list[dict], filepath: Path) -> Path:
                 r["value"],
                 METER_UNITS.get(r["meter_type"], ""),
                 r["submitted_by"],
+                "Начальное (замена счётчика)" if r.get("is_replacement_init") else "",
             ])
 
         for col in ws.columns:
@@ -220,10 +235,10 @@ def _build_pdf_sync(snapshots: list[dict], filepath: Path) -> Path:
     for snap in snapshots:
         pdf.add_page()
         pdf.set_font("DejaVu", "B", 14)
-        pdf.cell(0, 10, f"Отчёт — {snap['title']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 8, f"Отчёт — {snap['title']}", new_x="LMARGIN", new_y="NEXT")
 
         pdf.set_font("DejaVu", "", 10)
-        pdf.cell(
+        pdf.multi_cell(
             0, 6,
             f"Договор: {snap['agreement_no']} | Период: {snap['agreement_start']} — {snap['agreement_finish']}",
             new_x="LMARGIN", new_y="NEXT",
@@ -233,7 +248,7 @@ def _build_pdf_sync(snapshots: list[dict], filepath: Path) -> Path:
         billing = snap["billing"]
         status_note = "" if billing.is_complete else " — предварительный расчёт"
         pdf.set_font("DejaVu", "B", 11)
-        pdf.cell(0, 8, f"Текущий расчёт ({billing.period_label}{status_note})", new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 7, f"Текущий расчёт ({billing.period_label}{status_note})", new_x="LMARGIN", new_y="NEXT")
 
         headers = ["Счётчик", "Пред.", "Тек.", "Расход", "Тариф", "Сумма (₽)"]
         widths = [32, 26, 26, 28, 36, 36]
@@ -299,10 +314,10 @@ def _build_pdf_sync(snapshots: list[dict], filepath: Path) -> Path:
 
         pdf.set_font("DejaVu", "B", 10)
         pdf.ln(2)
-        pdf.cell(0, 7, "  |  ".join(totals_parts), new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 6, "  |  ".join(totals_parts), new_x="LMARGIN", new_y="NEXT")
         if not billing.is_complete:
             pdf.set_font("DejaVu", "", 8)
-            pdf.cell(0, 5, f"Причина неполноты: {', '.join(billing.incomplete_reasons)}", new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, 5, f"Причина неполноты: {', '.join(billing.incomplete_reasons)}", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(4)
 
         readings = snap["readings"]
@@ -319,16 +334,26 @@ def _build_pdf_sync(snapshots: list[dict], filepath: Path) -> Path:
             pdf.cell(0, 6, "Показаний пока нет.", new_x="LMARGIN", new_y="NEXT")
         else:
             r_headers = ["Дата", "Счётчик", "Значение", "TG ID"]
-            r_widths = [36, 44, 44, 60]
-            pdf.set_font("DejaVu", "B", 9)
-            for h_txt, w in zip(r_headers, r_widths):
-                pdf.cell(w, 7, h_txt, border=1, align="C")
-            pdf.ln()
-            pdf.set_font("DejaVu", "", 9)
+            r_widths = [34, 52, 44, 54]
+
+            def _draw_history_header() -> None:
+                pdf.set_font("DejaVu", "B", 9)
+                for h_txt, w in zip(r_headers, r_widths):
+                    pdf.cell(w, 7, h_txt, border=1, align="C")
+                pdf.ln()
+                pdf.set_font("DejaVu", "", 9)
+
+            _draw_history_header()
             for r in readings:
+                if pdf.get_y() + 7 > pdf.page_break_trigger:
+                    pdf.add_page()
+                    _draw_history_header()
+                base_lbl = METER_PLAIN_LABELS.get(r["meter_type"], r["meter_type"])
+                if r.get("is_replacement_init"):
+                    base_lbl = f"{base_lbl} (замена)"
                 row = [
                     r["date"],
-                    METER_PLAIN_LABELS.get(r["meter_type"], r["meter_type"]),
+                    base_lbl,
                     f"{r['value']} {METER_UNITS.get(r['meter_type'], '')}",
                     str(r["submitted_by"]),
                 ]

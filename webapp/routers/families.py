@@ -79,7 +79,10 @@ async def api_create_family(body: FamilyBody, user: WebAppUser = Depends(get_cur
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Название семьи не может быть пустым")
-    fam = await operations.create_family_atomic(name, user.telegram_id)
+    try:
+        fam = await operations.create_family_atomic(name, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     return {"ok": True, "id": fam.id}
 
 
@@ -119,6 +122,8 @@ async def api_invite_family(
             owner_name=owner_name,
             actor_tg_id=user.telegram_id,
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except operations.ConflictError as e:
         raise HTTPException(409, str(e))
 
@@ -154,6 +159,8 @@ async def api_rename_family(
         raise HTTPException(400, "Название не может быть пустым")
     try:
         await operations.rename_family_atomic(family_id, name, user.telegram_id, is_actor_admin=is_admin(user.telegram_id))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     return {"ok": True}
@@ -164,6 +171,8 @@ async def api_delete_family(family_id: int, user: WebAppUser = Depends(get_curre
     require_role(user, ("admin",))
     try:
         await operations.delete_family_atomic(family_id, user.telegram_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     return {"ok": True}
@@ -191,6 +200,8 @@ async def api_add_family_owner(
             phone=None,
             actor_tg_id=user.telegram_id,
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except operations.ConflictError as e:

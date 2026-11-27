@@ -612,6 +612,31 @@ async function loadBootstrap(applyUrlTab = false) {
     if (me.app_info) {
       state.appInfo = me.app_info;
     }
+    let requestedAptMissing = false;
+    if (applyUrlTab) {
+      const params = new URLSearchParams(window.location.search);
+      const aptIdRaw = params.get("apt_id");
+      if (aptIdRaw) {
+        const parsedAptId = Number(aptIdRaw);
+        if (Number.isInteger(parsedAptId) && state.apartments.some(a => a.id === parsedAptId)) {
+          state.selectedAptId = parsedAptId;
+        } else {
+          requestedAptMissing = true;
+        }
+      }
+      const tabParam = params.get("tab");
+      if (!requestedAptMissing) {
+        if (tabParam === "water" || tabParam === "electricity" || tabParam === "gas") {
+          state.activeTab = "submit";
+          state.submitSubtab = tabParam;
+        } else if (tabParam && ["dashboard", "apartments", "families", "history", "photo", "admin"].includes(tabParam)) {
+          state.activeTab = tabParam;
+        }
+      } else {
+        state.activeTab = "dashboard";
+      }
+    }
+
     if (!state.selectedAptId || !state.apartments.some(a => a.id === state.selectedAptId)) {
       state.selectedAptId = state.apartments[0]?.id || null;
     }
@@ -619,16 +644,8 @@ async function loadBootstrap(applyUrlTab = false) {
     updateUserBadge();
     renderAptSelector();
     renderNav();
-
-    if (applyUrlTab) {
-      const params = new URLSearchParams(window.location.search);
-      const tabParam = params.get("tab");
-      if (tabParam === "water" || tabParam === "electricity" || tabParam === "gas") {
-        state.activeTab = "submit";
-        state.submitSubtab = tabParam;
-      } else if (tabParam && ["dashboard", "apartments", "families", "history", "photo", "admin"].includes(tabParam)) {
-        state.activeTab = tabParam;
-      }
+    if (requestedAptMissing) {
+      showToast("⚠️ Объект из напоминания недоступен или был удалён", "error");
     }
 
     if (state.selectedAptId) {
@@ -1157,11 +1174,22 @@ function renderSubmit(root) {
   document.getElementById("open-photo-btn")?.addEventListener("click", () => { state.activeTab = "photo"; renderTab(); });
 
   let activeSubmissionId = null;
+  let formSubmitting = false;
   const submitBtn = document.getElementById("btn-submit-group");
   const boundAptId = apt.id;
   const boundGroup = state.submitSubtab;
 
+  const setFormLocked = (locked) => {
+    formSubmitting = locked;
+    if (submitBtn) submitBtn.disabled = locked;
+    activeGroup.meters.forEach(m => {
+      const el = document.getElementById(`in-${m.id}`);
+      if (el) el.disabled = locked;
+    });
+  };
+
   const updatePreview = () => {
+    if (formSubmitting) return;
     activeSubmissionId = null;
     const box = document.getElementById("calc-preview");
     const entered = [];
@@ -1185,26 +1213,44 @@ function renderSubmit(root) {
     const deltaParts = [];
     const monthParts = [];
     let monthTotalCost = 0;
-    let monthWaterSum = 0;
+    let monthColdSum = 0;
+    let monthHotSum = 0;
     let monthIrrDiff = 0;
+    let hasColdInMonth = false;
     let hasDomWaterInMonth = false;
+    let hasIrrInMonth = false;
     let missingBase = false;
     let missingTariff = false;
     let hasRepeatOrReplace = false;
 
-    // Seed with already-submitted meters of the same group in current month (HIGH-01)
+    // P2-06: seed already-submitted meters of the SAME group (volumes AND costs)
     const enteredIds = new Set(entered.map(e => e.m.id));
-    if (boundGroup === "water" && billing?.meters) {
-      for (const wm of ["cold_water", "hot_water", "irrigation"]) {
-        if (enteredIds.has(wm)) continue;
-        const bm = billing.meters[wm];
-        if (!bm || !bm.submitted || !bm.has_base) continue;
-        if (wm === "cold_water" || wm === "hot_water") {
-          monthWaterSum += bm.consumption;
-          hasDomWaterInMonth = true;
+    if (billing?.meters) {
+      for (const gm of activeGroup.meters) {
+        if (enteredIds.has(gm.id)) continue;
+        const bm = billing.meters[gm.id];
+        if (!bm || !bm.submitted) continue;
+        if (!bm.has_base) {
+          missingBase = true;
+          continue;
         }
-        if (wm === "irrigation") {
+        if (gm.id === "cold_water") {
+          monthColdSum += bm.consumption;
+          hasColdInMonth = true;
+          hasDomWaterInMonth = true;
+        } else if (gm.id === "hot_water") {
+          monthHotSum += bm.consumption;
+          hasDomWaterInMonth = true;
+        } else if (gm.id === "irrigation") {
           monthIrrDiff = bm.consumption;
+          hasIrrInMonth = true;
+        }
+        if (!isTenant && !(gm.id === "irrigation" && isIrrAfterCold)) {
+          if (bm.has_tariff === false) {
+            missingTariff = true;
+          } else {
+            monthTotalCost += (bm.cost || 0);
+          }
         }
       }
     }
@@ -1233,12 +1279,17 @@ function renderSubmit(root) {
       deltaParts.push(`${m.plain}: <b>${fmtNum(deltaDiff)} ${m.unit}</b>`);
       monthParts.push(`${m.plain}: <b>${fmtNum(monthDiff)} ${m.unit}</b>`);
 
-      if (m.id === "cold_water" || m.id === "hot_water") {
-        monthWaterSum += monthDiff;
+      if (m.id === "cold_water") {
+        monthColdSum += monthDiff;
+        hasColdInMonth = true;
+        hasDomWaterInMonth = true;
+      } else if (m.id === "hot_water") {
+        monthHotSum += monthDiff;
         hasDomWaterInMonth = true;
       }
       if (m.id === "irrigation") {
         monthIrrDiff = monthDiff;
+        hasIrrInMonth = true;
         if (isIrrAfterCold) continue;
       }
       if (!isTenant) {
@@ -1250,10 +1301,13 @@ function renderSubmit(root) {
       }
     }
 
+    const irrExceedsCold = boundGroup === "water" && isIrrAfterCold && hasColdInMonth && hasIrrInMonth && monthIrrDiff > monthColdSum;
     const sewRate = tariffs.sewerage;
     let sewCost = 0;
     if (!isTenant && boundGroup === "water" && hasDomWaterInMonth && sewRate !== null && sewRate !== undefined && sewRate > 0 && !missingBase) {
-      const sewVol = isIrrAfterCold ? Math.max(0, monthWaterSum - monthIrrDiff) : monthWaterSum;
+      const sewVol = isIrrAfterCold && hasIrrInMonth
+        ? Math.max(0, monthColdSum - monthIrrDiff) + monthHotSum
+        : (monthColdSum + monthHotSum);
       sewCost = Math.round(sewVol * sewRate);
       monthTotalCost += sewCost;
       monthParts.push(`Водоотведение: <b>${fmtNum(sewVol)} м³</b>`);
@@ -1265,6 +1319,10 @@ function renderSubmit(root) {
       lines.push(`За текущий месяц — ${monthParts.join(" · ")}`);
     } else {
       lines.push(`Расход за месяц — ${(monthParts.length ? monthParts : deltaParts).join(" · ")}`);
+    }
+
+    if (irrExceedsCold) {
+      lines.push("⚠️ Расход полива превышает расход ХВС — проверьте показания");
     }
 
     if (!isTenant) {
@@ -1287,40 +1345,58 @@ function renderSubmit(root) {
   });
 
   document.getElementById("btn-submit-group").onclick = () => {
+    if (formSubmitting) return;
     if (!activeSubmissionId) activeSubmissionId = genSubmissionId();
-    submitMeterGroup(boundAptId, boundGroup, activeGroup.meters, false, activeSubmissionId);
+    submitMeterGroup(boundAptId, boundGroup, activeGroup.meters, false, activeSubmissionId, false, null, setFormLocked);
   };
 }
 
-async function submitMeterGroup(aptId, groupName, groupMeters, force, submissionId, allowDecrease = false) {
+async function submitMeterGroup(
+  aptId,
+  groupName,
+  groupMeters,
+  force,
+  submissionId,
+  allowDecrease = false,
+  frozenMeters = null,
+  setFormLocked = null,
+) {
   if (aptId !== state.selectedAptId) {
     return showToast("Выбран другой объект. Обновите форму.", "error");
   }
+  const meterValues = {};
+  if (frozenMeters) {
+    Object.assign(meterValues, frozenMeters);
+  } else {
+    for (const m of groupMeters) {
+      const el = document.getElementById(`in-${m.id}`);
+      const parsed = parseIntSpaces(el?.value);
+      if (parsed.empty) continue;
+      if (!parsed.ok) {
+        return showToast(`Некорректное значение для ${m.plain}: ${parsed.error}`, "error");
+      }
+      meterValues[m.id] = parsed.value;
+    }
+  }
+  if (!Object.keys(meterValues).length) return showToast("Введите хотя бы одно показание счётчика", "error");
+
   const payload = {
+    ...meterValues,
     force,
     allow_decrease: Boolean(allowDecrease),
     submission_id: submissionId || genSubmissionId(),
   };
-  let count = 0;
-  for (const m of groupMeters) {
-    const el = document.getElementById(`in-${m.id}`);
-    const parsed = parseIntSpaces(el?.value);
-    if (parsed.empty) continue;
-    if (!parsed.ok) {
-      return showToast(`Некорректное значение для ${m.plain}: ${parsed.error}`, "error");
-    }
-    payload[m.id] = parsed.value;
-    count++;
-  }
-  if (!count) return showToast("Введите хотя бы одно показание счётчика", "error");
 
   const btn = document.getElementById("btn-submit-group");
-  if (btn) btn.disabled = true;
+  if (setFormLocked) setFormLocked(true);
+  else if (btn) btn.disabled = true;
+
   try {
     const res = await api(`/api/apartments/${aptId}/readings/${groupName}`, { method: "POST", body: payload });
 
     if (res.rejected_decrease) {
-      if (btn) btn.disabled = false;
+      if (setFormLocked) setFormLocked(false);
+      else if (btn) btn.disabled = false;
       const warningHtml = String(res.warning || "")
         .split("\n")
         .filter(Boolean)
@@ -1334,7 +1410,7 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
             {
               label: "Сохранить",
               onClick: () => {
-                submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id, true);
+                submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id, true, meterValues, setFormLocked);
               },
             },
             { label: "Отмена", cls: "btn-secondary" },
@@ -1354,12 +1430,13 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
     }
 
     if (res.needs_confirm) {
-      if (btn) btn.disabled = false;
+      if (setFormLocked) setFormLocked(false);
+      else if (btn) btn.disabled = false;
       return openModal("⚠️ Повторная подача за этот месяц", `<p>${esc(res.warning)}</p>`, [
         {
           label: "Сохранить",
           onClick: () => {
-            submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id);
+            submitMeterGroup(aptId, groupName, groupMeters, true, payload.submission_id, false, meterValues, setFormLocked);
           },
         },
         { label: "Отмена", cls: "btn-secondary" },
@@ -1370,10 +1447,18 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
     const sewAdd = res.billing.sewerage_total || 0;
     const irrAdd = res.billing.irrigation_total || 0;
     const waterSum = (res.billing.water_total || 0) + sewAdd + irrAdd;
-    const waterVolSum = (res.billing.water_consumption_total || 0) + (res.billing.irrigation_consumption_total || 0);
+    const irrVol = res.billing.irrigation_consumption_total || 0;
+    const isAfterCold = res.billing.irrigation_mode === "after_cold";
+    // P2-07: do not double-count irrigation inside ХВС when irrigation_mode === "after_cold"
+    const waterVolSum = isAfterCold
+      ? (res.billing.water_consumption_total || 0)
+      : ((res.billing.water_consumption_total || 0) + irrVol);
+    const tenantWaterMsg = (isAfterCold && irrVol > 0)
+      ? `Вода сохранена (за месяц: ${fmtNum(waterVolSum)} м³, в т.ч. полив ${fmtNum(irrVol)} м³)`
+      : `Вода сохранена (за месяц: ${fmtNum(waterVolSum)} м³)`;
     const costMap = isTenant
       ? {
-          water: `Вода сохранена (за месяц: ${fmtNum(waterVolSum)} м³)`,
+          water: tenantWaterMsg,
           electricity: `Показания электроэнергии сохранены (за месяц: ${fmtNum(res.billing.electricity_consumption_total)} кВт·ч)`,
           gas: `Газ сохранён (за месяц: ${fmtNum(res.billing.gas_consumption_total)} м³)`,
         }
@@ -1385,12 +1470,18 @@ async function submitMeterGroup(aptId, groupName, groupMeters, force, submission
           gas: `Газ сохранён (за месяц: ${fmtNum(res.billing.gas_total)} ₽)`,
         };
     showToast(`✅ ${costMap[groupName] || "Показания сохранены"}`);
-    await loadApartmentDetail(aptId);
-    state.activeTab = "dashboard";
-    await renderTab();
+    if (state.selectedAptId === aptId) {
+      await loadApartmentDetail(aptId);
+    }
+    // P2-15: only navigate to dashboard if user did not switch away while request was in-flight
+    if (state.selectedAptId === aptId && state.activeTab === "submit") {
+      state.activeTab = "dashboard";
+      await renderTab();
+    }
   } catch (err) {
     showToast("❌ " + err.message, "error");
-    if (btn) btn.disabled = false;
+    if (setFormLocked) setFormLocked(false);
+    else if (btn) btn.disabled = false;
   }
 }
 
@@ -1418,7 +1509,7 @@ async function renderHistory(root, renderSeq = state.tabRenderSeq) {
             <div class="bold">${esc(r.meter_type === "t" ? "⚡ Электричество" : r.label)}: ${fmtNum(r.value)} ${esc(r.unit)}${r.is_replacement_init ? ' <span class="pill">новый счётчик</span>' : ""}</div>
             <div class="small muted">#${r.id} · ${esc(r.reading_date)} · ID ${r.submitted_by}</div>
           </div>
-          ${canEdit ? `<button class="btn btn-secondary btn-sm edit-reading-btn" data-id="${r.id}" data-val="${r.value}" data-lbl="${esc(r.label)}">✏️</button>` : ""}
+          ${canEdit && !r.is_replacement_init ? `<button class="btn btn-secondary btn-sm edit-reading-btn" data-id="${r.id}" data-val="${r.value}" data-lbl="${esc(r.label)}">✏️</button>` : ""}
         </div>`).join("")
     : `<p class="muted center">Показаний за выбранный период нет.</p>`;
 
@@ -1456,13 +1547,18 @@ async function renderHistory(root, renderSeq = state.tabRenderSeq) {
     billParts.push(`всего <b>${fmtNum(data.billing.grand_total)} ₽</b>`);
   }
 
+  const histIncompleteBanner = (state.historyMonth && data.billing && data.billing.is_complete === false && data.billing.incomplete_reasons?.length)
+    ? `<div class="incomplete-banner">⚠️ Предварительный расчёт: ${esc(data.billing.incomplete_reasons.join(", "))}</div>`
+    : "";
+
   root.innerHTML = `
     <div class="card">
       <div class="row-between">
         <h2>📜 История — ${esc(propShort(currentApt))}</h2>
         <select id="month-filter" class="apt-select">${monthOptions}</select>
       </div>
-      ${state.historyMonth ? `<div class="preview-box mt-8">За ${esc(data.billing.period_label)}: ${billParts.join(" · ")}</div>` : ""}
+      ${state.historyMonth ? `<div class="preview-box mt-8">За ${esc(data.billing.period_label)}${data.billing?.is_complete === false ? " (предв.)" : ""}: ${billParts.join(" · ")}</div>` : ""}
+      ${histIncompleteBanner}
       <div class="mt-8">${listHtml}</div>
     </div>
   `;
@@ -1470,7 +1566,20 @@ async function renderHistory(root, renderSeq = state.tabRenderSeq) {
   document.getElementById("month-filter").onchange = async (e) => {
     state.historyMonth = e.target.value;
     showLoading(root, "Загружаю историю...");
-    await renderHistory(root, renderSeq);
+    try {
+      await renderHistory(root, renderSeq);
+    } catch (err) {
+      showToast("❌ " + (err.message || "Не удалось загрузить историю"), "error");
+      root.innerHTML = `
+        <div class="card center">
+          <p class="muted">⚠️ ${esc(err.message || "Ошибка загрузки истории")}</p>
+          <button class="btn mt-12" id="btn-retry-history">🔄 Повторить</button>
+        </div>`;
+      document.getElementById("btn-retry-history")?.addEventListener("click", () => {
+        showLoading(root, "Загружаю историю...");
+        renderHistory(root, state.tabRenderSeq).catch(e2 => showToast("❌ " + e2.message, "error"));
+      });
+    }
   };
 
   root.querySelectorAll(".edit-reading-btn").forEach(btn => {
@@ -1541,7 +1650,7 @@ function renderPhoto(root) {
     <div class="card">
       <h2>📷 Фото счётчиков — ${esc(propShort(apt))}</h2>
       <p class="small muted">${recipientHint}</p>
-      <div class="field mt-8"><label>Выберите или сделайте фото (до 15 МБ)</label><input type="file" id="photo-file" accept="image/*" /></div>
+      <div class="field mt-8"><label>Выберите или сделайте фото (JPEG, PNG, WebP, GIF до 15 МБ)</label><input type="file" id="photo-file" accept="image/jpeg,image/png,image/webp,image/gif" /></div>
       ${resources.length ? `
         <div class="field" id="photo-resources-field">
           <label>Что на фото? (нажмите, чтобы добавить в описание)</label>
@@ -1613,15 +1722,24 @@ function renderPhoto(root) {
     updatePhotoUi();
     try {
       const res = await api(`/api/apartments/${boundAptId}/photo`, { method: "POST", body: fd });
-      if (res.recipients_count > 0) {
-        showToast(`✅ Фото отправлено (получателей: ${res.recipients_count})`);
+      const sentCnt = res.sent !== undefined ? res.sent : (res.recipients_count || 0);
+      const attemptedCnt = res.attempted !== undefined ? res.attempted : sentCnt;
+      const failedCnt = res.failed || 0;
+      if (sentCnt > 0) {
+        if (failedCnt > 0) {
+          showToast(`⚠️ Фото доставлено частично (${sentCnt} из ${attemptedCnt})`);
+        } else {
+          showToast(`✅ Фото отправлено (получателей: ${sentCnt})`);
+        }
+        fileInput.value = "";
+        if (commentInput) commentInput.value = "";
+        selectedIds.clear();
+        root.querySelectorAll(".resource-chip.active").forEach(b => b.classList.remove("active"));
+      } else if (attemptedCnt === 0) {
+        showToast("⚠️ Получателей в Telegram не найдено — фото не доставлено", "error");
       } else {
-        showToast("⚠️ Получателей в Telegram не найдено — фото не доставлено");
+        showToast("❌ Не удалось доставить фото в Telegram — попробуйте ещё раз", "error");
       }
-      fileInput.value = "";
-      if (commentInput) commentInput.value = "";
-      selectedIds.clear();
-      root.querySelectorAll(".resource-chip.active").forEach(b => b.classList.remove("active"));
     } catch (err) {
       showToast("❌ " + err.message, "error");
     } finally {
@@ -1828,6 +1946,7 @@ function openReplaceMeterModal(aptId) {
   };
 
   const firstDev = physicalDevices[0];
+  let activeReplacementId = null;
   openModal(`🔄 Замена счётчика — ${propShort(apt)}`, `
     <p class="small muted">Остаток потребления по старому счётчику будет учтён в текущем месяце, а дальнейший расчёт пойдёт с начального показания нового счётчика.</p>
     <div class="field mt-8">
@@ -1857,6 +1976,7 @@ function openReplaceMeterModal(aptId) {
         }
         const newSerial = (document.getElementById("rep-new-serial").value || "").trim() || null;
         const isMultiElec = devMt === "t" && multiElecEnabled.length > 0;
+        if (!activeReplacementId) activeReplacementId = genSubmissionId();
 
         let body;
         if (isMultiElec) {
@@ -1880,6 +2000,7 @@ function openReplaceMeterModal(aptId) {
             tariff_entries: entries,
             new_serial_number: newSerial,
             new_verification_due_date: dueParsed.display,
+            replacement_id: activeReplacementId,
           };
         } else {
           const oldParsed = parseIntSpaces(document.getElementById("rep-old-final")?.value);
@@ -1898,6 +2019,7 @@ function openReplaceMeterModal(aptId) {
             new_initial_value: newParsed.value,
             new_serial_number: newSerial,
             new_verification_due_date: dueParsed.display,
+            replacement_id: activeReplacementId,
           };
         }
 
@@ -1918,6 +2040,7 @@ function openReplaceMeterModal(aptId) {
   attachDateField("rep-new-due", "rep-new-due-nat");
   const replaceBtn = document.getElementById("modal-replace-meter");
   const updateReplaceReady = () => {
+    activeReplacementId = null;
     if (!replaceBtn) return;
     const devMt = document.getElementById("rep-meter-type")?.value;
     const isMultiElec = devMt === "t" && multiElecEnabled.length > 0;

@@ -48,8 +48,10 @@ class BackgroundTaskManager:
             return
         pending = list(self._tasks)
         _, still_pending = await asyncio.wait(pending, timeout=timeout)
-        for t in still_pending:
-            t.cancel()
+        if still_pending:
+            for t in still_pending:
+                t.cancel()
+            await asyncio.gather(*still_pending, return_exceptions=True)
 
 
 async def dispatch_notification(request, coro: Coroutine, name: str = "notification") -> None:
@@ -72,19 +74,23 @@ def get_webapp_version() -> str:
     return hasher.hexdigest()[:10]
 
 
-def build_webapp_url(tab: str | None = None) -> str:
+def build_webapp_url(tab: str | None = None, apt_id: int | None = None) -> str:
     ver = get_webapp_version()
+    params = [f"v={ver}"]
     if tab:
-        return f"{WEBAPP_URL}/?v={ver}&tab={tab}"
-    return f"{WEBAPP_URL}/?v={ver}"
+        params.append(f"tab={tab}")
+    if apt_id is not None:
+        params.append(f"apt_id={int(apt_id)}")
+    return f"{WEBAPP_URL}/?{'&'.join(params)}"
 
 
 def webapp_open_kb(
     label: str = "📱 Открыть панель счётчиков",
     tab: str | None = None,
     include_about: bool = False,
+    apt_id: int | None = None,
 ) -> InlineKeyboardMarkup:
-    url = build_webapp_url(tab=tab)
+    url = build_webapp_url(tab=tab, apt_id=apt_id)
     rows = [
         [InlineKeyboardButton(text=label, web_app=WebAppInfo(url=url))],
     ]
@@ -139,7 +145,7 @@ async def notify_tenant_added(bot: Bot, apt, tenant_tg_id: int, tenant_name: str
                 f"со сроком действия до <b>{date_finish}</b>).\n"
                 f"Откройте Mini App кнопкой ниже для подачи показаний."
             ),
-            reply_markup=webapp_open_kb("📱 Открыть панель счётчиков"),
+            reply_markup=webapp_open_kb("📱 Открыть панель счётчиков", apt_id=getattr(apt, "id", None)),
             parse_mode="HTML",
         )
         return True
@@ -166,7 +172,7 @@ async def notify_tenant_removed(
         return False
 
 
-async def forward_meter_photo_file(
+async def forward_meter_photo_detailed(
     bot: Bot,
     apt_id: int,
     filepath: Path | None,
@@ -174,19 +180,21 @@ async def forward_meter_photo_file(
     sender_name: str,
     comment: str = "",
     photo_file_id: str | None = None,
-) -> int:
+) -> dict[str, int]:
+    """P2-11: forward meter photo directly to owners and report attempted/sent/failed counts."""
     apt = await crud.get_apartment(apt_id)
     if not apt:
-        return 0
+        return {"attempted": 0, "sent": 0, "failed": 0}
     recipients = [r for r in await get_notification_recipients(apt_id) if r != sender_tg_id]
     if not recipients:
-        return 0
+        return {"attempted": 0, "sent": 0, "failed": 0}
 
     safe_comment = h(comment.strip()[:500])
     sender_user = await crud.get_user_by_telegram_id(sender_tg_id)
     prop_short = h(format_property_short(apt))
 
     sent = 0
+    failed = 0
     for uid in recipients:
         viewer_role = "admin" if is_admin(uid) else "landlord"
         resolved_sender = (
@@ -210,8 +218,30 @@ async def forward_meter_photo_file(
             )
             sent += 1
         except Exception as e:
+            failed += 1
             logger.warning("Failed to send meter photo to %s: %s", uid, e)
-    return sent
+    return {"attempted": len(recipients), "sent": sent, "failed": failed}
+
+
+async def forward_meter_photo_file(
+    bot: Bot,
+    apt_id: int,
+    filepath: Path | None,
+    sender_tg_id: int,
+    sender_name: str,
+    comment: str = "",
+    photo_file_id: str | None = None,
+) -> int:
+    result = await forward_meter_photo_detailed(
+        bot=bot,
+        apt_id=apt_id,
+        filepath=filepath,
+        sender_tg_id=sender_tg_id,
+        sender_name=sender_name,
+        comment=comment,
+        photo_file_id=photo_file_id,
+    )
+    return result["sent"]
 
 
 async def send_document_to_user(bot: Bot, telegram_id: int, filepath: Path, caption: str) -> None:

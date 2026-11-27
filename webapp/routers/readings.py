@@ -20,7 +20,7 @@ from services.access import user_can_access_apartment
 from services.calculations import calculate_billing, sanitize_billing_for_tenant
 from services.notifications import (
     dispatch_notification,
-    forward_meter_photo_file,
+    forward_meter_photo_detailed,
     notify_new_readings,
 )
 from webapp.auth import WebAppUser, get_current_user
@@ -36,9 +36,11 @@ router = APIRouter()
 CHUNK_SIZE = 64 * 1024
 MIN_HISTORY_YEAR = 1970
 MAX_HISTORY_YEAR = 2100
+_INFLIGHT_PHOTO_USERS: set[int] = set()
 
 
 def _detect_image_extension(header: bytes) -> str | None:
+    """P2-11: accept only Telegram-compatible image formats (JPEG, PNG, WebP, GIF); reject HEIC."""
     if header.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -47,12 +49,6 @@ def _detect_image_extension(header: bytes) -> str | None:
         return ".webp"
     if header.startswith((b"GIF87a", b"GIF89a")):
         return ".gif"
-    if (
-        len(header) >= 12
-        and header[4:8] == b"ftyp"
-        and header[8:12] in (b"heic", b"heix", b"hevc", b"mif1", b"msf1")
-    ):
-        return ".jpg"
     return None
 
 
@@ -87,6 +83,8 @@ async def _save_meter_group(
             allow_decrease=effective_allow_decrease,
             submission_id=submission_id,
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except operations.ConflictError as e:
         raise HTTPException(409, str(e))
     except LookupError as e:
@@ -275,8 +273,12 @@ async def api_correct_reading(
         _, old_val, new_val = await operations.correct_reading_atomic(
             reading_id, body.value, user.telegram_id
         )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True, "old_value": old_val, "new_value": new_val}
 
 
@@ -291,6 +293,9 @@ async def api_upload_photo(
     if not await user_can_access_apartment(user.telegram_id, apt_id):
         raise HTTPException(403, "Нет доступа к объекту недвижимости")
 
+    if user.telegram_id in _INFLIGHT_PHOTO_USERS:
+        raise HTTPException(429, "Предыдущее фото ещё отправляется. Подождите несколько секунд.")
+
     content_len = getattr(request, "headers", {}).get("content-length")
     if content_len:
         try:
@@ -299,6 +304,7 @@ async def api_upload_photo(
         except ValueError:
             pass
 
+    _INFLIGHT_PHOTO_USERS.add(user.telegram_id)
     tmp_path: Path | None = None
     total_size = 0
     detected_ext: str | None = None
@@ -309,7 +315,10 @@ async def api_upload_photo(
             raise HTTPException(400, "Файл пуст")
         detected_ext = _detect_image_extension(first_chunk)
         if detected_ext is None:
-            raise HTTPException(400, "Неподдерживаемый формат файла. Загрузите изображение (JPEG, PNG, WebP).")
+            raise HTTPException(
+                400,
+                "Неподдерживаемый формат файла. Загрузите изображение в формате JPEG, PNG, WebP или GIF.",
+            )
 
         fd_num, raw_name = tempfile.mkstemp(prefix=f"umb_photo_{apt_id}_", suffix=detected_ext)
         tmp_path = Path(raw_name)
@@ -326,7 +335,14 @@ async def api_upload_photo(
         await asyncio.to_thread(fd.close)
         fd = None
 
-        sent = await forward_meter_photo_file(
+        # P1-03: re-verify access right before forwarding to Telegram
+        if not await user_can_access_apartment(user.telegram_id, apt_id):
+            raise HTTPException(403, "Нет доступа к объекту недвижимости")
+        apt = await crud.get_apartment(apt_id)
+        if not apt:
+            raise HTTPException(404, "Объект недвижимости не найден")
+
+        delivery = await forward_meter_photo_detailed(
             bot=request.app.state.bot,
             apt_id=apt_id,
             filepath=tmp_path,
@@ -337,10 +353,18 @@ async def api_upload_photo(
         await crud.add_audit_log(
             user.telegram_id,
             "upload_photo_webapp",
-            f"Объект id={apt_id}, получателей={sent}",
+            f"Объект id={apt_id}, отправлено={delivery['sent']}/{delivery['attempted']}",
+            family_id=apt.family_id,
         )
-        return {"ok": True, "recipients_count": sent}
+        return {
+            "ok": True,
+            "recipients_count": delivery["sent"],
+            "attempted": delivery["attempted"],
+            "sent": delivery["sent"],
+            "failed": delivery["failed"],
+        }
     finally:
+        _INFLIGHT_PHOTO_USERS.discard(user.telegram_id)
         if fd is not None:
             try:
                 fd.close()
